@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 
+/** Model ids served through the Kimi lane. */
+export const KIMI_MODELS=Object.freeze(["kimi-for-coding","kimi-for-coding-highspeed","k3","k3-256k","k3.1-pro","k3.1-pro-highspeed"]);
 export const KIMI_HISTORY_MESSAGE='没有切换到 Kimi：当前会话含 Kimi 不支持的压缩历史，不能在保留完整上下文的前提下安全交接。原会话和内容已保留；请继续使用 GPT，或另开独立 Kimi 会话并明确提供所需上下文。';
 export const KIMI_HISTORY_UNKNOWN_MESSAGE='没有切换到 Kimi：无法完整核验当前会话历史，已保留当前模型和全部内容。请继续使用当前会话，待历史核验恢复后再试。';
 export const historyError=(unknown=false)=>Object.assign(Error(unknown?KIMI_HISTORY_UNKNOWN_MESSAGE:KIMI_HISTORY_MESSAGE),{code:unknown?'KIMI_HISTORY_UNVERIFIED':'KIMI_HISTORY_INCOMPATIBLE',beforeMutation:true});
@@ -13,7 +15,7 @@ export function assertKimiInputCompatible(input){
  * an earlier one: later readable items do not prove that all its context survived.
  * Incomplete, changing or oversized logs fail closed. No content leaves this reader. */
 export async function checkModelHistory(profile,runtime){
-  if(!["kimi-for-coding","kimi-for-coding-highspeed","k3","k3-256k","k3.1-pro","k3.1-pro-highspeed"].includes(profile?.model))return;
+  if(!KIMI_MODELS.includes(profile?.model))return;
   if(!runtime?.known||!runtime.rolloutPath||!runtime.threadId||runtime.threadId!==runtime.sessionId)throw historyError(true);
   let handle;
   try{

@@ -100,7 +100,6 @@ def interaction_windows(conn, scope, at, timezone="Asia/Singapore", *, recipient
         "join_minutes": 30,
         "timezone": timezone,
         "recipient_person_id": recipient_person_id,
-        "conversation_key": conversation_key,
         "window_count": len(windows),
         "active_days": len(days),
         "hourly_window_starts": hours,

@@ -27,5 +27,17 @@ export function ownerNotice(kind,subject,{scope='input'}={}) {
   if(!SCOPES.includes(scope))throw Error('Unsupported owner notice scope');
   return {id:'kin-'+scope+'-notice-'+digest([subject,kind]).slice(0,32),kind,text:SYSTEM_NOTICE_LABEL+OWNER_NOTICE_TEXTS[kind]};
 }
+/** One line about Kin's own prompt documents: a save, a restore, a kept edit, or an edit a newer
+ * code default has passed. The words name only the document and its versions. */
+export function promptNotice({state,name,version,externalRead=false,restoredFrom=null,defaultAt=null}) {
+  if(typeof name!=='string'||!name||name.length>200||!Number.isInteger(version))throw Error('A prompt notice names the document and its version');
+  const doc='提示词「'+name+'」',read=externalRead?'；这一回合读过网页或文件':'';
+  const text=state==='stale'?doc+'改过之后，代码默认又更新了；现在仍用改过的第 '+version+' 版，没有自动覆盖。可以让 Kin 用 edit_prompt 对比后合并、保留或恢复默认。'
+    :state==='kept'?'Kin 决定继续用改过的'+doc+'（第 '+version+' 版），不跟随更新后的代码默认'+read+'。'
+    :state==='saved'&&restoredFrom!==null?'Kin 把'+doc+'恢复成'+(restoredFrom==='default'?'代码默认':'第 '+restoredFrom+' 版')+'，现在是第 '+version+' 版'+read+'。'
+    :state==='saved'?'Kin 改了'+doc+'，现在是第 '+version+' 版'+read+'。需要时可以让 Kin 用 edit_prompt 的 history 查看、restore 恢复。':null;
+  if(!text)throw Error('Unsupported prompt notice');
+  return {id:'kin-prompt-notice-'+digest([name,state,state==='saved'?version:defaultAt]).slice(0,32),kind:'prompt',text:SYSTEM_NOTICE_LABEL+text};
+}
 /** Notices are the host's words: they never become Kin's delivered words in memory. */
-export const isSystemNoticeId=id=>typeof id==='string'&&/^kin-(?:input|reply)-notice-[a-f0-9]{32}$/.test(id);
+export const isSystemNoticeId=id=>typeof id==='string'&&/^kin-(?:input|reply|prompt)-notice-[a-f0-9]{32}$/.test(id);

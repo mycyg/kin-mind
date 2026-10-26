@@ -65,3 +65,67 @@ def test_empty_search_is_not_a_page_read(setup):
     reader = DeepSeekWebReader(cfg, api_client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200,json={'results':[]})), **kw))
     result = reader.search('example')
     assert result['state'] == 'search_result' and result['results_empty']
+
+
+def test_paid_calls_have_turn_day_and_site_budgets(setup, tmp_path):
+    import sqlite3
+    cfg, calls, handler = setup
+    turn = ['turn-1']
+    factory = lambda **kw: httpx.Client(transport=httpx.MockTransport(handler), **kw)
+    paid = {'database': str(tmp_path / 'memory.sqlite3'), 'scope': 'synthetic-scope', 'purpose': 'chat'}
+    reader = DeepSeekWebReader({**cfg, 'paid_calls': paid, 'day_limit': 10}, api_client_factory=factory, turn=lambda: turn[0])
+    pages = [reader.read_page(f'https://site0.example/{i}') for i in range(5)]
+    assert [p['failure_reason'] for p in pages] == [None] * 4 + ['host-courtesy-limit'] and len(calls) == 4
+    found = [reader.search(f'query {i}') for i in range(5)]
+    assert [f['failure_reason'] for f in found] == [None] * 4 + ['web-budget-exhausted'] and len(calls) == 8
+    turn[0] = 'turn-2'
+    assert reader.read_page('https://site0.example/again')['state'] == 'observed'
+    assert reader.search('one more')['state'] == 'search_result'
+    assert reader.search('over the day')['failure_reason'] == 'web-budget-exhausted' and len(calls) == 10
+    rows = sqlite3.connect(paid['database']).execute(
+        'SELECT service,purpose,calls,failures FROM mind_paid_calls ORDER BY service').fetchall()
+    assert rows == [('deepseek-fetch', 'chat', 5, 0), ('deepseek-search', 'chat', 5, 0)]
+    other = DeepSeekWebReader({**cfg, 'paid_calls': {**paid, 'purpose': 'exploration'}, 'turn_limit': None, 'day_limit': 10},
+                              api_client_factory=factory)
+    assert all(other.search(f'explore {i}')['state'] == 'search_result' for i in range(9))
+
+
+def test_a_timed_out_paid_call_is_unconfirmed_and_not_sent_again_that_turn(setup, tmp_path):
+    from kin_mind.web_read import register_web_tools
+    cfg, calls, _ = setup
+    def handler(request):
+        calls.append(request)
+        raise httpx.ReadTimeout('synthetic timeout', request=request)
+    paid = {'database': str(tmp_path / 'memory.sqlite3'), 'scope': 'synthetic-scope', 'purpose': 'chat'}
+    turn = ['turn-1']
+    reader = DeepSeekWebReader({**cfg, 'paid_calls': paid}, turn=lambda: turn[0],
+                               api_client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handler), **kw))
+    tools = {}
+    class Server:
+        def tool(self):
+            def register(fn):
+                tools[fn.__name__] = fn
+                return fn
+            return register
+    register_web_tools(Server(), reader)
+    first = tools['web_search']('same question')
+    assert first['state'] == 'unconfirmed' and first['reason'] == 'web-service-timeout' and '计费' in first['note']
+    again = tools['web_search']('same question')
+    assert again['state'] == 'unconfirmed' and again['reason'] == 'web-request-unconfirmed' and len(calls) == 1
+    turn[0] = 'turn-2'
+    assert tools['web_search']('same question')['reason'] == 'web-service-timeout' and len(calls) == 2
+    import sqlite3
+    assert sqlite3.connect(paid['database']).execute('SELECT calls,failures FROM mind_paid_calls').fetchall() == [(2, 2)]
+
+
+def test_web_results_are_marked_untrusted(setup):
+    from kin_mind.web_read import register_web_tools
+    cfg, calls, handler = setup
+    reader = DeepSeekWebReader(cfg, api_client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handler), **kw))
+    tools = {}
+    class Server:
+        def tool(self):
+            return lambda fn: tools.setdefault(fn.__name__, fn)
+    register_web_tools(Server(), reader)
+    assert tools['web_search']('example')['content_is_untrusted'] is True
+    assert tools['read_page']('https://example.com')['content_is_untrusted'] is True

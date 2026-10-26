@@ -49,6 +49,7 @@ test('existing transport failures keep a useful reason without retaining private
       const r=await fetch(gateway.baseUrl+'/responses',{method:'POST',headers:{authorization:'Bearer '+gateway.token},body:JSON.stringify({model:'deepseek-flash',input:[user('synthetic')]})});
       const body=await r.text();assert.equal(rows.length,1,reason);assert.equal(rows[0].transportFailure.reason,reason);
       assert.equal(rows[0].usageStatus,'unknown');assert.equal(JSON.stringify(rows).includes(marker),false);assert.equal(body.includes(marker),false);
+      assert.ok(Number.isInteger(rows[0].ms)&&rows[0].ms>=0,'the usage ledger reads how long the call took');
     }finally{await gateway.close();}
   }
 });

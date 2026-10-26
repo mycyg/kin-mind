@@ -260,9 +260,10 @@ def anniversaries_today(conn, mind, at):
 
 def contact_decision(state, event_id, proposal):
     """What an idle review committed about contacting: a contact wish it made or took up again
-    (`contact`), a move that says why not now (`not-now`), or neither (`missing`). Read from what
-    this commit wrote for the wishes, and from the proposal for the move, which is recorded either
-    way: in its own table when it was committed, on the queue row with the proposal when it was not."""
+    (`contact`), a move that says why not now (`not-now`), or neither -- which is booked as not now
+    too, `defaulted` (feature 5). Read from what this commit wrote for the wishes, and from the
+    proposal for the move, which is recorded either way: in its own table when it was committed, on
+    the queue row with the proposal when it was not."""
     wishes = sorted(d["id"] for d in state["desires"].values()
                     if d.get("event_id") == event_id and d.get("kind") == "contact" and d.get("status") == "wanted")
     move = proposal.next_move
@@ -270,4 +271,4 @@ def contact_decision(state, event_id, proposal):
         return {"state": "contact", "desire_ids": wishes}
     if move and move.move in QUIET_MOVES and move.reason.strip():
         return {"state": "not-now", "move": move.move}
-    return {"state": "missing", **({"move": move.move} if move else {})}
+    return {"state": "not-now", "defaulted": True, **({"move": move.move} if move else {})}

@@ -33,6 +33,7 @@ from .model_view import for_model
 from .source_ledger import (
     build_ledger,
     coverage,
+    drop_unbacked,
     rejection_counts,
     seal_source_receipt,
     valid_computer_receipt,
@@ -605,6 +606,9 @@ def codex_prompt(topic, *, budget_seconds, continuation=None, computer=None, web
         "引用已有证据用 memory://<source_id>，只用 known_evidence 给出的 source_id，其他字段里的编号不能这样引用；网页须本轮实际调用 read_page 读取，使用返回的完整 locator；重定向的请求与最终地址均可。既有已核验探索来源用其准确 URL。搜索结果只证明页面可见，不证明正文；仅提到的链接和失败读取均不能引用。\n"
         'evidence_map 按结论映射证据：键是 findings 从 1 起的序号，例如 "1"；值为非空数组，只用可引用 state=observed 回执或已有来源中的完整 evidence_id/locator。不填描述、截短编号、版本哈希、review_* 或 action_*。无需逐条映射时用 null。\n'
         "你可以寻找新材料、整理已有材料，也可以等待。整理已有材料也能完成一轮。工具无法核实的条件写入 assistance_needed，并给出完成条件；不要宣称已完成。字段写完整，不为固定字数截掉事实；保持一个 JSON 对象。\n")
+    if topic.get("mode") == "play":
+        from .play import PLAY_GUIDE
+        prompt += PLAY_GUIDE
     if web:
         prompt += ("kin_web 的 web_search 返回搜索摘要；read_page 返回正文页段、next_offset 及 evidence_id、locator、version、truncation、delivered_ranges。只有 delivered_ranges 是本轮实际交付给你的正文。需要后文时从 next_offset 续读，不声称读过未交付部分。HTTP 成功只证明传输，内容是否相关、是否支持结论仍需你判断。\n")
     if computer:
@@ -848,7 +852,9 @@ def run_codex(
                       "credentials_file": web.get("credentials_file"),
                       "search_endpoint": web.get("search_endpoint") or DEFAULT_SEARCH_ENDPOINT,
                       "public_transport": web.get("public_transport"),
-                      "allow_hosts": list(web.get("allow_hosts", []))}
+                      "allow_hosts": list(web.get("allow_hosts", [])),
+                      # One run is bounded by its time budget and the daily paid-call budget, not a turn budget.
+                      "paid_calls": web.get("paid_calls"), "turn_limit": None}
         web_config_file = directory / "web-reader.json"
         web_config_file.write_text(dumps(web_config))
         web_config_file.chmod(0o600)
@@ -1128,13 +1134,17 @@ def run_codex(
                     # URL that was merely mentioned or searched-but-not-read.
                     rejected, unknown_ids = verify_citations(result, ledger)
                     if rejected or unknown_ids:
+                        # The same refusals by class, no words: what is left to read of them once
+                        # the settled run's files lose theirs.
+                        citation_rejections = rejection_counts(result, ledger, web_observations)
+                        repaired = drop_unbacked(result, rejected, unknown_ids)
+                        if repaired is not None and verify_citations(repaired, ledger) == ([], []):
+                            result, rejected, unknown_ids = repaired, [], []
+                    if rejected or unknown_ids:
                         state = "failed"
                         reason = "unbacked-citation"
                         extra_gaps = ["rejected unbacked citation: " + citation for citation in rejected[:10]]
                         extra_gaps += ["rejected unknown evidence id: " + identifier for identifier in unknown_ids[:10]]
-                        # The same refusals by class, no words: what is left to read of them once
-                        # the settled run's files lose theirs.
-                        citation_rejections = rejection_counts(result, ledger, web_observations)
                         evidence_coverage = coverage(result, ledger)
                         # The run still failed and nothing of it reaches memory; what it
                         # concluded stays the draft a later attempt starts from (K2-08).

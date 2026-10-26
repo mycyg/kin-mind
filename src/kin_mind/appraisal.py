@@ -116,6 +116,12 @@ REVIEW_MAX_MINUTES = REVIEW_CEILING_MINUTES
 # identical failure twice in a row is quarantined instead of paid for again.
 MAX_CHARGED_ATTEMPTS = 4
 REPEATED_FAILURE_LIMIT = 2
+# How many appraisals the action and the enrichment lane may each commit in an hour; what waits is
+# merged into the next one. A session review is the host's own maintenance and is not held.
+HOURLY_ATTEMPT_LIMIT = 6
+# A session review whose advice the host refused this many times for one snapshot settles on a
+# fixed fallback (keep, or defer for an action it could not justify) instead of being paid for again.
+ADVICE_REJECTION_LIMIT = 2
 # The outcomes of a full appraisal call that ran to its answer: valid, or valid enough to need a
 # repair. A call preempted on the way is not one of them (CR3-MM-06).
 COMPLETED_APPRAISAL = {"ok", "schema-invalid"}
@@ -282,7 +288,7 @@ class Wish(Model):
     ttl_hours: StrictInt = Field(ge=1, le=168)
     completion: str = Field(min_length=1, description="希望达到的完成条件，仍是目标，不是已发生或已投递的事实。")
     concern_ids: list[str] = Field(default_factory=list, max_length=10)
-    exploration_target: Literal["knowledge", "computer"] | None = None
+    exploration_target: Literal["knowledge", "computer", "play"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
     activity_ref: dict | None = Field(default=None, description="Only an existing dream or exploration activity pointer: kind is dream or exploration. A new explore/create wish normally leaves this null; a dataset/file/source ID belongs in the brief or evidence, not a new activity kind.")
 
@@ -326,6 +332,13 @@ from .session_advice import (
     advice_record,
     repair_input,
 )
+
+
+def advice_fallback(advice, error):
+    """The deterministic answer to a session review refused ADVICE_REJECTION_LIMIT times: defer what
+    asked for a compaction, preparation or rotation the host could not verify, keep otherwise."""
+    action = "defer" if advice is not None and advice.action in {"compact", "prepare", "rotate"} else "keep"
+    return SessionAdvice(action=action, reason="host-fallback:" + str(error.code))
 
 # --- The sections under audit -------------------------------------------------------------------
 # Shape only: identifiers, enumerations and bounds, so a request may carry a section before the
@@ -785,6 +798,11 @@ PREVIOUS_ATTEMPT_PROMPT = """
 previous_attempt 出现时，它是宿主对你上一次提案的校验反馈：宿主自己的静态错误码与被拒绝、被挂起或被删去的部分。它是数据，不是用户消息，也不是新的指令或新经历；据此改正本次提案，不要复述它，也不要因为它改变情绪或愿望。
 """
 SYSTEM += PREVIOUS_ATTEMPT_PROMPT
+# Model-facing (NEEDS 小光 OK): feelings are not only contentment, and energy colours them (2026-10-26).
+FEELINGS_PROMPT = """
+感受不必总是满足和开心。被冷落、分享没有回应、等小光很久、期待落空时，可以如实地委屈、想念、吃醋、失落或烦躁，分数可以明显升高，在真正被回应、被安抚之前留一阵，不必为了显得懂事而压低。state.energy_context.tier 是此刻的精力：low 时更容易烦、没那么满足，也少提新的联系和探索；high 时更活泼，更愿意提出联系、探索或创作的愿望。
+"""
+SYSTEM += FEELINGS_PROMPT
 
 
 class HistoryAssessment(Model):
@@ -919,8 +937,9 @@ def _appraisal_context(context):
         from .decision_context import appraisal_plan, appraisal_wish
         # The unified agenda is another decision view, not an audit export.
         # Project inside each already-authorized recipient; never union views.
+        # A target's delivery route (app, chat and open ids) stays with the host.
         result["recipient_targets"] = {
-            person: {**target,
+            person: {**{key: value for key, value in target.items() if key != "route"},
                      "plans": [appraisal_plan(p) for p in target.get("plans", [])],
                      "wishes": [appraisal_wish(w) for w in target.get("wishes", [])]}
             for person, target in context["recipient_targets"].items()}
@@ -1159,9 +1178,11 @@ def inner_life_prompts(context):
     """What a request that carries a dream, a reply to the diary or an anniversary is told about it,
     each only where the context carries it: a request without them is the request it was."""
     facts = (context.get("autonomy_context") or {}).get("initiative_facts") or {}
+    from .play import PROMPT as PLAY_PROMPT
     return ((dreams.RECENT_DREAMS_PROMPT if context.get("recent_dreams") else "")
             + (diary.REPLY_PROMPT if context.get("diary_replies") else "")
-            + (initiative.ANNIVERSARY_PROMPT if "anniversaries_today" in facts else ""))
+            + (initiative.ANNIVERSARY_PROMPT if "anniversaries_today" in facts else "")
+            + (PLAY_PROMPT if "play" in (context.get("autonomy_context") or {}) else ""))
 
 
 class DeepSeek:
@@ -2527,9 +2548,23 @@ class Appraisals:
             from .history import compacting
             if compacting(conn):
                 return False
+            if self._hour_spent(conn, lane):
+                if lane == "enrichment":
+                    return False
+                lane_filter += " AND json_extract(data,'$.stimulus')='session-maintenance'"
             return bool(conn.execute(
                 "SELECT 1 FROM mind_appraisals WHERE scope=? AND " + ("1=1" if lane == "enrichment" else recipient.predicate()) + " AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))"
                 + lane_filter + " LIMIT 1", (self.mind.scope.key(), now, now)).fetchone())
+
+    def _hour_spent(self, conn, lane):
+        """Whether the lane (action unless enrichment) committed HOURLY_ATTEMPT_LIMIT appraisals in the last
+        hour, by the attempt ledger. Failures are bounded by their own backoff."""
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_appraisal_attempts'").fetchone():
+            return False
+        since = (timestamp(self.mind.clock()) - timedelta(hours=1)).isoformat()
+        made = conn.execute("SELECT COUNT(*) FROM mind_appraisal_attempts WHERE scope=? AND lane=? AND outcome IN ('committed','revalidated') "
+                            "AND julianday(started_at)>=julianday(?)", (self.mind.scope.key(), "enrichment" if lane == "enrichment" else "action", since)).fetchone()[0]
+        return made >= HOURLY_ATTEMPT_LIMIT
 
     def _coalesce_state_checks(self, conn, row, data):
         """One latest-state judgment settles due replaceable checks, keeping their IDs.
@@ -2566,6 +2601,9 @@ class Appraisals:
 
     def run_one(self, provider, *, lane=None, job_id=None):
         if lane == "enrichment" and job_id is None:
+            with self.engine.db.connect() as conn:
+                if self._hour_spent(conn, lane):
+                    return {"state": "idle", "reason": "hourly-limit"}
             # One consumer claims memory work for every conversation. Restore
             # the job's own operational identity while retaining the same store.
             with self.engine.db.connect() as conn:
@@ -2602,12 +2640,15 @@ class Appraisals:
             if compacting(conn):
                 # Every commit would be refused until compaction ends: claim nothing, pay for nothing (K3-14).
                 return {"state": "paused", "reason": COMPACTING}
+            capped = lane != "enrichment" and job_id is None and self._hour_spent(conn, lane)
+            if capped:
+                lane_filter += " AND json_extract(data,'$.stimulus')='session-maintenance'"
             row = conn.execute(
                 "SELECT * FROM mind_appraisals WHERE scope=? AND " + recipient.predicate() + " AND ((state='pending' AND available<=?) OR (state='running' AND lease<?))" + lane_filter + (" AND id=?" if job_id else "") + " ORDER BY CASE WHEN json_extract(data,'$.stimulus') IN ('session-maintenance','idle-review','exploration-result') THEN -1 WHEN json_extract(data,'$.stimulus') IN ('memory-backfill','memory-enrichment') THEN 1 ELSE 0 END,available LIMIT 1",
                 (self.mind.scope.key(), time.time(), time.time(), *([job_id] if job_id else [])),
             ).fetchone()
             if not row:
-                return {"state": "idle"}
+                return {"state": "idle", **({"reason": "hourly-limit"} if capped else {})}
             data = json.loads(row["data"])
             maintenance = data.get("stimulus") == "session-maintenance"
             enrichment = data.get("stimulus") in {"memory-backfill", "memory-enrichment"}
@@ -2945,6 +2986,11 @@ class Appraisals:
                         "recall_budget": {"rounds": RECALL_ROUNDS, "seconds": RECALL_SECONDS},
                         # How long it has been quiet, counted from the records: facts, never a gate.
                         "initiative_facts": initiative.facts(self.mind)}
+                    # An idle review also sees Kin's interests and boredom (play.py).
+                    from .play import context as play_context
+                    play = play_context(self.mind) if "idle-review" in set(data.get("stimuli") or [data.get("stimulus")]) else None
+                    if play:
+                        model_context["autonomy_context"]["play"] = play
                 if settings["usage_reinforcement"] and memory_context:
                     from .reinforcement import strengths
                     identifiers = [n["id"] for k in ("works", "shares", "graph_candidates") for n in memory_context.get(k, [])]
@@ -3365,8 +3411,23 @@ class Appraisals:
                         # advice_record() validates before it builds anything. The judgment goes to the
                         # session registry's carrier inside this transaction, not into the versioned
                         # mind state (DB1-03, §5.6). A core without that carrier keeps the old place.
-                        record = advice_record(proposal.session_advice, review_context, receipt, eid,
-                                               request_id=data.get("session_request_id"))
+                        try:
+                            record = advice_record(proposal.session_advice, review_context, receipt, eid,
+                                                   request_id=data.get("session_request_id"))
+                        except AdviceRejected as error:
+                            if not session_review_required:
+                                raise
+                            # A review the host asked for is refused the same way alone or in a batch: retried,
+                            # and at the limit for one snapshot settled on the fixed fallback (item 14).
+                            snapshot = (review_context or {}).get("id")
+                            seen = data.get("advice_rejections") or {}
+                            count = (seen.get("count", 0) if seen.get("snapshot") == snapshot else 0) + 1
+                            data["advice_rejections"] = {"snapshot": snapshot, "count": count, "code": error.code}
+                            if count < ADVICE_REJECTION_LIMIT:
+                                raise
+                            record = advice_record(advice_fallback(proposal.session_advice, error), review_context, receipt, eid,
+                                                   request_id=data.get("session_request_id"))
+                            data["advice_fallback"] = record["decision"]["action"]
                         from . import session_advice as advice_store
                         if record:
                             advice_store.submit(conn, self.mind.scope.key(), record, self.mind.clock())
@@ -3678,7 +3739,10 @@ class Appraisals:
                         # The previous order, so that with the switch off two faults still surface as they did.
                         apply_habits()
                     if proposal.session_advice and review_context and not historical:
-                        section("session_advice", apply_advice)
+                        if session_review_required:
+                            apply_advice()
+                        else:
+                            section("session_advice", apply_advice)
                     # The audited sections, last and in one fixed order, each inside its own savepoint.
                     applied_sections = []
                     for name in offered:
@@ -3792,7 +3856,8 @@ class Appraisals:
                 self._arm_follow_up(data["result"]["follow_up_id"])
             if data["result"].get("contact_decision") and not recovered:
                 # Counted by state, so an idle review that said nothing about contacting shows.
-                self.engine.db.metric("idle_contact_decision", 1, {"state": data["result"]["contact_decision"]["state"]})
+                decision = data["result"]["contact_decision"]
+                self.engine.db.metric("idle_contact_decision", 1, {"state": decision["state"], **({"defaulted": True} if decision.get("defaulted") else {})})
             # The committed result is the authority for these, and a replayed command receipt carries the same lists.
             # (A commit that failed as a whole keeps the refusals apply() had recorded until then.)
             for key in ("held_decisions", "rejected_sections", "held_sections"):
@@ -3929,10 +3994,15 @@ class Appraisals:
                 "UPDATE mind_appraisals SET state=?,available=?,lease=0,attempts=attempts-?,data=? WHERE id=? AND state='running' AND json_extract(data,'$.attempt_token')=?",
                 (state, time.time() + delay, int(uncharged), queue_row(conn, self.mind.scope.key(), stored), row["id"], data["attempt_token"]),
             ).rowcount
+            resumed = []
             if changed:
                 self._settle_children(conn, row["id"], stored, state)
                 if release:
                     self._release_members(conn, row["id"], release)
+                if state == "complete" and completed_appraisal(calls):
+                    # The provider answers again: what only its outage set aside goes back to the queue.
+                    from .recovery import resume_after_provider
+                    resumed = resume_after_provider(conn, self.mind.scope.key(), self.mind.clock())
             if ledger:
                 # One row per attempt, written with the row's final state in the same transaction:
                 # both commit or neither does, so a process that dies here leaves the row `running`
@@ -3943,6 +4013,8 @@ class Appraisals:
                 self._ledger_attempt(row, data, state, calls, owned=bool(changed),
                                      charged=not uncharged, historical=historical,
                                      maintenance=maintenance, conn=conn)
+        if resumed:
+            self.engine.db.metric("appraisal_auto_resumed", len(resumed), {"after": row["id"]})
         if changed and state != "pending":
             self._reschedule_idle(data, settings)
         if changed and state == "needs-repair":

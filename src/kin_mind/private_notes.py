@@ -21,6 +21,7 @@ PROMPT = ('这是你自己写的私密心情札记，属于当时的角色感受
           '小光的最新说明和纠正优先；旧猜测不自动代表现在。')
 MAX_NOTES = 20000
 MAX_TEXT = 4000
+MAX_SOURCES = 2000
 
 
 class PrivateNotes:
@@ -37,6 +38,11 @@ class PrivateNotes:
             raise ValueError('private-note-text-invalid')
         at = timestamp(request.get('at') or self.mind.clock()).isoformat()
         input_id = request.get('input_id')
+        # What the note was written from, besides its input: kept on the row (`rests_on`, never shown) so a
+        # delete of any of it takes the note.
+        named = request.get('source_ids') or []
+        if not isinstance(named, list) or len(named) > MAX_SOURCES or not all(isinstance(i, str) and i for i in named):
+            raise ValueError('private-note-sources-invalid')
         data = {k: request[k] for k in ('turn_id', 'model', 'provider', 'session', 'reply_text', 'corrects', 'person_id', 'conversation_key') if k in request}
         if isinstance(data.get('reply_text'), str):
             data['reply_text'] = data['reply_text'][:2000]
@@ -45,6 +51,9 @@ class PrivateNotes:
             old = conn.execute('SELECT data FROM mind_private_notes WHERE scope=? AND id=?', (self.scope, identifier)).fetchone()
             if old:
                 if json.loads(old['data']).get('text') != data['text']:
+                    if request.get('on_conflict') == 'keep':
+                        # A redraft of the same attempt keeps the note already written.
+                        return {'state': 'saved', 'id': identifier, 'kept': 'existing'}
                     raise Conflict('Private note identity already used', code='private-note-conflict')
                 return {'state': 'saved', 'id': identifier}
             if input_id:
@@ -52,6 +61,12 @@ class PrivateNotes:
                 if any(r['deleted'] for r in rows):
                     raise Conflict('Private note input was erased', code='private-note-input-erased')
                 data['evidence_ids'] = [r['id'] for r in rows]
+            if named:
+                for start in range(0, len(named), 400):
+                    page = named[start:start + 400]
+                    if conn.execute(f"SELECT 1 FROM sources WHERE scope=? AND deleted AND id IN ({','.join('?' * len(page))}) LIMIT 1", (self.scope, *page)).fetchone():
+                        raise Conflict('Private note input was erased', code='private-note-input-erased')
+                data['rests_on'] = list(dict.fromkeys(named))
             conn.execute('INSERT INTO mind_private_notes VALUES(?,?,?,?,?,?)', (self.scope, identifier, at, input_id, group, dumps(data)))
             # Bound disk use as well as prompt use. No automatic model summaries or fact promotion.
             conn.execute('DELETE FROM mind_private_notes WHERE scope=? AND id IN '
@@ -73,7 +88,7 @@ class PrivateNotes:
             # Queries stay local. A bounded semantic rerank is optional and never a paid chat call.
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_private_notes'").fetchone()
             rows = conn.execute('SELECT * FROM mind_private_notes WHERE '+' AND '.join(where)+' ORDER BY at DESC,id DESC', args).fetchall() if exists else []
-        entries = [{**json.loads(r['data']), 'id': r['id'], 'at': r['at'], 'input_id': r['input_id'], 'group_id': r['group_id']} for r in rows]
+        entries = [{**{k: v for k, v in json.loads(r['data']).items() if k != 'rests_on'}, 'id': r['id'], 'at': r['at'], 'input_id': r['input_id'], 'group_id': r['group_id']} for r in rows]
         state = 'not-needed'
         if query:
             from .memory import tokenize

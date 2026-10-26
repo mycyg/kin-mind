@@ -121,7 +121,7 @@ def test_companion_windows_keep_people_and_conversations_separate(env):
             windows=mind.read()["rhythm"]["interactions"]
         assert windows["last_owner_at"]==(clock[0]-timedelta(minutes=5-expected)).isoformat()
         assert windows["recipient_person_id"]==person
-        assert windows["conversation_key"]==chat
+        assert "conversation_key" not in windows
 
 
 def test_real_split_phase_proposal_uses_phase_and_arrival_cannot_overwrite_it(env):
@@ -241,7 +241,7 @@ def daytime(clock):
 def test_circadian_daytime_idle_recovers_reserve_but_accumulates_awake_fatigue(env):
     mind,_,clock,_,_=env
     daytime(clock)
-    energy.configure(mind,{"enabled":True})
+    energy.configure(mind,{"enabled":True,"idle_rest_minutes":0})
     clock[0]+=timedelta(hours=4)
     v=mind.read()["energy_context"]
     assert (v["reserve"],v["fatigue"],v["night_penalty"],v["value"])==(79,8,0,71)
@@ -254,7 +254,7 @@ def test_midnight_crossing_and_late_work_never_turn_waiting_into_vigor(env):
     mind,_,clock,_,_=env
     daytime(clock)
     clock[0]+=timedelta(hours=10)  # Singapore 22:00
-    energy.configure(mind,{"enabled":True})
+    energy.configure(mind,{"enabled":True,"idle_rest_minutes":0})
     start=mind.read()["energy_context"]
     clock[0]+=timedelta(hours=4)  # next day 02:00
     before=mind.read()["energy_context"]
@@ -269,7 +269,7 @@ def test_midnight_crossing_and_late_work_never_turn_waiting_into_vigor(env):
 def test_sleep_recovery_uses_real_phase_transition_and_does_not_reset_on_repeat(env):
     mind,_,clock,_,_=env
     daytime(clock)
-    energy.configure(mind,{"enabled":True})
+    energy.configure(mind,{"enabled":True,"idle_rest_minutes":0})
     clock[0]+=timedelta(hours=11) # 23:00, reserve86/fatigue22
     set_phase(mind,"resting","sleep")
     first=mind.read()["energy_context"]
@@ -295,7 +295,7 @@ def test_long_offline_and_reboot_follow_last_recorded_phase_not_guessed_sleep(en
     mind,_,clock,_,_=env
     daytime(clock)
     set_phase(mind,phase,"before-enable")
-    energy.configure(mind,{"enabled":True})
+    energy.configure(mind,{"enabled":True,"idle_rest_minutes":0})
     assert mind.read()["energy_context"]["mode"]==phase # first enable while already resting
     clock[0]+=timedelta(days=30)
     before=mind.read()["energy_context"]
@@ -333,7 +333,7 @@ def test_dst_and_utc_elapsed_time_do_not_double_count_a_repeated_local_hour(env)
     # Next known future fall-back Sunday in New York. 05:30 and 06:30 UTC
     # are both 01:30 local, but elapsed fatigue is exactly one hour.
     clock[0]=datetime(2027,11,7,5,30,tzinfo=timezone.utc)
-    energy.configure(mind,{"enabled":True,"timezone":"America/New_York"})
+    energy.configure(mind,{"enabled":True,"timezone":"America/New_York","idle_rest_minutes":0})
     first=mind.read()["energy_context"]
     clock[0]+=timedelta(hours=1)
     second=mind.read()["energy_context"]
@@ -461,3 +461,32 @@ def test_dead_exploration_receipt_is_reclaimed_without_leaving_busy(env):
     assert explorer.reclaim_dead()==[]
     energy.activity(mind,{"kind":"explore","activity_id":"wish:recovery","execution_id":"explore-dead","execution_state":"started"})
     assert mind.read()["energy_context"]["active_execution_count"]==0
+
+
+def test_quiet_awake_stretch_recovers_fatigue_without_a_rest_phase(env):
+    mind, _, clock, _, _ = env
+    energy.configure(mind, {"enabled": True, "night_penalty": 0})
+    energy.activity(mind, {"kind": "reply", "activity_id": "chat"})
+    clock[0] += timedelta(minutes=30)
+    busy = mind.read()["energy_context"]
+    assert busy["fatigue"] == 1 and busy["rest"] is None
+    clock[0] += timedelta(hours=4)
+    quiet = mind.read()["energy_context"]
+    # The reserve still recovers at the awake rate; only fatigue eases once it has been quiet.
+    assert (quiet["fatigue"], quiet["rest"], quiet["mode"]) == (0, "idle", "awake")
+    assert quiet["reserve"] == round(75 - 1.5 + 4.5, 2) and quiet["tier"] == "high"
+    energy.activity(mind, {"kind": "work", "activity_id": "job"})
+    clock[0] += timedelta(minutes=30)
+    assert mind.read()["energy_context"]["fatigue"] == 1
+
+
+def test_tier_thresholds_and_new_activity_kinds(env):
+    mind, _, _, _, _ = env
+    view = energy.configure(mind, {"enabled": True, "night_penalty": 0, "initial": 20})["energy_context"]
+    assert view["tier"] == "low" and (view["low_threshold"], view["high_threshold"]) == (20, 70)
+    assert energy.configure(mind, {"high_threshold": 15, "low_threshold": 5})["energy_context"]["tier"] == "high"
+    for kind in ("contact", "play"):
+        assert energy.activity(mind, {"kind": kind, "activity_id": kind})["state"] == "applied"
+    assert mind.read()["energy_context"]["reserve"] == 16
+    with pytest.raises(ValueError):
+        energy.activity(mind, {"kind": "nap", "activity_id": "x"})

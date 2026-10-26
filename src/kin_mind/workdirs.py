@@ -13,7 +13,8 @@ So once a run is settled, a stopped one too, these files keep what names or clas
 -- identifiers, states and codes, model and executor names, paths and locators, times, hashes,
 numbers -- and lose every word (`without_words`): a page's text goes whole. The directory itself
 stays, as a stopped run's always has. Only words go: nothing a person wrote or asked for is
-deleted here, and the store keeps its own.
+deleted here, and the store keeps its own. A week after its words went, everything but the run's
+receipt and marker moves into the owner's Trash (`archive`), never deleted.
 
 Three things take the words: the run itself once it is settled, the host at every start (every
 settled run's directory not marked yet: a run stopped with the host, one settled before this
@@ -28,7 +29,10 @@ cases both answer the same."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
+import time
 from pathlib import Path
 
 from eventmem.core.db import dumps
@@ -72,6 +76,10 @@ PAGES = "web-content/*.txt"
 LEFT = ("*.tmp", "web-content/*.tmp")
 # Written once the directory has lost its words, so that a later sweep passes it by.
 MARKER = "words-removed.json"
+# A settled run keeps only its conclusion -- the receipt and the marker -- once its words have been
+# gone this many days; everything else of its directory moves into the owner's Trash.
+KEEP_DAYS = 7
+CONCLUSION = ("receipt.json", MARKER)
 
 
 def kept(value, key=None, keys=frozenset()):
@@ -171,6 +179,51 @@ def sweep(root, settled):
             except OSError:
                 continue
             done.append(directory.name)
+    return done
+
+
+def to_trash(path, trash=None):
+    """`path` moved into the owner's Trash under its own name -- `-2`, `-3`... when taken -- claimed
+    first by an empty directory the rename then replaces; never copied, never deleted (as the
+    host's trash.mjs). Returns where it went."""
+    trash = Path(trash) if trash else Path.home() / ".Trash"
+    for n in range(1, 100):
+        target = trash / (path.name if n == 1 else f"{path.name}-{n}")
+        try:
+            target.mkdir()
+        except FileExistsError:
+            continue
+        try:
+            os.rename(path, target)
+        except OSError:
+            target.rmdir()
+            raise
+        return target
+    raise FileExistsError(path.name)
+
+
+def archive(root, settled, *, days=KEEP_DAYS, now=None, trash=None):
+    """Every settled run under `root` whose words went `days` ago or more keeps its conclusion; the
+    rest of its directory moves into the Trash, one directory a run. Returns the run ids moved."""
+    root, now = Path(root), time.time() if now is None else now
+    if not root.is_dir():
+        return []
+    done = []
+    for directory in sorted(root.iterdir()):
+        marker = directory / MARKER
+        try:
+            if directory.name not in settled or not marker.is_file() or marker.stat().st_mtime > now - days * 86400:
+                continue
+            rest = [path for path in directory.iterdir() if path.name not in CONCLUSION]
+            if not rest:
+                continue
+            holder = Path(tempfile.mkdtemp(prefix="kin-exploration-" + directory.name + "-", dir=root))
+            for path in rest:
+                os.rename(path, holder / path.name)
+            to_trash(holder, trash)
+        except OSError:
+            continue
+        done.append(directory.name)
     return done
 
 

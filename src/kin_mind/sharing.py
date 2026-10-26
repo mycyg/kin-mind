@@ -241,10 +241,11 @@ class ShareLedger:
         return data
 
     def settle(self, conn, share, *, mappings=None):
-        """Only persisted, host-observed bubbles can change delivery coverage."""
-        recipient=share.get("recipient_person_id", "owner")
+        """Only persisted, host-observed bubbles can change delivery coverage.
+        Each bubble counts for its own recipient; one reply may address several."""
         supplied = {m.bubble_id: m for m in mappings or []}
         for bid, bubble in share.get("bubbles", {}).items():
+            recipient = bubble.get("recipient_person_id") or share.get("recipient_person_id", "owner")
             mapping = supplied.get(bid)
             raw_refs = [r.model_dump() for r in mapping.references] if mapping else bubble.get("references", [])
             for raw in raw_refs:

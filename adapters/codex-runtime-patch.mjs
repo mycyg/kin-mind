@@ -685,9 +685,9 @@ function kinToolResultIds(item, turn) {
         lastTurnId = latest.turnId;
       }
       const selectedModel = ModelId.fromString(state.currentModelId);
-      // Self-contained evaluations always use the existing DS/high profile.
-      // Drafts and executions retain their explicit model policy; main is unchanged.
-      const modelId = params.detachedContext === true || ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(selectedModel.model) && params.preserveModel !== true ? ModelId.create("deepseek-flash", "high") : selectedModel;
+      // Self-contained evaluations always use the existing DS/high profile; a detached draft that
+      // preserves the model keeps main's. Drafts and executions retain their explicit model policy; main is unchanged.
+      const modelId = (params.detachedContext === true || ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(selectedModel.model)) && params.preserveModel !== true ? ModelId.create("deepseek-flash", "high") : selectedModel;
       const config = await kinWithin(this.codexAcpClient.createSessionConfig(state.cwd, state.additionalDirectories ?? [], []), deadline, "timeout");
       const servers = await kinWithin(this.codexAcpClient.getConfigMcpServerNames(state.cwd), deadline, "timeout");
       for (const name of servers) if (name !== "memorypalace") config[\`mcp_servers.\${name}.enabled\`] = false;
@@ -715,7 +715,14 @@ function kinToolResultIds(item, turn) {
       // A self-contained assessment keeps persona/config and scoped read tools, not
       // the main conversation's private transcript. Each request supplies its full schema/state.
       if (params.detachedContext === true && execution) return end("failed", { error: "detached-execution-not-supported" });
-      const threadOptions = { ephemeral: true, cwd: state.cwd, model: modelId.model, modelProvider: await this.codexAcpClient.getResumeModelProvider(), approvalPolicy: "never", sandbox: executionShell ? state.agentMode.sandboxMode : "read-only", config };
+      let modelProvider = await this.codexAcpClient.getResumeModelProvider();
+      // A gateway model while main runs on its native provider: the host's gateway serves this thread alone.
+      if (params.detachedContext === true && this.codexAcpClient.gatewayConfig === null && typeof params.gateway?.baseUrl === "string" && typeof params.gateway?.token === "string" &&
+          (modelId.model === "deepseek-flash" || ["kimi-for-coding", "kimi-for-coding-highspeed", "k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed"].includes(modelId.model))) {
+        config.model_providers = { ...(config.model_providers ?? {}), "custom-gateway": { name: "Kin gateway", base_url: params.gateway.baseUrl, http_headers: { "X-Client-Feature-ID": "codex", Authorization: "Bearer " + params.gateway.token }, wire_api: "responses" } };
+        modelProvider = "custom-gateway";
+      }
+      const threadOptions = { ephemeral: true, cwd: state.cwd, model: modelId.model, modelProvider, approvalPolicy: "never", sandbox: executionShell ? state.agentMode.sandboxMode : "read-only", config };
       const forkPromise = params.detachedContext === true ? api.threadStart(threadOptions) : api.threadFork({ ...threadOptions, threadId: params.sessionId, lastTurnId, excludeTurns: true });
       void forkPromise.then((fork) => { if (stopped && result.forkThreadId === null) void release(fork.thread.id); }, () => {});
       const fork = await kinWithin(forkPromise, deadline, "timeout");
@@ -784,7 +791,7 @@ function kinToolResultIds(item, turn) {
   source = replaceOnce(source, '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);',
     '    if (method === "_kin/runtime") return await this.kinRuntime(params.sessionId);\n    if (method === "_kin/assess") return await this.kinAssess(params);', 'ACP assessment dispatch');
   source = replaceOnce(source, '.onRequest("_kin/runtime",',
-    '.onRequest("_kin/assess", external_exports.object({sessionId: external_exports.string(), requestId: external_exports.string(), input: external_exports.unknown(), outputSchema: external_exports.unknown(), timeoutMs: external_exports.number().optional(), lastTurnId: external_exports.string().optional(), preserveModel: external_exports.boolean().optional(), detachedContext: external_exports.boolean().optional(), execution: external_exports.object({kind:external_exports.string(),capability:external_exports.string()}).optional()}), (ctx) => getAgent().extMethod("_kin/assess", ctx.params)).onRequest("_kin/runtime",', 'ACP assessment registration');
+    '.onRequest("_kin/assess", external_exports.object({sessionId: external_exports.string(), requestId: external_exports.string(), input: external_exports.unknown(), outputSchema: external_exports.unknown(), timeoutMs: external_exports.number().optional(), lastTurnId: external_exports.string().optional(), preserveModel: external_exports.boolean().optional(), detachedContext: external_exports.boolean().optional(), gateway: external_exports.object({baseUrl: external_exports.string(), token: external_exports.string()}).optional(), execution: external_exports.object({kind:external_exports.string(),capability:external_exports.string()}).optional()}), (ctx) => getAgent().extMethod("_kin/assess", ctx.params)).onRequest("_kin/runtime",', 'ACP assessment registration');
   if (!source.includes('async kinCompact(') || !source.includes('function kinWithin(')) throw Error('ACP assessment needs the compaction bound helper');
   return mark(source, assessmentMarker);
 }

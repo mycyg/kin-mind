@@ -992,8 +992,25 @@ test('65 percent capacity uses local checkpoint without needing a semantic sugge
  assert.equal((await f.manager.tick()).state,'complete');assert.equal(f.calls.filter(x=>x==='compact').length,1);
 });
 
+test('auto chat compacts near 120k input; other models keep their window share (feature 6)',()=>{
+ const runtime=model=>({model,modelContextWindow:1048576,lastTokenUsage:{inputTokens:121000}});
+ assert.ok(windowPressure(runtime('deepseek-flash')).ratio>=SESSION_DEFAULTS.compactPressure);
+ assert.equal(windowPressure({...runtime('deepseek-flash'),lastTokenUsage:{inputTokens:100000}}).ratio<SESSION_DEFAULTS.compactPressure,true);
+ assert.equal(windowPressure(runtime('gpt-test')).level,'normal');
+});
+test('a compaction that left the window elevated is not asked for again on that pressure each cooldown (feature 6)',async t=>{
+ const f=fixture(t);f.runtime.lastTokenUsage.inputTokens=16000;
+ f.manager.compact=async id=>{f.calls.push('compact');f.runtime.lastTokenUsage.inputTokens=15000;return {completed:true,actual_session:'old',operationId:id,at:new Date(f.clock.now).toISOString()};};
+ await f.advise('compact');assert.equal((await f.manager.tick()).state,'complete');
+ const asked=f.calls.filter(c=>c==='review').length;
+ for(let i=0;i<3;i++){minutes(f,31);await f.manager.tick();}
+ assert.equal(f.calls.filter(c=>c==='review').length,asked);assert.equal(f.calls.filter(c=>c==='compact').length,1);
+ f.runtime.lastTokenUsage.inputTokens=50000;minutes(f,1);await f.manager.tick();
+ assert.equal(f.calls.filter(c=>c==='review').length,asked+1,'critical pressure still asks');
+});
 test('55 percent warms one checkpoint in the same controller; identical idle ticks reuse it',async t=>{
- const f=fixture(t);f.runtime.modelContextWindow=1000000;f.runtime.lastTokenUsage={inputTokens:520000};f.manager.state.config.compactPressure=0.65;
+ // Not the chat model, which compacts early (CHAT_COMPACTION).
+ const f=fixture(t);f.runtime.model='gpt-test';f.runtime.modelContextWindow=1000000;f.runtime.lastTokenUsage={inputTokens:520000};f.manager.state.config.compactPressure=0.65;
  let builds=0;const build=f.manager.checkpoint;f.manager.checkpoint=async(...args)=>{builds++;return build(...args);};
  await f.manager.tick();assert.equal(builds,1);assert.equal(f.calls.includes('compact'),false);assert.equal(f.manager.state.checkpointPreparation.complete,true);
  await f.manager.tick();assert.equal(builds,1);

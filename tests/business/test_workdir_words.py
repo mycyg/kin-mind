@@ -225,3 +225,29 @@ def test_a_delete_takes_the_words_of_the_settled_runs_that_name_what_it_takes(tm
     for name in ("explore_other", "explore_going"):
         assert MARKER_WORDS in (root / name / "input.json").read_text(), name
         assert not (root / name / MARKER).exists(), name
+
+
+def test_a_week_after_its_words_went_a_run_keeps_only_its_conclusion(tmp_path):
+    """Feature 7: past KEEP_DAYS the swept directory keeps its receipt and marker; the rest moves
+    into the Trash in one directory of its own, and nothing is deleted. A newer run, a running one
+    and a directory no run is named for are left alone; a second pass finds nothing to move."""
+    import os
+    from kin_mind import workdirs
+    root, trash = tmp_path / "exploration", tmp_path / "trash"
+    trash.mkdir()
+    for name in ("explore_old", "explore_new", "explore_going", "deploy-check-run"):
+        left_behind(root, name)
+    (root / "explore_old" / "receipt.json").write_text(dumps({"state": "complete"}))
+    settled = {"explore_old": "complete", "explore_new": "failed"}
+    workdirs.sweep(root, settled)
+    now = os.stat(root / "explore_new" / workdirs.MARKER).st_mtime + 3600
+    old = now - 8 * 86400
+    os.utime(root / "explore_old" / workdirs.MARKER, (old, old))
+    assert workdirs.archive(root, settled, now=now, trash=trash) == ["explore_old"]
+    assert sorted(p.name for p in (root / "explore_old").iterdir()) == sorted(workdirs.CONCLUSION)
+    [moved] = list(trash.iterdir())
+    assert moved.name.startswith("kin-exploration-explore_old-") and (moved / "input.json").exists()
+    for name in ("explore_new", "explore_going", "deploy-check-run"):
+        assert (root / name / "input.json").exists()
+    assert workdirs.archive(root, settled, now=now, trash=trash) == []
+    assert sorted(p.name for p in root.iterdir()) == ["deploy-check-run", "explore_going", "explore_new", "explore_old"]

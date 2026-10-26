@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS mind_memory_migrations(
 # The quiet-review interval Kin may choose (N8, set by kin_mind.appraisal). The stored
 # review_min/max_minutes keys stay readable for older configurations and bound nothing now.
 REVIEW_FLOOR_MINUTES, REVIEW_CEILING_MINUTES = 10, 1440
+# With nothing newer than the last committed assessment, the quiet review Kin scheduled waits until
+# this long after it: new input and changes wake their own; wishes, diary and dreams keep growing.
+QUIET_REVIEW_MINUTES = 120
 
 def review_minutes(value, maximum=None):
     return max(REVIEW_FLOOR_MINUTES, min(maximum or REVIEW_CEILING_MINUTES, value))
@@ -690,7 +693,8 @@ class MemoryContinuity:
                         "conversation_id": event.get("conversation_id"), "message_ids": event.get("message_ids", []),
                         "source_ids": self.sharing.reference_sources(conn, event.get("references", prior.get("references", []))),
                         "references": event.get("references", prior.get("references", [])), "draft_id": event.get("draft_id"),
-                        "reply_id": event.get("reply_input_id") or prior.get("reply_id")}
+                        "reply_id": event.get("reply_input_id") or prior.get("reply_id"),
+                        **({"recipient_person_id": event["recipient_person_id"]} if event.get("recipient_person_id") else {})}
                 elif event.get("message_id") and prior["message_id"] != event["message_id"]:
                     raise Conflict("Accepted bubble cannot change platform ID")
                 states = {b["state"] for b in share["bubbles"].values()}
@@ -1014,6 +1018,9 @@ class MemoryContinuity:
     def queue_idle(self, actions):
         due = self.due()
         if not due:
+            return None
+        last = json.loads(due.get("data") or "{}").get("last_success")
+        if last and timestamp(self.mind.clock()) - timestamp(last) < timedelta(minutes=QUIET_REVIEW_MINUTES):
             return None
         with self.engine.db.connect(write=True) as conn:
             state = self.mind._load(conn)

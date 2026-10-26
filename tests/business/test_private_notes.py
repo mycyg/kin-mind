@@ -36,6 +36,21 @@ def test_saved_once_restart_time_message_and_private_search(tmp_path):
     assert again.read()['notes']==[]
 
 
+def test_contact_note_names_its_sources_and_a_redraft_keeps_it(tmp_path):
+    mind, source=setup(tmp_path);notes=PrivateNotes(mind)
+    req={'id':'note:contact:a1','group_id':'a1','text':'想问问今天顺不顺利。','source_ids':[source['id']],'on_conflict':'keep'}
+    assert notes.save(req)['state']=='saved'
+    # A crash and a redraft write other words under the same attempt: the first note stays, no failure.
+    assert notes.save({**req,'text':'换了一种说法。'})=={'state':'saved','id':'note:contact:a1','kept':'existing'}
+    assert notes.read(identifier='note:contact:a1')['notes'][0]['text']==req['text']
+    shown=notes.read(identifier='note:contact:a1')['notes'][0]
+    assert shown['evidence_ids']==[] and 'rests_on' not in shown, 'what it rests on is kept for deletes, not shown'
+    from kin_mind.erasure import _recall_rows
+    with mind.engine.db.connect(write=True) as conn:_recall_rows(conn,{source['id']},{source['id']})
+    assert notes.read()['notes']==[]
+    with pytest.raises(ValueError):notes.save({**req,'id':'x','source_ids':'src'})
+
+
 def test_semantic_paraphrase_and_scope(tmp_path,monkeypatch):
     mind,_=setup(tmp_path);notes=PrivateNotes(mind)
     notes.save({'id':'one','group_id':'a','text':'想靠近她一点。'})

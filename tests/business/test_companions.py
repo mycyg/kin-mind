@@ -1,3 +1,4 @@
+import json
 import pytest
 from eventmem.core import Engine
 from eventmem.core.db import Conflict, Missing
@@ -9,16 +10,16 @@ SCOPE=Scope(persona='duo-synthetic');AT='2026-09-01T05:00:00Z'
 @pytest.fixture
 def world(tmp_path):
     e=Engine(tmp_path/'memory');m=Companions(e,SCOPE)
-    def source(key,person=X,classification='ordinary',text='一起散步',sharing='ordinary-shared',parents=None):
+    def source(key,person=X,text='一起散步',parents=None):
         sid=e.receive(SourceInput(namespace='kin-owner-input',key=key,scope=SCOPE,text=text,occurred_at=AT,extract=False),derived_from=parents)['id']
-        m.annotate(source_id=sid,speaker_person_id=person,conversation_key='chat:'+str(person),classification=classification,sharing=sharing,command_id=key,evidence_id='synthetic:'+key,participants=[{'person_id':Y,'role':'companion'}])
+        m.annotate(source_id=sid,speaker_person_id=person,conversation_key='chat:'+str(person),command_id=key,evidence_id='synthetic:'+key,participants=[{'person_id':Y,'role':'companion'}])
         return sid
     return e,m,source
 
 def test_times_speaker_participants_and_protected_derivation(world):
     e,m,source=world;s=source('walk');v=m.source_view(s,Y)
     assert v['occurred_at'].startswith('2026-09-01') and v['speaker_person_id']==X and v['participants'][0]['person_id']==Y
-    private=source('private',classification='intimate');derived=source('summary',parents=[private])
+    private=source('private',text='私密的事');derived=source('summary',parents=[private])
     assert m.source_view(private,X)
     for sid in [private,derived]:
         assert m.source_view(sid,Y)['speaker_person_id']==X
@@ -28,9 +29,9 @@ def test_times_speaker_participants_and_protected_derivation(world):
     assert e.source(old)['occurred_at'].startswith('2026-09-01')
 
 def test_private_reply_visible_only_to_original_recipient(world):
-    e,m,source=world;s=source('private-y',Y,'private',sharing='pending')
+    e,m,source=world;s=source('private-y',Y)
     reply=e.receive(SourceInput(namespace='kin-companion-output',key='reply',scope=SCOPE,text='收到',extract=False),derived_from=[s])['id']
-    m.annotate(source_id=reply,speaker_person_id='agent:kin',recipient_person_id=Y,conversation_key='chat:'+Y,classification='ordinary',sharing='pending',command_id='reply',evidence_id='om_reply')
+    m.annotate(source_id=reply,speaker_person_id='agent:kin',recipient_person_id=Y,conversation_key='chat:'+Y,command_id='reply',evidence_id='om_reply')
     assert m.source_view(reply,Y)
     assert m.source_view(reply,X)['speaker_person_id']=='agent:kin'
 
@@ -59,17 +60,35 @@ from test_event_graph import system, findings
 
 def test_host_context_keeps_real_text_unknown_time_and_speaker(system):
     mind,memory,_,_=system;cfg={'scope':mind.scope.model_dump(),'agent_version':'synthetic'}
-    ident={'speaker_person_id':Y,'conversation_key':'feishu:cli_t:oc_y','source_message_id':'om_y','route':{'chat_id':'oc_y'},'sharing':'pending'}
+    ident={'speaker_person_id':Y,'conversation_key':'feishu:cli_t:oc_y','source_message_id':'om_y','route':{'chat_id':'oc_y'}}
     got=dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'synthetic-y','text':'我今天在看星星','at':None,'received_at':'2020-01-01T02:00:00Z','identity':ident})
     ctx=dispatch_companion(mind.engine,cfg,'companion-context',{'person_id':Y,'conversation_key':ident['conversation_key'],'query':'星星'})
     assert any(s['text']=='我今天在看星星' and s['occurred_at'] is None and s['speaker_person_id']==Y for s in ctx['sources'])
     with mind.engine.db.connect() as conn:
         assert Companions(mind.engine,mind.scope).visible(conn,got['source_id'],X)
 
+def test_annotation_keeps_only_who_said_it_and_legacy_labels_replay(world):
+    """One memory, Kin's judgment: no sharing classification is asked for, stored or shown."""
+    e,m,source=world;sid=source('plain',Y,text='今天吃了面')
+    with e.db.connect() as conn:
+        saved=m.annotation(conn,sid)
+    assert saved['speaker_person_id']==Y and not {'classification','sharing'}&set(saved)
+    with pytest.raises(TypeError):
+        m.annotate(source_id=sid,speaker_person_id=Y,conversation_key='chat:'+Y,classification='private',command_id='label',evidence_id='synthetic')
+    with pytest.raises(ValueError):
+        dispatch_companion(e,{'scope':SCOPE.model_dump()},'companion-classify',{'source_id':sid,'person_id':Y,'classification':'private','command_id':'c'})
+    old=e.receive(SourceInput(namespace='kin-owner-input',key='labelled',scope=SCOPE,text='旧标注',occurred_at=AT,extract=False))['id']
+    intent=dict(source_id=old,speaker_person_id=X,conversation_key='chat:x',subject_ids=[],participants=[],basis='explicit',evidence_id='synthetic',recipient_person_id=None)
+    with e.db.connect(write=True) as conn:
+        legacy={**intent,'classification':'uncertain','sharing':'pending'}
+        conn.execute('INSERT INTO mind_companion_changes VALUES(?,?,?)',(SCOPE.key(),'legacy-input',json.dumps({'intent':legacy,'result':{**legacy,'revision':1}})))
+    assert m.annotate(source_id=old,speaker_person_id=X,conversation_key='chat:x',command_id='legacy-input',evidence_id='synthetic')['revision']==1
+
+
 def test_one_finding_can_reach_each_person_once_and_reply_belongs_to_chat(system):
     mind,memory,_,_=system;unit=findings(system)[0];m=Companions(mind.engine,mind.scope)
     for sid in unit['source_ids']:
-        m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key=None,classification='ordinary',sharing='ordinary-shared',basis='internal_thought',command_id='kin:'+sid,evidence_id='exploration-test',participants=[{'person_id':'agent:kin','role':'explorer'}])
+        m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key=None,basis='internal_thought',command_id='kin:'+sid,evidence_id='exploration-test',participants=[{'person_id':'agent:kin','role':'explorer'}])
     cfg={'scope':mind.scope.model_dump(),'agent_version':'synthetic'};ref={'unit_id':unit['id'],'version':1,'mode':'new'}
     for person,chat in [(X,'oc_x'),(Y,'oc_y')]:
         draft='share-'+person
@@ -100,7 +119,7 @@ def test_reviewed_legacy_migration_never_rewrites_time_bytes_or_unknown_actor(wo
     old=e.receive(SourceInput(namespace='kin-owner-input',key='legacy-review',scope=SCOPE,text='从前我和一一看灯',occurred_at=AT,extract=False,metadata={'participants':[{'person_id':Y,'role':'companion'}]}))['id']
     unknown=e.receive(SourceInput(namespace='unclassified-import',key='unknown',scope=SCOPE,text='某个人说过的话',occurred_at=AT,extract=False))['id']
     before=e.source(old);blob=e.source(old,content=True).read_bytes()
-    result=m.migrate_legacy(source_ids=[old,unknown],classifications={old:'ordinary'},command_id='reviewed-batch',evidence_id='fixture-owner-consent')
+    result=m.migrate_legacy(source_ids=[old,unknown],command_id='reviewed-batch',evidence_id='fixture-owner-consent')
     assert result['items'][1]['state']=='unknown-speaker'
     assert e.source(old)['occurred_at']==before['occurred_at'] and e.source(old,content=True).read_bytes()==blob
     view=m.source_view(old,Y);assert view['speaker_person_id']==X and view['participants']==[{'person_id':Y,'role':'companion'}]
@@ -134,18 +153,18 @@ def test_raw_delivery_journal_preserves_recipient_and_source_dependencies(system
             return json.loads(conn.execute('SELECT data FROM mind_runtime_events WHERE id=?',(receipt['id'],)).fetchone()[0])['source_id']
     sid=deliver('y-private-outgoing')
     view=m.source_view(sid,Y)
-    assert view['speaker_person_id']=='agent:kin' and view['conversation_key']=='feishu:cli_t:oc_y'
+    assert view['speaker_person_id']=='agent:kin' and 'conversation_key' not in view
     assert m.source_view(sid,X)['speaker_person_id']=='agent:kin'
     source=mind.engine.receive(SourceInput(namespace='kin-owner-input',key='shared-then-private',scope=mind.scope,text='后来收回分享',extract=False))['id']
-    labels=dict(source_id=source,speaker_person_id=X,conversation_key='chat:x',sharing='ordinary-shared',evidence_id='synthetic')
-    m.annotate(**labels,classification='ordinary',command_id='share-it')
+    labels=dict(source_id=source,speaker_person_id=X,conversation_key='chat:x',evidence_id='synthetic')
+    m.annotate(**labels,command_id='share-it')
     derived=deliver('y-derived',input_source_ids=[source]);assert m.source_view(derived,Y)
-    m.annotate(**labels,classification='private',command_id='protect-it',expected_revision=1)
+    m.annotate(**labels,command_id='protect-it',expected_revision=1)
     assert m.source_view(derived,Y)['speaker_person_id']=='agent:kin'
 
 
 def test_self_reminder_body_cannot_leak_through_unannotated_task_source(world):
-    e,m,source=world;sid=source('y-self',Y,'private',text='提醒我写私密日记',sharing='pending')
+    e,m,source=world;sid=source('y-self',Y,text='提醒我写私密日记')
     tasks=CompanionTasks(e,SCOPE,['duo']);tasks.tasks.scheduler.policy(ContactPolicy(id='duo',scope=SCOPE,enabled=True,channel='http://127.0.0.1:9',quiet_start=0,quiet_end=0,max_per_day=100,min_interval_minutes=0,require_confirmation=False))
     route=CompanionDelivery(channel='feishu',person_id=Y,app_id='cli_fake',open_id='ou_y',chat_id='oc_y',conversation_key='feishu:cli_fake:oc_y',binding_revision=1,requester_person_id=Y,request_conversation_key='chat:'+Y,source_input_id=sid)
     tasks.create(ContactTaskInput(command_id='self-private',policy_id='duo',title='提醒',text='写日记',basis=sid,due_at='2030-01-01T05:00:00Z',companion_delivery=route),actor=Y)
@@ -157,14 +176,14 @@ def test_old_kin_exploration_is_own_action_not_yiyi_dialogue(world):
     e,m,_=world
     sid=e.receive(SourceInput(namespace='kin-exploration',key='old-self',scope=SCOPE,text='KIN自己读到合成影评，评论不是核实事实',occurred_at=AT,extract=False))['id']
     before=e.source(sid);assert m.history_preview([sid])[0]['candidate_speaker']=='agent:kin'
-    m.migrate_legacy(source_ids=[sid],classifications={sid:'ordinary'},command_id='old-self',evidence_id='fixture-consent')
+    m.migrate_legacy(source_ids=[sid],command_id='old-self',evidence_id='fixture-consent')
     view=m.source_view(sid,Y)
-    assert view['speaker_person_id']=='agent:kin' and view['conversation_key'] is None
+    assert view['speaker_person_id']=='agent:kin' and view['conversation_kind']=='autonomous' and 'conversation_key' not in view
     assert e.source(sid)['occurred_at']==before['occurred_at']
 
 def test_contact_preferences_do_not_change_other_person(world):
     from kin_mind.companions import contact_preference
-    e,m,source=world;sid=source('pref-y',Y,sharing='pending')
+    e,m,source=world;sid=source('pref-y',Y)
     request={'command_id':'quiet-y','expected_revision':0,'wait_for_reply':False,'evidence_ids':[sid],'reason':'本人明确允许'}
     result=contact_preference(m,Y,request)
     assert contact_preference(m,Y,request)==result and contact_preference(m,X)['revision']==0
@@ -174,7 +193,7 @@ def test_scoped_share_coverage_and_reference_registration_follow_current_person(
     from kin_mind.companion_view import CompanionView,companion_scope
     mind,memory,_,_=system;unit=findings(system)[0];m=Companions(mind.engine,mind.scope)
     for sid in unit['source_ids']:
-        m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key=None,classification='ordinary',sharing='ordinary-shared',command_id='scope-share:'+sid,evidence_id='synthetic')
+        m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key=None,command_id='scope-share:'+sid,evidence_id='synthetic')
     ref={'unit_id':unit['id'],'version':1,'mode':'new'}
     # A real legacy owner receipt counts for X, never for the newly met Y.
     memory.ingest({'id':'legacy-shared','kind':'delivery','at':mind.clock(),'channel':'feishu','delivery_id':'legacy-shared','bubble_id':'legacy-shared','text':unit['text'],'state':'accepted','message_id':'om_fake_legacy','references':[ref]})
@@ -194,23 +213,22 @@ def test_same_event_in_two_private_chats_and_family_keeps_source_time_speaker_an
     from kin_mind.companion_view import CompanionView
     mind,memory,_,_=system;cfg={'scope':mind.scope.model_dump(),'agent_version':'synthetic'};m=Companions(mind.engine,mind.scope)
     rows=[]
-    for key,person,kind,chat,sharing in [('x',X,'p2p','oc_x','ordinary-shared'),('y',Y,'p2p','oc_y','pending'),('family',Y,'group','oc_family','pending')]:
-        identity={'speaker_person_id':person,'conversation_key':'feishu:cli_test:'+chat,'source_message_id':'om_'+key,'route':{'person_id':G if kind=='group' else person,'chat_id':chat},'sharing':sharing,'chat_type':kind,'audience_person_ids':[X,Y] if kind=='group' else []}
+    for key,person,kind,chat in [('x',X,'p2p','oc_x'),('y',Y,'p2p','oc_y'),('family',Y,'group','oc_family')]:
+        identity={'speaker_person_id':person,'conversation_key':'feishu:cli_test:'+chat,'source_message_id':'om_'+key,'route':{'person_id':G if kind=='group' else person,'chat_id':chat},'chat_type':kind,'audience_person_ids':[X,Y] if kind=='group' else []}
         at='2026-10-22T0'+str(len(rows))+':00:00Z'
         row=dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'same-event-'+key,'text':'说起同一次散步：'+key,'at':at,'received_at':at,'identity':identity})
-        dispatch_companion(mind.engine,cfg,'companion-classify',{'source_id':row['source_id'],'person_id':person,'classification':'ordinary','participants':[{'person_id':X,'role':'walker'},{'person_id':Y,'role':'walker'}],'command_id':'classify-'+key})
         rows.append((row['source_id'],at,person,kind,chat))
     for sid,at,person,kind,chat in rows:
         view=m.source_view(sid,person)
-        assert view['speaker_person_id']==person and view['conversation_kind']==kind and view['chat_id']==chat
-        assert view['occurred_at'].startswith(at[:-1]) and view['participants'][1]['person_id']==Y
+        assert view['speaker_person_id']==person and view['conversation_kind']==kind and 'chat_id' not in view
+        assert view['occurred_at'].startswith(at[:-1]) and not {'classification','sharing'}&set(view)
     assert m.source_view(rows[0][0],G) and m.source_view(rows[2][0],G)
     # Ordinary experience is one KIN memory even when its ingestion workflow is
     # still pending; the original speaker/time remain unchanged.
     assert m.source_view(rows[1][0],G)['speaker_person_id']==Y
     secret=mind.engine.receive(SourceInput(namespace='kin-owner-input',key='family-secret',scope=mind.scope,text='私密内容',extract=False))['id']
-    m.annotate(source_id=secret,speaker_person_id=X,conversation_key='feishu:cli_test:oc_x',classification='intimate',sharing='ordinary-shared',command_id='family-secret',evidence_id='fixture')
-    assert m.source_view(secret,G)['classification']=='intimate'
+    m.annotate(source_id=secret,speaker_person_id=X,conversation_key='feishu:cli_test:oc_x',command_id='family-secret',evidence_id='fixture')
+    assert m.source_view(secret,G)['speaker_person_id']==X
     context=dispatch_companion(mind.engine,cfg,'companion-context',{'person_id':G,'conversation_key':'feishu:cli_test:oc_family'})
     assert [s['source_id'] for s in context['sources']]==[rows[2][0]]
     assert CompanionView(mind.engine,mind.scope,G,'feishu:cli_test:oc_family').filter({'id':secret,'text':'私密内容'})['text']=='私密内容'
@@ -257,3 +275,16 @@ def test_source_dag_visits_shared_ancestors_once_per_read(world):
     with e.db.connect() as conn:
         assert m.visible(conn,ids[-1],X)
         assert not m.visible(conn,ids[0],X)
+
+
+def test_host_copies_learn_which_sources_were_deleted(tmp_path):
+    from kin_mind.host import dispatch
+    e=Engine(tmp_path/'memory')
+    kept=e.receive(SourceInput(namespace='kin-companion-input',key='kept',scope=SCOPE,text='合成：留着',occurred_at=AT,extract=False))['id']
+    gone=e.receive(SourceInput(namespace='kin-companion-input',key='gone',scope=SCOPE,text='合成：删掉',occurred_at=AT,extract=False))['id']
+    e.receive(SourceInput(namespace='kin-owner-input',key='owner-kept',scope=SCOPE,text='合成：图一',occurred_at=AT,extract=False))
+    owner=e.receive(SourceInput(namespace='kin-owner-input',key='owner-gone',scope=SCOPE,text='合成：图二',occurred_at=AT,extract=False))['id']
+    e.delete(gone);e.delete(owner)
+    config={'root':str(tmp_path/'memory'),'scope':SCOPE.model_dump(),'agent_version':'test'}
+    got=dispatch(config,'deleted-sources',{'source_ids':[kept,gone],'owner_input_ids':['owner-kept','owner-gone','never-stored']})
+    assert got=={'deleted':sorted([gone,'owner-gone'])}

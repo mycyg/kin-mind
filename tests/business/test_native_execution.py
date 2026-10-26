@@ -35,3 +35,30 @@ s.run(transport='stdio')
     assert observed[0]['native_review']['execution_tools'][0]['name']=='increment'
     assert [(f['native_tool_result']['result'].get('structuredContent') or json.loads(f['native_tool_result']['result']['content'][0]['text']))['value'] for f in observed[1:3]]==[1,2]
     assert observed[3]['native_tool_result']['result']['isError'] is True
+
+
+def test_a_spent_token_budget_turns_tool_calls_into_a_finish_signal(tmp_path):
+    """Feature 7: past the safety ceiling no tool runs; the answer tells the run to finish with
+    what it has. The meter reads only exploration rows the gateway logs after it started."""
+    import asyncio
+    from kin_mind.native_execution import BUDGET_SPENT, _tool_result, usage_meter
+    log = tmp_path / "mobile-model-usage.jsonl"
+    row = lambda purpose, total: json.dumps({"purpose": purpose, "usage": {"total_tokens": total}}) + "\n"
+    log.write_text(row("native-exploration", 900))
+    spent = usage_meter(log)
+    with log.open("a") as out:
+        out.write(row("native-exploration", 300) + row("native-chat-turn", 5000) + "not json\n" + row("native-exploration", 200)[:-1])
+    assert spent() == 300, "a row still being written waits for its line end"
+    with log.open("a") as out:
+        out.write("\n")
+    assert spent() == 500
+    class Client:
+        calls = 0
+        async def call_tool(self, name, arguments):
+            Client.calls += 1
+            raise RuntimeError("synthetic")
+    call = {"id": "1", "server": "s", "name": "t"}
+    assert asyncio.run(_tool_result(call, {"s": Client()}, {("s", "t")}, lambda: True)) == {"isError": True, "content": [{"type": "text", "text": BUDGET_SPENT}]}
+    assert Client.calls == 0
+    assert asyncio.run(_tool_result(call, {"s": Client()}, {("s", "t")}, lambda: False))["content"][0]["text"] == "RuntimeError"
+    assert usage_meter(tmp_path / "missing.jsonl") is None

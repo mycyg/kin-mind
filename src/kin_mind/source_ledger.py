@@ -373,6 +373,28 @@ def verify_citations(findings, ledger):
     return rejected, sorted(set(unknown_ids))
 
 
+def drop_unbacked(findings, rejected, unknown_ids):
+    """The findings without what no receipt backs, so one bad citation does not void a run: refused
+    citations and evidence ids go, and a finding whose mapped evidence all went becomes an open
+    question. None when nothing backed is left."""
+    data, gone, bad = findings.model_dump(), set(rejected), set(unknown_ids)
+    data["sources"] = [source for source in data["sources"] if source["url"] not in gone]
+    evidence, kept, unverified, mapping = data.get("evidence_map"), [], [], {}
+    for index, finding in enumerate(data["findings"], 1):
+        ids = [i for i in (evidence or {}).get(str(index)) or [] if str(i) not in bad]
+        if evidence and str(index) in evidence and not ids:
+            unverified.append(finding)
+            continue
+        kept.append(finding)
+        if ids:
+            mapping[str(len(kept))] = ids
+    if not kept or not data["sources"] and not mapping:
+        return None
+    data.update(findings=kept, open_questions=[*data["open_questions"], *("未能核实：" + f for f in unverified)],
+                evidence_map=mapping if evidence is not None else None)
+    return type(findings).model_validate(data)
+
+
 def rejection_counts(findings, ledger, web_observations=()):
     """Why each refused citation and evidence_map id was refused, as counts by class: no locator,
     title or text, so the counts outlast the words a settled run's files lose (workdirs). A locator

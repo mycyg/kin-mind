@@ -1,7 +1,5 @@
-// The hard rule: a change to the persona canon needs 小光's own confirmation. The canon file checks
-// only itself (its hashes sit beside its texts, so whoever edits the texts can rewrite them); the
-// owner's approval is the record the host keeps outside it (mind-config `persona_contract`). These
-// cases pin that record's check in the core reader every host consumer uses. Synthetic roles only.
+// The persona seed has no approval gate: any part may change, and the hashes read beside it are
+// metadata the reader recomputes. Synthetic roles only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

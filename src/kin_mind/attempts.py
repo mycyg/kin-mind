@@ -53,7 +53,7 @@ TOOL_PURPOSES = {
     "submit_archive_memories": "archive-memory",
 }
 # Fields an operator may read back. Digests and static codes only.
-CALL_FIELDS = ("purpose", "tool", "model", "request_id", "elapsed_ms", "outcome",
+CALL_FIELDS = ("purpose", "tool", "provider", "model", "request_id", "elapsed_ms", "outcome",
                "usage", "usage_status", "cost", "cost_status", "context_digest", "detail")
 
 
@@ -119,7 +119,9 @@ def record_call(provider, tool, *, purpose=None, outcome, model=None, request_id
     Missing usage additionally writes the `model_usage_unknown` metric, so an
     unattributable call is visible without any zero being written for it.
     """
+    # A native review's call is also one of the gateway's rows; the usage ledger counts only the direct ones.
     call = {"purpose": purpose or purpose_of(tool), "tool": tool, "outcome": outcome,
+            "provider": "native" if getattr(provider, "native_review", False) else "deepseek",
             "model": model, "request_id": request_id, "elapsed_ms": elapsed_ms,
             **usage_entry(usage), **({"usage_status": usage_status} if usage_status else {})}
     if context_digest:

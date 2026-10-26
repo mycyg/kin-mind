@@ -150,3 +150,19 @@ test('a confirmed failed native run can accept a revised goal without waiting fo
   f.host.runtime=async r=>{f.calls.push(r);return r.op==='cancel'?{state:'failed'}:{state:'running',threadId:'worker-thread'};};
   await f.host.runTask(t);await f.host.tick();assert.equal(t.parallel.inputVersion,2);assert.equal(t.parallel.state,'running');
 });
+
+test('a force switch elsewhere does not stale the worker final; a dropped final is a blocker told once',async()=>{
+  const f=fixture();await f.start();
+  f.router.state.executionEpoch=1; // the main session was switched; the worker's task kept its own epoch
+  f.setNative({state:'completed',threadId:'worker-thread',turnId:'t1',events:[],text:final('第一份结果。')});await f.drain();
+  assert.deepEqual(f.sent.map(x=>x.kind),['final']);assert.equal(f.router.state.tasks.task.status,'completed');
+
+  // The task itself is fenced while its final is being prepared.
+  const seen=[];const g=fixture({onChange:async s=>{seen.push(s);return {state:'accepted'};},
+    prepare:async item=>{if(item.kind==='final')g.router.state.tasks.task.executionEpoch=1;return null;}});await g.start();
+  g.setNative({state:'completed',threadId:'worker-thread',turnId:'t2',events:[],text:final('第二份结果。')});await g.drain();
+  await Promise.all([...g.host.notifying.values()]);await g.drain();
+  const t=g.router.state.tasks.task,item=Object.values(g.router.state.visibleItems).find(i=>i.kind==='final');
+  assert.equal(item.state,'dropped');assert.equal(t.status,'running');
+  assert.equal(seen.length,1);assert.ok(seen[0].blockers.includes('final-dropped:stale-expression'));
+});

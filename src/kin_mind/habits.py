@@ -164,7 +164,11 @@ class ConversationHabits:
             if not row:
                 raise Missing("Reply choice must refer to a received owner input")
             preferences = self.read(conn)
-            if request["action"] in {"silent", "defer"} and preferences["preferences"]["reply_choice"] != "autonomous":
+            # Too tired to answer now: putting it off is Kin's own choice even when every input is
+            # otherwise answered (2026-10-26); it is offered back once Kin recovers (moment.py).
+            from .energy import view as energy_view
+            resting = request["action"] == "defer" and energy_view(conn, self.scope.key(), self.mind.clock()).get("tier") == "low"
+            if request["action"] in {"silent", "defer"} and preferences["preferences"]["reply_choice"] != "autonomous" and not resting:
                 raise Conflict("Autonomous silence has not been enabled by the owner")
             # These markers come from the host's received input path, not from a generated
             # explanation. Quiet/rest cannot silently settle an explicit task or urgent input.
@@ -182,7 +186,8 @@ class ConversationHabits:
                 if not other or request["merged_into"] == request["input_id"]:
                     raise Conflict("Merge target must be another received input")
             value = {"input_id": request["input_id"], "action": request["action"], "reason": reason,
-                "merged_into": request.get("merged_into"), "at": self.mind.clock(), "source_id": row[0], "preference_revision": preferences["revision"], "state": "decided"}
+                "merged_into": request.get("merged_into"), "at": self.mind.clock(), "source_id": row[0], "preference_revision": preferences["revision"], "state": "decided",
+                **({"resting": True} if resting else {})}
             old = conn.execute("SELECT data FROM mind_reply_choices WHERE scope=? AND input_id=?", (self.scope.key(), request["input_id"])).fetchone()
             if old:
                 current = json.loads(old[0])

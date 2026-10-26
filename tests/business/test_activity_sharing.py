@@ -179,6 +179,19 @@ def test_multi_bubble_delivery_uses_the_registered_index_not_text_matching(syste
     assert share["bubbles"]["actual-bubble-id"]["references"][0]["activity_ref"] == report
 
 
+def test_one_reply_to_two_people_counts_each_bubble_for_its_own_recipient(system):
+    mind, memory, _, _ = system
+    dream, report = activity(system), activity(system, "exploration", "paper-report")
+    for bubble, person, ref in (("to-owner", "person:xiaoguang", dream), ("to-family", "person:family-a", report)):
+        memory.ingest({"id": bubble + ":accepted", "kind": "delivery", "at": mind.clock(), "channel": "feishu",
+            "conversation_id": "chat-" + bubble, "delivery_id": "one-reply", "bubble_id": bubble, "text": "合成正文",
+            "state": "accepted", "message_id": "platform-" + bubble, "recipient_person_id": person,
+            "references": [{"activity_ref": ref, "mode": "new", "reason": ""}]})
+    with mind.engine.db.connect() as conn:
+        rows = conn.execute("SELECT bubble_id, recipient FROM mind_share_coverage WHERE scope=?", (mind.scope.key(),)).fetchall()
+    assert sorted(tuple(row) for row in rows) == [("to-family", "person:family-a"), ("to-owner", "person:xiaoguang")]
+
+
 def test_repeated_report_projection_keeps_its_existing_database_unit_ids(system):
     first = findings(system)
     assert [unit["id"] for unit in findings(system)] == [unit["id"] for unit in first]

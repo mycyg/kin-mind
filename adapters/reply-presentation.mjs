@@ -2,6 +2,11 @@ export const REPLY_MODES = ['text', 'voice', 'both'];
 export const presentationSchema = {type:'object',additionalProperties:false,required:['mode','style'],properties:{
   mode:{type:'string',enum:REPLY_MODES},style:{type:'string',description:'当前参考克隆不应用独立语气指令，留空；仅兼容支持指令的其他音色配置，不含札记或其他朗读内容'}}};
 
+/** A voice bubble longer than this goes as text: about a minute of speech, past which the local
+ * model's output budget and timeout can cut it short. */
+export const VOICE_MAX_CHARS=300;
+export const spokenMode=(mode,text)=>mode!=='text'&&String(text??'').length>VOICE_MAX_CHARS?'text':mode;
+
 export function replyPresentation(value) {
   return {mode:REPLY_MODES.includes(value?.mode)?value.mode:'text',style:typeof value?.style==='string'?value.style:''};
 }

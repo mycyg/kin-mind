@@ -143,12 +143,12 @@ def test_shared_native_can_choose_group_wish_and_time_plan_without_new_message_o
         desires=mind.read()['desires'];assert len(desires)==1 and desires[0]['recipient_person_id']==group
     assert not mind.read()['desires']
     secret=source('private-secret')
-    Companions(mind.engine,mind.scope).annotate(source_id=secret,speaker_person_id=X,conversation_key='chat:x',classification='intimate',sharing='ordinary-shared',command_id='private-tag',evidence_id='private-tag')
+    Companions(mind.engine,mind.scope).annotate(source_id=secret,speaker_person_id=X,conversation_key='chat:x',command_id='private-tag',evidence_id='private-tag')
     request['change'].update(command_id='forbidden-group-basis',expected_revision=mind.read()['revision'],evidence_ids=[secret])
     dispatch_companion(mind.engine,config,'companion-autonomy',request)
     shown=Companions(mind.engine,mind.scope).source_view(secret,group)
-    assert shown['classification']=='intimate' and shown['speaker_person_id']==X
-    assert shown['conversation_key']=='chat:x'
+    assert 'classification' not in shown and shown['speaker_person_id']==X
+    assert 'conversation_key' not in shown and shown['conversation_kind']=='p2p'
 
 def test_one_appraisal_can_choose_two_recipients_without_duplicate_content_suppression(setup):
     from kin_mind.appraisal import Appraisal, Wish
@@ -172,7 +172,7 @@ def test_activity_sharing_defer_affects_only_target_and_source_labels_remain_fac
     from kin_mind.companions import Companions
     mind,source,clock=setup;sid,_=explored(mind,clock,'shared-finding')
     m=Companions(mind.engine,mind.scope)
-    m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key='kin:explore',classification='ordinary',sharing='ordinary-shared',command_id='tag-shared',evidence_id='synthetic')
+    m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key='kin:explore',command_id='tag-shared',evidence_id='synthetic')
     ev=SimpleNamespace(evidence_ids=[sid],command_id='share',agent_version='v1')
     with mind.engine.db.connect(write=True) as conn:
         state=mind._load(conn)
@@ -184,12 +184,12 @@ def test_activity_sharing_defer_affects_only_target_and_source_labels_remain_fac
         assert state['desires'][X]['status']=='wanted' and state['desires'][Y]['status']=='waiting'
         assert state['exploration_decisions'][decision_key('shared-finding',X)]['decision']=='share'
         assert state['exploration_decisions'][decision_key('shared-finding',Y)]['decision']=='defer'
-    m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key='kin:explore',classification='private',sharing='ordinary-shared',command_id='tag-private',evidence_id='synthetic',expected_revision=1)
+    m.annotate(source_id=sid,speaker_person_id='agent:kin',conversation_key='kin:explore',command_id='tag-private',evidence_id='synthetic',expected_revision=1)
     with mind.engine.db.connect(write=True) as conn:
         state=mind._load(conn)
         apply_decisions(mind,conn,state,[SharingDecision(exploration_id='shared-finding',recipient_person_id='group:family',decision='share')],ev,{},'idle-review')
         assert state['exploration_decisions'][decision_key('shared-finding','group:family')]['decision']=='share'
-    assert m.source_view(sid,'group:family')['classification']=='private'
+    assert m.source_view(sid,'group:family')['speaker_person_id']=='agent:kin'
 
 def test_unified_minute_queues_one_idle_wake_but_ticks_all_recipient_plans(setup,monkeypatch,tmp_path):
     from kin_mind.host import dispatch

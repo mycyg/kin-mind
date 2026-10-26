@@ -8,7 +8,8 @@ export function replyOutcomeFacts(inputs={},groups={}, {now=Date.now(),limit=8,i
     const sent=bubbles.filter(b=>b.state==='accepted').length;
     const format=String(g.reason??'').startsWith('private-note-')||g.reason==='private-reply-envelope';
     const failed=bubbles.some(b=>['rejected','undeliverable'].includes(b.state));
-    const state=unknown?'send-unknown':format?'format-failed':failed?'send-failed':includeAccepted&&sent?(g.state==='accepted'?'accepted':'partially-accepted'):null;
+    // A fully accepted group is already in the native history; only an unsettled one is a fact.
+    const state=unknown?'send-unknown':format?'format-failed':failed?'send-failed':includeAccepted&&sent&&g.state!=='accepted'?'partially-accepted':null;
     if(!state)continue;
     facts.push({groupId:g.group_id,inputIds:[...new Set([g.reply_id,...(g.answered_input_ids??[])].filter(Boolean))],at:g.updated_at??g.created_at,
       state,sentBubbles:sent,unknownFragments:unknown,...(bubbles.some(b=>b.reason==='tts-failed')?{reason:'tts-failed',sentTextFragments:fragments.filter(f=>f.kind==='text'&&f.state==='accepted').length}:{})});
@@ -18,12 +19,18 @@ export function replyOutcomeFacts(inputs={},groups={}, {now=Date.now(),limit=8,i
   return facts.filter(f=>Number.isFinite(f.at)&&now-f.at<86400000).sort((a,b)=>b.at-a.at).slice(0,limit);
 }
 
+const RECONCILE_EVERY_MS=5*60000,reconciledAt=new WeakMap();
 /** Reconcile existing fragment IDs before describing an unknown send. This port
- * has no transport sender: it only reads receipts and applies their outcome. */
+ * has no transport sender: it only reads receipts and applies their outcome.
+ * Only groups from the last day are looked up, each at most once per interval. */
 export async function readReplyOutcomeFacts(inputs,manifests,options) {
-  const before=manifests?.status()?.groups??{};
-  for(const group of Object.values(before))if((group.bubbles??[]).some(b=>(b.fragments??[]).some(f=>['unknown','submitting'].includes(f.state))))
+  const before=manifests?.status()?.groups??{},now=options?.now??Date.now(),seen=manifests?reconciledAt.get(manifests)??new Map():null;
+  if(manifests){reconciledAt.set(manifests,seen);for(const [id,at] of seen)if(now-at>86400000)seen.delete(id);}
+  for(const group of Object.values(before))if(now-(group.updated_at??group.created_at)<86400000&&(seen.get(group.group_id)??-Infinity)<=now-RECONCILE_EVERY_MS&&
+    (group.bubbles??[]).some(b=>(b.fragments??[]).some(f=>['unknown','submitting'].includes(f.state)))) {
+    seen.set(group.group_id,now);
     try{await manifests.reconcileGroup(group.group_id);}catch{/* Keep its unresolved facts; never infer delivery from a failed lookup. */}
+  }
   const facts=replyOutcomeFacts(inputs,manifests?.status()?.groups??{},options);
   if(options?.includeAccepted)for(const fact of facts) {
     const group=manifests.load?.(fact.groupId);

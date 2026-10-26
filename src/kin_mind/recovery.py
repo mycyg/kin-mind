@@ -171,6 +171,44 @@ def resume_compaction_waits(conn, at):
     return resumed
 
 
+# A row set aside only because its provider was out (`transient-failures-exhausted`) goes back to the
+# queue by itself once an appraisal commits again -- at most AUTO_RESUMES times a row, a few at a time.
+RECOVERABLE_REASON = "transient-failures-exhausted:"
+AUTO_RESUMES, AUTO_RESUME_PER_SLOT, AUTO_RESUME_SPACING_SECONDS = 3, 2, 600
+PROVIDER_RECOVERED = "provider-recovered"
+
+
+def recoverable_sql(column="data"):
+    """SQL true for a quarantined row the provider's recovery gives back (liveness counts them too)."""
+    return (f"json_extract({column},'$.repair_reason') LIKE '{RECOVERABLE_REASON}%' AND (SELECT COUNT(*) FROM json_each({column},'$.recovery_history') "
+            f"WHERE json_extract(value,'$.command_id')='{PROVIDER_RECOVERED}')<{AUTO_RESUMES}")
+
+
+def resume_after_provider(conn, scope, at):
+    """Inside the transaction of a commit that shows the provider answers again: the rows its outage
+    set aside are pending again, judged afresh as after an operator's resume, spread over time."""
+    resumed, now = [], time.time()
+    rows = conn.execute("SELECT id,attempts,data FROM mind_appraisals WHERE scope=? AND state='needs-repair' AND " + recoverable_sql()
+                        + " ORDER BY available,id", (scope,)).fetchall()
+    events = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_action_events'").fetchone()
+    for row in rows:
+        data = json.loads(row["data"])
+        data.setdefault("recovery_history", []).append({
+            "command_id": PROVIDER_RECOVERED, "source": "host", "at": at, "attempts": row["attempts"],
+            **{field: data.get(field) for field in ("error", "error_detail", "repair_reason")},
+            **{field: data[field] for field in RETRY_COUNTERS if field in data}})
+        for field in ("error", "error_detail", "repair_reason", "waiting_reason", "frozen_memory_context", *RETRY_COUNTERS, *REUSE_FIELDS):
+            data.pop(field, None)
+        conn.execute("UPDATE mind_appraisals SET state='pending',available=?,lease=0,attempts=0,data=? WHERE id=?",
+                     (now + len(resumed) // AUTO_RESUME_PER_SLOT * AUTO_RESUME_SPACING_SECONDS, queue_row(conn, scope, data), row["id"]))
+        if events:
+            # The internal event follows its appraisal to the end again (ActionEvents.drain).
+            conn.execute("UPDATE mind_action_events SET state='queued' WHERE scope=? AND state='needs-review' "
+                         "AND json_extract(data,'$.job_id')=?", (scope, row["id"]))
+        resumed.append(row["id"])
+    return resumed
+
+
 def recover_quarantined(mind, *, job_ids, command_id, source, retire=False):
     """Resume quarantined appraisals of any lane. Each one is judged afresh.
 

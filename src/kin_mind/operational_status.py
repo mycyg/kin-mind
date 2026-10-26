@@ -234,10 +234,19 @@ def liveness(conn, scope, *, now=None):
         reasons = {}
         for row in rows:
             reasons[label(row[2]) if row[2] else "unknown"] = reasons.get(label(row[2]) if row[2] else "unknown", 0) + 1
+        # The rows an outage alone set aside go back by themselves after the next commit (recovery.py):
+        # counted apart, with how long ago an appraisal last committed.
+        from .recovery import recoverable_sql
+        back = [_seconds(at) for (at,) in conn.execute("SELECT json_extract(data,'$.attempt_started_at') FROM mind_appraisals "
+                                                         "WHERE scope=? AND state='needs-repair' AND " + recoverable_sql(), (scope,))]
+        committed = conn.execute("SELECT MAX(finished_at) FROM mind_appraisal_attempts WHERE scope=? AND outcome='committed'",
+                                 (scope,)).fetchone()[0] if _table(conn, "mind_appraisal_attempts") else None
         facts["quarantine"] = {
             "count": len(rows), "oldest_hours": _hours(min(available), now) if available else None,
             "newest_hours": _hours(max(available), now) if available else None,
             "new_24h": sum(1 for at in started if at is not None and at >= now - DAY), "reasons": reasons,
+            "recoverable": len(back), "recoverable_new_24h": sum(1 for at in back if at is not None and at >= now - DAY),
+            "hours_since_commit": _hours(_seconds(committed), now) if committed else None,
         }
     last = {}
     if _table(conn, "mind_state"):
@@ -258,6 +267,16 @@ def liveness(conn, scope, *, now=None):
                             "ORDER BY rowid DESC LIMIT 1", (scope,)).fetchone()
         last["contact_sent_at"] = sent[0] if sent else None
         facts["contact_failures"] = contact_failures(conn, scope, now)
+    if _table(conn, "metrics"):
+        # The contact funnel's first step (feature 5): what idle reviews of the last day decided.
+        decided = {"contact": 0, "not-now": 0, "defaulted": 0}
+        for state, defaulted in conn.execute("SELECT json_extract(data,'$.state'),json_extract(data,'$.defaulted') FROM metrics "
+                                             "WHERE name='idle_contact_decision' AND julianday(created_at)>=julianday(?)",
+                                             (_iso(now - DAY),)):
+            key = "defaulted" if defaulted else state
+            if key in decided:
+                decided[key] += 1
+        facts["contact_funnel"] = {"idle_decisions_24h": decided}
     names = {"wish_created_at": "wish", "exploration_at": "exploration", "contact_sent_at": "contact"}
     facts["last"] = {**last, "hours_since": {names[key]: _hours(_seconds(value), now) for key, value in last.items()}}
     return facts

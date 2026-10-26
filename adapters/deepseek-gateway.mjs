@@ -1,5 +1,5 @@
 import {projectPrompt,currentProjectPrompt,projectSchema,refreshMcpInstructions,refreshSessionSummaryPrompt,refreshPersonaPrompt} from './project-prompts.mjs';
-import {assertKimiInputCompatible,isHistoryRefusal,KIMI_HISTORY_MESSAGE} from './provider-history.mjs';
+import {assertKimiInputCompatible,isHistoryRefusal,KIMI_HISTORY_MESSAGE,KIMI_MODELS} from './provider-history.mjs';
 import http from 'node:http';
 import {privateReplyBoundary} from './chat-bubbles.mjs';
 import {randomBytes, timingSafeEqual} from 'node:crypto';
@@ -184,7 +184,7 @@ export function deepseekSchema(schema) {
 }
 
 function companionRequest(body, reasoningEffort, profile, contracts, kimi) {
-  if (!(kimi ? ["kimi-for-coding","kimi-for-coding-highspeed","k3","k3-256k","k3.1-pro","k3.1-pro-highspeed"].includes(body.model) : body.model === 'deepseek-flash') || !Array.isArray(body.input)) throw Error('unsupported-request');
+  if (!(kimi ? KIMI_MODELS.includes(body.model) : body.model === 'deepseek-flash') || !Array.isArray(body.input)) throw Error('unsupported-request');
   if(body.instructions!==undefined&&typeof body.instructions!=='string')throw Error('unsupported-request');
   if (!DEEPSEEK_EFFORTS.includes(reasoningEffort)) throw Error('unsupported-reasoning-effort');
   const bound = profile === null ? null : gatewayProfile(profile);
@@ -341,9 +341,10 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
     let upstreamProvider = 'deepseek';
     let attributed = {lane: null, purpose: null}, held = null, attempted = false, reported = false;
     let requestEvidence = null, evidenceFinished = false;
+    const startedAt = Date.now();
     const report = value => {
       if (reported) return; reported = true;
-      try {emitInstructionEvidence(onUsage,usageRow({provider: upstreamProvider, ...attributed, ...(held ? held.detail() : {}), ...value}));} catch {}
+      try {emitInstructionEvidence(onUsage,usageRow({provider: upstreamProvider, ...attributed, ...(held ? held.detail() : {}), ...value, ms: Date.now() - startedAt}));} catch {}
     };
     const finishEvidence=(outcome,providerResponseId=null)=>{
       if(!requestEvidence||evidenceFinished)return;evidenceFinished=true;
@@ -370,7 +371,7 @@ export async function startDeepSeekGateway({key, kimiKey = null, fetchImpl = fet
       // is told apart from her own request (CR-MIND-06).
       attributed = attribute({identity, body: parsed}) ?? nativeTurnPurpose();
       const requestProfile=profile??(attributed.purpose==='native-assessment'?'assessment':attributed.purpose==='native-contact-draft'?'contact-draft':attributed.isolatedCompanion===true&&['native-creation','native-exploration'].includes(attributed.purpose)?'internal-execution':null);
-      const kimi = ["kimi-for-coding","kimi-for-coding-highspeed","k3","k3-256k","k3.1-pro","k3.1-pro-highspeed"].includes(parsed.model);
+      const kimi = KIMI_MODELS.includes(parsed.model);
       // Returning a task result to the bound main conversation uses the creation
       // scheduling lane. It is still her selected companion replying; only the
       // host's verified native thread identity can admit that delivery here.

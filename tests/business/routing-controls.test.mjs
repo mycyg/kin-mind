@@ -83,3 +83,12 @@ test('a failed literal force leaves the original epoch active',async t=>{
  await router.dispatch({id:'force-now',kind:'owner',text:'/mode work'},()=>assert.fail('literal command is handled by host'));
  assert.equal(during,true);assert.equal(router.state.requests['owner-mode:force-now'].state,'failed');assert.equal(router.forceInProgress(),false);assert.equal(router.state.executionEpoch,0);
 });
+
+test('a family member\'s literal mode or compact command reaches Kin as words, while the owner\'s still runs',async t=>{
+ const f=fixture(t),seen=[];
+ for(const [id,text] of [['family-mode','/mode work'],['family-compact','/compact']])
+  await f.router.dispatch({id,kind:'owner',text,speaker_person_id:'person:family-a',recipient_person_id:'person:family-a'},async decision=>{seen.push([id,decision.command??null]);return 'new-turn';});
+ assert.deepEqual(seen,[['family-mode',null],['family-compact',null]]);assert.equal(f.router.state.mode,'auto');
+ await f.router.dispatch({id:'owner-compact',kind:'owner',text:'/compact',speaker_person_id:'person:xiaoguang'},async decision=>{seen.push(['owner-compact',decision.command??null]);return 'new-turn';});
+ assert.deepEqual(seen.at(-1),['owner-compact','compact']);
+});

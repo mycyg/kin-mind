@@ -72,6 +72,15 @@ def _dispatch(config, action, request):
     # `recover` is the host's start-up call: there the configured capacity replaces what meta
     # holds. Any other action only fills a missing value.
     sync_capacity(engine, config, startup=action == "recover")
+    if action == "deleted-sources":
+        # Which of the host's own copies stand on a deleted source: named by it, or by the owner input it was stored from.
+        from .erasure import tombstoned
+        from .sealed import source_id
+        scope = Scope.model_validate(config["scope"])
+        inputs = {source_id("kin-owner-input", key, scope): key for key in request.get("owner_input_ids") or []}
+        with engine.db.connect() as conn:
+            gone = tombstoned(conn, [*(request.get("source_ids") or []), *inputs])
+        return {"deleted": sorted(inputs.get(sid, sid) for sid in gone)}
     if action.startswith("companion-"):
         from .companion_host import dispatch_companion
         return dispatch_companion(engine, config, action, request)
@@ -96,6 +105,11 @@ def _dispatch(config, action, request):
         else:
             return DeepSeek.from_engine(engine)
 
+    def background_provider():
+        """The one entry of the background lane: the shared session's isolated DeepSeek assessment,
+        else DeepSeek directly."""
+        return review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)
+
     if config.get("contact_policy_file"):
         # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
         mind.register_contact_policy(config["contact_policy_file"])
@@ -110,6 +124,9 @@ def _dispatch(config, action, request):
     if action in {"energy-configure", "energy-activity"}:
         from .energy import configure, activity
         return (configure if action == "energy-configure" else activity)(mind, request)
+    if action == "drives-configure":
+        from .drives import configure
+        return configure(mind, request)
     if action == "liveness-facts":
         # The host's contact pause and fault watch: the store's liveness facts, read-only, with no
         # model, executor or embedding service asked (operational_status.liveness_read).
@@ -410,7 +427,14 @@ def _dispatch(config, action, request):
         # the context reads the original even with graph recall or dreams off.
         if not request.get('activity_focus') and isinstance(request.get('intent'), dict):
             request['activity_focus'] = request['intent'].get('activity_ref') or request['intent'].get('exploration_id')
-        return {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
+        # A lean draft snapshot carries the last turns itself: who said what, when, and its source id.
+        recent = request.pop("recent_dialogue", False)
+        built = {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
+        if recent:
+            from .dialogue import recent_dialogue
+            built["recent_dialogue"] = [{k: turn[k] for k in ("role", "text", "occurred_at", "source_id", "speaker_person_id", "recipient_person_id") if k in turn}
+                                        for turn in recent_dialogue(mind)]
+        return built
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
     if action == "prepare-memory":
@@ -532,6 +556,10 @@ def _dispatch(config, action, request):
         # Read only: what each appraisal said it was doing, and what the host found behind it.
         from .next_move import recent
         return recent(mind, limit=request.get("limit", 20))
+    if action in {"play-configure", "interests-seed"}:
+        # Operator actions: the play defaults, and the interests' migration after release (play.py).
+        from . import play
+        return play.configure(mind, request) if action == "play-configure" else play.seed(mind, DeepSeek.from_engine(engine))
     if action == "configure-autonomy":
         return mind.configure_autonomy(request)
     if action == "computer-context":
@@ -554,13 +582,13 @@ def _dispatch(config, action, request):
             # checkpoint carries it only once it is written.
             from . import window_notes
             if window_notes.due(mind):
-                return window_notes.run(mind, (review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)))
+                return window_notes.run(mind, background_provider())
             # The background lane also writes the memories of archived records (archive_memory):
             # when it has no job of its own to run, or when they have waited an hour for it.
             from . import archive_memory
             if archive_memory.due(mind, waited=0 if not jobs.runnable("enrichment") else archive_memory.STARVED_SECONDS):
-                return archive_memory.run(mind, (review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)))
-        return jobs.run_one((review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)), lane="enrichment", job_id=request.get("job_id"))
+                return archive_memory.run(mind, background_provider())
+        return jobs.run_one(background_provider(), lane="enrichment", job_id=request.get("job_id"))
     def review_pause():
         if config.get("review_paused"):
             return {"state": "paused", "reason": "host-maintenance"}
@@ -581,6 +609,10 @@ def _dispatch(config, action, request):
         plans = AutonomousPlans(mind)
         plans.tick(actions)
         if not secondary:memory.queue_idle(actions)
+        if not secondary:
+            # Boredom may wake that idle review early (play.py).
+            from .play import wake
+            wake(mind, actions, memory)
         actions.review_unselected()
         actions.drain(jobs)
         if secondary:
@@ -681,14 +713,18 @@ def _dispatch(config, action, request):
                 raise
         prepared = None
         if config.get("companion", {}).get("shared_session"):
-            from .native_execution import native_exploration_exchange
+            from .native_execution import TOKEN_BUDGET, native_exploration_exchange, usage_meter
             from .codex_executor import run_codex
             profile=request.get("native_review_profile")
             if not profile:raise RuntimeError("main-session-required")
+            # The gateway's usage log lies beside the state file it publishes.
+            gateway_state = config.get("exploration_gateway_state_file")
+            spent = usage_meter(Path(gateway_state).with_name("mobile-model-usage.jsonl")) if gateway_state else None
+            budget = int(config.get("exploration_token_budget") or TOKEN_BUDGET)
             prepared={"state":"ready", "executable":None, "budget_seconds":1200, "model":profile["model"],
                 "runner":lambda executable,topic,directory,**kwargs:run_codex(executable,topic,directory,
                     reasoning=profile["reasoningEffort"],provider={"id":"native-main","base_url":"http://127.0.0.1","wire_api":"responses"},
-                    cli_version="native-main",native_exchange=lambda request,servers,on_started=None:native_exploration_exchange({**request,"profile":profile},servers,on_started=on_started),**kwargs)}
+                    cli_version="native-main",native_exchange=lambda request,servers,on_started=None:native_exploration_exchange({**request,"profile":profile},servers,on_started=on_started,spent=spent,budget=budget),**kwargs)}
             prepared["runner"].reports_start = True
         if prepared is None:
             prepared = prepare_codex_exploration(config, repair=repair_final)
@@ -698,8 +734,10 @@ def _dispatch(config, action, request):
         capabilities = exploration_capabilities(config, computer_override=resolved_computer)
         web = None
         if capabilities["capabilities"]["search"]["available"]:
-            web = {**(config.get("exploration_web") or {}), "enabled": True,
-                   "backend": "deepseek", "credentials_file": config.get("credentials_file")}
+            # Exploration is how KIN plays on its own: its day budget sits above the busiest past day.
+            web = {"day_limit": 400, **(config.get("exploration_web") or {}), "enabled": True,
+                   "backend": "deepseek", "credentials_file": config.get("credentials_file"),
+                   "paid_calls": {"database": str(engine.db.path), "scope": mind.scope.key(), "purpose": "exploration"}}
         budget = min(int(request.get("budget_seconds") or prepared["budget_seconds"]),
                      prepared["budget_seconds"])
         return explorer.run(
@@ -825,7 +863,7 @@ RESIDENT_ACTIONS = frozenset({
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
     "context-delivery-metrics", "configure-habits", "reply-choice", "review-due", "liveness-facts",
     "attention", "continuity-attend", "continuity-finish-attention",
-    "sharing-preflight", "share-references", "share-cancel",
+    "sharing-preflight", "share-references", "share-cancel", "deleted-sources",
 })
 
 

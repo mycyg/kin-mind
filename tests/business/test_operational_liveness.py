@@ -78,10 +78,34 @@ def test_the_store_says_whether_the_work_is_moving_through_a_connection_that_can
     assert embeddings["waiting_error"] == "Local embedding service did not become ready within 30 s"
     assert embeddings["hours_since_last_complete"] == 26.0
     assert facts["quarantine"] == {"count": 3, "oldest_hours": 238.0, "newest_hours": 2.0, "new_24h": 1,
-                                   "reasons": {"compression-passes-exhausted:13": 3}}
+                                   "reasons": {"compression-passes-exhausted:13": 3},
+                                   "recoverable": 0, "recoverable_new_24h": 0, "hours_since_commit": None}
     assert facts["last"]["hours_since"] == {"wish": 50.0, "exploration": 100.0, "contact": 58.0}
     assert "canceled" not in json.dumps(facts), "a canceled contact reached nobody"
 
+
+
+def test_rows_an_outage_set_aside_and_the_idle_decisions_are_said_apart(store):
+    """Feature 3 and 5: what only an outage set aside goes back by itself, so health counts it apart,
+    with how long since an appraisal committed; and what idle reviews decided about contacting."""
+    engine, scope, _mind, root = store
+    from kin_mind import attempts
+    with engine.db.connect(write=True) as conn:
+        conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES('app_out',?,'needs-repair',?,?)",
+                     (scope.key(), NOW.timestamp(), dumps({"attempt_started_at": iso(hours=1), "repair_reason": "transient-failures-exhausted:9"})))
+        conn.executescript(attempts.LEDGER_SCHEMA)
+        conn.execute("INSERT INTO mind_appraisal_attempts VALUES('a1',?,'app_ok',1,'t','action',NULL,'committed',?,?,'{}')",
+                     (scope.key(), iso(hours=5), iso(hours=5)))
+    engine.db.metric("idle_contact_decision", 1, {"state": "not-now", "defaulted": True})
+    engine.db.metric("idle_contact_decision", 1, {"state": "contact"})
+    conn = read_only(root)
+    try:
+        facts = liveness(conn, scope.key(), now=NOW.timestamp())
+    finally:
+        conn.close()
+    assert (facts["quarantine"]["recoverable"], facts["quarantine"]["recoverable_new_24h"], facts["quarantine"]["count"]) == (1, 1, 4)
+    assert facts["quarantine"]["hours_since_commit"] == 5.0
+    assert facts["contact_funnel"]["idle_decisions_24h"] == {"contact": 1, "not-now": 0, "defaulted": 1}
 
 
 def test_a_failure_on_a_revision_since_replaced_or_deleted_is_not_a_failure_of_the_day(store):

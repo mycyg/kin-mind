@@ -44,7 +44,7 @@ def test_large_checkpoint_recovers_full_coverage_with_existing_summarizer(setup,
     snapshot['items'] = [dict(id=f'event-{i}', revision=1, role='user' if i % 2 == 0 else 'assistant',
         text=f'合成事件{i}：小光转述一一看过灯塔。' + '这是完整保存的合成日常资料。' * (0 if metadata_heavy else 150),
         at=f'2026-10-22T01:{i:02}:00Z', basis='explicit', speaker_person_id='person:xiaoguang',
-        conversation_kind='private', conversation_key='synthetic-x' * (300 if metadata_heavy else 1), recipient_person_id='person:xiaoguang') for i in range(16)]
+        conversation_kind='private', conversation_key='synthetic-x', actor='synthetic-x' * (300 if metadata_heavy else 1), recipient_person_id='person:xiaoguang') for i in range(16)]
     binding = {'conversationId': 'one-kin', 'generation': 5}
     waiting = checkpoints.build(snapshot, binding, allow_model=False, adaptive_budget=True,restore_capacity=capacity)
     assert not waiting['complete'] and waiting['coverage']['omitted_ids']
@@ -60,7 +60,7 @@ def test_large_checkpoint_recovers_full_coverage_with_existing_summarizer(setup,
     if capacity:
         assert restored['budgetPlan']['reason']=='native-window' and restored['budgetPlan']['limit']==capacity
         assert restored['tokens'] > INJECTION_CEILING, 'large native recovery is not blocked at the legacy 8k cap'
-    assert all('speaker_person_id' in i['text'] and 'conversation_key' in i['text'] for i in calls[0]['items'])
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' not in i['text'] for i in calls[0]['items'])
     assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
 
 
@@ -86,7 +86,7 @@ def test_checkpoint_reserves_space_for_summary_provenance(setup):
     assert calls and restored['complete'], restored.get('waitReason')
     assert len(restored['items']) < len(snapshot['items']), 'old exchanges are summarized, not dropped'
     assert not restored['coverage']['omitted_ids'] and restored['tokens'] <= INJECTION_CEILING
-    assert all('speaker_person_id' in i['text'] and 'conversation_key' in i['text'] for i in calls[0]['items'])
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' not in i['text'] for i in calls[0]['items'])
     assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
 
 
@@ -352,13 +352,46 @@ def test_recent_dialogue_excludes_platform_metadata(setup):
     items = recent_dialogue(mind)
     assert items and not any(k in item for item in items for k in ('conversation_id','platform_message_id','reply_context','reply_resolution'))
 
+def test_model_views_carry_no_platform_route_ids(setup):
+    """A Feishu route (feishu:<app>:<chat>, chat and open ids) stays with the host: what a model is
+    shown names people and the conversation kind only."""
+    import re
+    from kin_mind.companion_host import dispatch_companion
+    from kin_mind.companions import YIYI as Y
+    from kin_mind.dialogue import recent_dialogue
+    from kin_mind.model_view import for_model
+    mind,_,_=setup;memory=MemoryContinuity(mind);memory.configure({'records':True,'manifests':False})
+    cfg={'root':str(mind.engine.db.root),'scope':mind.scope.model_dump(),'agent_version':'synthetic-v1','session_id':'synthetic-session'}
+    chat='oc_synthetic0000';key='feishu:cli_synthetic0000:'+chat
+    identity={'speaker_person_id':Y,'conversation_key':key,'source_message_id':'om_synthetic','chat_type':'p2p','route':{'person_id':Y,'chat_id':chat}}
+    got=dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'route-synthetic','text':'今天看了星星','at':'2026-10-22T03:10:00Z','received_at':'2026-10-22T03:10:01Z','identity':identity})
+    snapshot=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':key,'action':'session-snapshot','request':{}})
+    context=dispatch_companion(mind.engine,cfg,'companion-context',{'person_id':Y,'conversation_key':key,'query':'星星'})
+    with mind.engine.db.connect() as conn:
+        metadata=json.loads(conn.execute('SELECT data FROM sources WHERE id=?',(got['source_id'],)).fetchone()[0])['metadata']
+    assert metadata['conversation_key']==key and metadata['chat_id']==chat
+    shown={'recent':recent_dialogue(mind),'snapshot':snapshot,'checkpoint':SessionCheckpoint(mind).snapshot()['items'],
+           'context':context,'source':for_model({'id':got['source_id'],'metadata':metadata})}
+    assert shown['recent'] and snapshot['items'] and context['sources']
+    found=re.search(r'feishu:|\b(?:oc|ou|cli)_',json.dumps(shown,ensure_ascii=False))
+    assert not found, found
+    assert snapshot['items'][0]['recipient_person_id']==Y and snapshot['items'][0]['conversation_kind']=='p2p'
+
+
+def test_appraisal_recipient_targets_hide_delivery_routes():
+    from kin_mind.appraisal import _appraisal_context
+    route={'chat_id':'oc_synthetic0000','conversation_key':'feishu:cli_synthetic0000:oc_synthetic0000'}
+    shown=_appraisal_context({'recipient_targets':{'person:yiyi':{'route':route,'person_id':'person:yiyi','plans':[],'wishes':[]}}})
+    assert shown['recipient_targets']['person:yiyi']['person_id']=='person:yiyi' and 'route' not in shown['recipient_targets']['person:yiyi']
+
+
 def test_companion_checkpoint_keeps_direct_conversation_separate_from_shared_sources(setup):
     from kin_mind.companion_host import dispatch_companion
     from kin_mind.companions import XIAOGUANG as X,YIYI as Y
     mind,_,_=setup;memory=MemoryContinuity(mind);memory.configure({'records':True,'manifests':False})
     cfg={'root':str(mind.engine.db.root),'scope':mind.scope.model_dump(),'agent_version':'synthetic-v1','session_id':'synthetic-session'}
     for person,chat,text in [(X,'chat:x','小光转述：一一喜欢星星'),(Y,'chat:y','一一接入后的第一句')]:
-        identity={'speaker_person_id':person,'conversation_key':chat,'source_message_id':'om_'+chat[-1],'sharing':'ordinary-shared','route':{'chat_id':chat}}
+        identity={'speaker_person_id':person,'conversation_key':chat,'source_message_id':'om_'+chat[-1],'route':{'chat_id':chat}}
         dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'anchor-'+chat,'text':text,'at':'2026-10-22T03:10:00Z','received_at':'2026-10-22T03:10:01Z','identity':identity})
     result=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':'chat:y','action':'session-snapshot','request':{}})
     assert [i['text'] for i in result['items']]==['一一接入后的第一句']
@@ -379,7 +412,7 @@ def test_shared_checkpoint_preserves_people_scene_and_business_indices_without_m
     built=cp.build(snap,{'conversationId':'one','generation':5},allow_model=False,adaptive_budget=True)
     assert built['complete']
     payload=built['payload'];item=payload['publicHistory'][0]
-    assert item['speaker_person_id']=='person:yiyi' and item['conversation_kind']=='group' and item['chat_id']=='oc_synthetic'
+    assert item['speaker_person_id']=='person:yiyi' and item['conversation_kind']=='group' and not {'chat_id','conversation_key'}&set(item)
     assert payload['businessState']['wishes'][0]['recipient_person_id']=='person:yiyi'
     assert payload['businessState']['affect']['mood']['value']==mind.read()['dimensions']['mood']['value']
     assert 'synthetic Y wish' not in json.dumps(payload['businessState'])
@@ -414,3 +447,16 @@ def test_checkpoint_segments_reuse_only_unchanged_sources_and_compress_new_tail(
     assert not changed['cache_hit'] and changed['model_requests']==1
     empty=ctx.pack_incremental([],'history',500,namespace='same-main',provider=Compressor(),require_all=True)
     assert empty['covered_ids']==[] and empty['text']==''
+
+def test_a_lean_draft_snapshot_is_handed_the_last_turns_without_platform_identity(setup):
+    """Feature 2: memory-context, asked for them, adds the last turns -- role, words, time and source id only."""
+    from kin_mind.host import dispatch
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'records':True})
+    MemoryContinuity(mind).ingest({'id':'lean-turn','kind':'owner-message','at':mind.clock(),'text':'Synthetic last turn',
+        'conversation_key':'platform:app:chat','chat_id':'chat'})
+    cfg = {'root': str(mind.engine.db.root), 'scope': mind.scope.model_dump(), 'agent_version': 'synthetic-v1'}
+    built = dispatch(cfg, 'memory-context', {'query': 'last', 'purpose': 'proactive', 'recent_dialogue': True})
+    assert [turn['text'] for turn in built['recent_dialogue']] == ['Synthetic last turn']
+    assert set(built['recent_dialogue'][0]) <= {'role', 'text', 'occurred_at', 'source_id', 'speaker_person_id', 'recipient_person_id'}
+    assert 'recent_dialogue' not in dispatch(cfg, 'memory-context', {'query': 'last', 'purpose': 'proactive'})

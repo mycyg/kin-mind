@@ -24,7 +24,9 @@ DEFAULTS = {"enabled": False, "initial": 75.0, "recovery_per_hour": 1.0,
             "rest_recovery_per_hour": 8.0, "awake_fatigue_per_hour": 2.0,
             "rest_fatigue_recovery_per_hour": 10.0, "max_fatigue": 40.0,
             "timezone": "Asia/Singapore", "night_penalty": 20.0,
-            "costs": {"reply": 1.5, "explore": 4.0, "work": 6.0},
+            # Minutes without any activity after which fatigue recovers as at rest; 0 turns it off.
+            "idle_rest_minutes": 45.0, "low_threshold": 20.0, "high_threshold": 70.0,
+            "costs": {"reply": 1.5, "explore": 4.0, "work": 6.0, "contact": 2.0, "play": 2.0},
             "state_notes": "", "expression_preferences": ""}
 
 
@@ -33,25 +35,39 @@ def _load(conn, scope):
     if not row:
         return 0, None
     data = json.loads(row[1])
-    data["config"] = {**DEFAULTS, **data["config"]}
+    data["config"] = {**DEFAULTS, **data["config"], "costs": {**DEFAULTS["costs"], **data["config"].get("costs", {})}}
     data.setdefault("fatigue", 0.0)
     data.setdefault("mode", "awake")
     data.setdefault("active_executions", {})
     return row[0], data
 
 
+def _idle_from(data):
+    """When fatigue starts recovering without a rest phase: a quiet stretch after the last activity."""
+    minutes = data["config"]["idle_rest_minutes"]
+    if not minutes or data["active_executions"]:
+        return None
+    return stamp(data.get("last_activity_at") or data["as_of"]) + timedelta(minutes=minutes)
+
+
 def _project(data, at):
-    elapsed = max(0.0, (stamp(at) - stamp(data["as_of"])).total_seconds() / 3600)
+    start, end = stamp(data["as_of"]), stamp(at)
     cfg = data["config"]
     if not cfg["enabled"]:
         return data["value"], data["fatigue"]
     resting = data["mode"] == "resting" and not data["active_executions"]
     recovery = cfg["rest_recovery_per_hour"] if resting else cfg["recovery_per_hour"]
     fatigue_rate = -cfg["rest_fatigue_recovery_per_hour"] if resting else cfg["awake_fatigue_per_hour"]
-    # Recovery caps before expenditure; long offline intervals use the last
-    # recorded phase, never invented sleep and never a per-hour replay loop.
-    return (min(100.0, data["value"] + recovery * elapsed),
-            min(cfg["max_fatigue"], max(0.0, data["fatigue"] + fatigue_rate * elapsed)))
+    # Recovery caps before expenditure; long offline intervals use the last recorded
+    # phase, never a per-hour replay loop. Only fatigue eases in a quiet awake stretch:
+    # the reserve still needs a real rest phase (2026-10-26: no rest proposal had come
+    # since energy was enabled, so fatigue sat at its cap).
+    idle = None if resting else _idle_from(data)
+    busy = max(0.0, ((min(end, idle) if idle else end) - start).total_seconds() / 3600)
+    quiet = max(0.0, (end - max(start, idle)).total_seconds() / 3600) if idle else 0.0
+    fatigue = min(cfg["max_fatigue"], max(0.0, data["fatigue"] + fatigue_rate * busy))
+    return (min(100.0, data["value"] + recovery * (busy + quiet)),
+            max(0.0, fatigue - cfg["rest_fatigue_recovery_per_hour"] * quiet))
 
 
 def _night_penalty(cfg, at):
@@ -75,6 +91,8 @@ def _settle(data, at):
 
 def phase_changed(conn, mind, phase):
     """Same transaction as a real rhythm proposal; repeats do not reset its clock."""
+    from .drives import phase_changed as drives_phase
+    drives_phase(conn, mind, phase)
     revision, data = _load(conn, mind.scope.key())
     mode = "resting" if phase == "resting" else "awake"
     if not data or data["mode"] == mode:
@@ -83,6 +101,11 @@ def phase_changed(conn, mind, phase):
     data["mode"] = mode
     conn.execute("UPDATE mind_energy_state SET revision=?,data=? WHERE scope=?",
                  (revision + 1, dumps(data), mind.scope.key()))
+
+
+def tier(value, cfg):
+    """low / normal / high by the configured thresholds; a reading for context, never a gate."""
+    return "low" if value <= cfg["low_threshold"] else "high" if value >= cfg["high_threshold"] else "normal"
 
 
 def view(conn, scope, at):
@@ -97,7 +120,11 @@ def view(conn, scope, at):
         counts[kind] = count
     reserve, fatigue = _project(data, at)
     night = _night_penalty(cfg, at)
-    return {"enabled": cfg["enabled"], "value": round(max(0.0, reserve - fatigue - night), 2),
+    value = round(max(0.0, reserve - fatigue - night), 2)
+    idle = None if data["mode"] == "resting" else _idle_from(data)
+    rest = None if data["active_executions"] else "rhythm" if data["mode"] == "resting" else "idle" if idle and stamp(at) >= idle else None
+    return {"enabled": cfg["enabled"], "value": value, "tier": tier(value, cfg), "rest": rest,
+            "low_threshold": cfg["low_threshold"], "high_threshold": cfg["high_threshold"],
             "reserve": round(reserve, 2), "fatigue": round(fatigue, 2), "night_penalty": round(night, 2),
             "mode": "awake" if data["active_executions"] else data["mode"], "rhythm_mode": data["mode"],
             "active_execution_count": len(data["active_executions"]), "timezone": cfg["timezone"],
@@ -122,9 +149,9 @@ def configure(mind, request):
         if "costs" in request and not isinstance(request["costs"], dict):
             raise ValueError("Energy costs must be a mapping")
         cfg = {**previous, **request, "costs": {**previous["costs"], **request.get("costs", {})}}
-        if type(cfg["enabled"]) is not bool or set(cfg["costs"]) != {"reply", "explore", "work"}:
+        if type(cfg["enabled"]) is not bool or set(cfg["costs"]) != set(DEFAULTS["costs"]):
             raise ValueError("Invalid energy configuration")
-        for value in [*(cfg[key] for key in ("initial", "recovery_per_hour", "rest_recovery_per_hour", "awake_fatigue_per_hour", "rest_fatigue_recovery_per_hour", "max_fatigue", "night_penalty")), *cfg["costs"].values()]:
+        for value in [*(cfg[key] for key in ("initial", "recovery_per_hour", "rest_recovery_per_hour", "awake_fatigue_per_hour", "rest_fatigue_recovery_per_hour", "max_fatigue", "night_penalty", "low_threshold", "high_threshold", "idle_rest_minutes")), *cfg["costs"].values()]:
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 100:
                 raise ValueError("Energy parameters must be finite values from 0 to 100")
         try:
@@ -142,6 +169,7 @@ def configure(mind, request):
         mode = data["mode"] if data else ("resting" if (rhythm.get("phase") or rhythm.get("base_phase")) == "resting" else "awake")
         data = {"value": value, "fatigue": min(fatigue, cfg["max_fatigue"]), "mode": mode,
                 "active_executions": (data or {}).get("active_executions", {}),
+                **({"last_activity_at": data["last_activity_at"]} if data and data.get("last_activity_at") else {}),
                 "as_of": at, "config": cfg, "config_version": (data or {}).get("config_version", 0) + 1}
         conn.execute("INSERT INTO mind_energy_state VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,data=excluded.data", (mind.scope.key(), revision + 1, dumps(data)))
         return {"state": "configured", "energy_context": view(conn, mind.scope.key(), at)}
@@ -152,6 +180,8 @@ def record(conn, mind, kind, activity_id, *, metadata=None):
     if kind not in DEFAULTS["costs"] or not isinstance(activity_id, str) or not activity_id.strip() or len(activity_id) > 240:
         raise ValueError("Energy activity requires a supported kind and stable logical id")
     scope, now = mind.scope.key(), mind.clock()
+    from .drives import engaged
+    engaged(conn, mind, kind, activity_id)
     revision, data = _load(conn, scope)
     if not data or not data["config"]["enabled"]:
         return {"state": "disabled", "energy_context": view(conn, scope, now)}
@@ -162,7 +192,7 @@ def record(conn, mind, kind, activity_id, *, metadata=None):
                             (scope, event_id, kind, at, -cost, data["config_version"], dumps(metadata or {}))).rowcount
     if inserted:
         _settle(data, at)
-        data.update(value=max(0.0, data["value"] - cost), last_event_id=event_id)
+        data.update(value=max(0.0, data["value"] - cost), last_event_id=event_id, last_activity_at=at)
         conn.execute("UPDATE mind_energy_state SET revision=?,data=? WHERE scope=?", (revision + 1, dumps(data), scope))
     return {"state": "applied" if inserted else "duplicate", "energy_context": view(conn, scope, at)}
 
@@ -199,6 +229,7 @@ def execution(conn, mind, kind, activity_id, execution_id, execution_state):
         return result
     at = _at(data, mind.clock())
     _settle(data, at)
+    data["last_activity_at"] = at
     executions[execution_id] = execution_state
     if execution_state == "started":
         data["active_executions"][execution_id] = {"kind": kind, "activity_id": activity_id}

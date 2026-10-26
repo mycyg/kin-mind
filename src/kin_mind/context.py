@@ -64,6 +64,10 @@ def affect_projection(view):
             return {**item, "review": REVIEW_MARK}
         return {"text": item, "review": REVIEW_MARK} if flag and item else item
 
+    # The adult-intimacy dimension is 小光's alone: no other audience is shown it, nor what lingers of it.
+    from .drives import owner_private, without_intimacy
+    if not owner_private():
+        view = without_intimacy(view)
     understanding = (view.get("appraisal_summary") or {}).get("understanding") if active else None
     # The derived layers in words and a coarse pulse, without content fingerprints.
     layers = compact(view.get("affect_layers"), coarse=True) if active else None
@@ -1175,6 +1179,9 @@ class Contexts:
         dynamic = affect_projection(view)
         affect_item = {"id": "affect", "revision": view.get("revision", 1), "text": dumps(dynamic), "basis": "inferred"}
         habits = self.memory.habits.read()
+        # 此刻的状态, in words and first in the injection; never compressed or paged away.
+        from .moment import current as moment
+        now_block = "" if explicit else moment(self.mind, view, record=record)
         if habits["revision"]:
             items.append(self.habits_item(habits))
             state_ids.add(HABITS_ITEM)
@@ -1329,7 +1336,7 @@ class Contexts:
         more = "\n" + ADMISSION_MORE_NOTE if admission == "on" and decision["unscored"] else ""
         if not 0 <= host_overhead <= 500:
             raise ValueError("Invalid host envelope allowance")
-        overhead = tokens(envelope + "\n相关记录尚未完整覆盖，可继续查询。\n" + more) + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected, recall_info)
+        overhead = tokens(envelope + ("\n" + now_block if now_block else "") + "\n相关记录尚未完整覆盖，可继续查询。\n" + more) + host_overhead + (95 if receipt_mode else 0) if not explicit else self._read_overhead(selected, recall_info)
         if automatic_budget:
             # Relevance and paging select material; token accounting is not a lifetime
             # allowance. The native session owns pressure and compaction.
@@ -1343,7 +1350,7 @@ class Contexts:
         if explicit:
             self._compact_receipt(packed)
         if not explicit:
-            rendered = envelope + "\n" + packed["text"] + ("\n相关记录尚未完整覆盖，可继续查询。" if packed["omitted_ids"] else "") + more
+            rendered = envelope + "\n" + (now_block + "\n" if now_block else "") + packed["text"] + ("\n相关记录尚未完整覆盖，可继续查询。" if packed["omitted_ids"] else "") + more
             if tokens(rendered) > budget:
                 rendered = ""
             packed.update(rendered_text=rendered, tokens=tokens(rendered) + min(host_overhead, budget), content_tokens=packed["tokens"], host_overhead=host_overhead)

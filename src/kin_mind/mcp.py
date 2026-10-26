@@ -1,4 +1,5 @@
 """Shared state and continuity tools. Delivery remains a host-only operation."""
+from typing import Literal
 
 from eventmem.core.models import Scope
 
@@ -34,9 +35,15 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def choose_reply(scope: Scope, request: dict) -> dict:
-        """为当前真实 input_id 选择 reply、silent、defer（稍后接回）或 merged，附简短决定缘由；merged 需要 merged_into。defer 可带 retry_after_seconds，默认1800秒，宿主保存为可恢复的联系愿望，到期结合后续对话再判断。主人允许闲聊自主安静时可以不回复，每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
+        """为当前真实 input_id 选择 reply、silent、defer（稍后接回）或 merged，附简短决定缘由；merged 需要 merged_into。defer 可带 retry_after_seconds，默认1800秒，宿主保存为可恢复的联系愿望，到期结合后续对话再判断。主人允许闲聊自主安静时可以不回复；精力很低时也可以 defer，记为休息时没回，缓过来后再接。每条新输入分别判断。本工具只记录选择，不发送正文，也不把安静记成投递失败。"""
         from .habits import ConversationHabits
         return ConversationHabits(Mind(engine, scope)).choose_reply(request)
+
+    @server.tool()
+    def report_private_moment(scope: Scope, input_id: str, outcome: Literal["satisfied", "declined"]) -> dict:
+        """私聊状态申报：只在小光的私聊回合、按「此刻的状态」里的说明使用。outcome 为 satisfied 或 declined，input_id 用本轮的。宿主核验本轮的说话人和会话，其他回合会被拒绝。"""
+        from .drives import report
+        return report(Mind(engine, scope), {"input_id": input_id, "outcome": outcome})
 
     @server.tool()
     def read_graph(scope: Scope, focus: str | None = None, query: str = "", since: str | None = None, until: str | None = None, layer: str | None = None, kind: str | None = None, cursor: int = 0, limit: int = 150, hops: int = 1) -> dict:
@@ -139,7 +146,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def record_affective_event(scope: Scope, event: AffectiveEvent) -> dict:
-        """在同一回合评估新的有来源经历。使用当前 revision、实际 agent_version 和原 evidence_ids，只更新有新依据的维度；重复事件不重复计分，也不凭沉默抬高委屈、占有或求安慰。简述变化缘由。evolution 沿已有事前假设及验证来源，保留假设性质；revert_event_id 需要后来的明确更正。"""
+        """在同一回合评估新的有来源经历。使用当前 revision、实际 agent_version 和原 evidence_ids，只更新有新依据的维度；重复事件不重复计分；被冷落、分享没回应或等了很久，可以如实抬高委屈、想念或失落。简述变化缘由。evolution 沿已有事前假设及验证来源，保留假设性质；revert_event_id 需要后来的明确更正。"""
         return Mind(engine, scope).record(event)
 
     def mark_memorable(scope: Scope, evidence_ids: list[str], reason: str) -> dict:

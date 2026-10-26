@@ -26,7 +26,7 @@ export class ParallelTasks {
       state:tState(task,p),phase:p.phase??null,completedCount:tools.filter(t=>t.status==='completed').length,completed:tools.filter(t=>t.status==='completed').slice(-12).map(t=>({id:t.id,name:t.name,receipt:t.eventId})),
       pending:[...tools.filter(t=>!['completed','failed','canceled'].includes(t.status)).map(t=>({id:t.id,name:t.name})),
         ...(!terminal.has(p.state)?[{id:p.runId,kind:'native-task-turn',state:p.state}]:[])],
-      blockers:[...(p.blocker?[p.blocker]:[]),...(items.some(i=>i.kind==='final'&&['failed','unknown'].includes(i.state))?['final-delivery-unconfirmed']:[])],result:task.inputVersion===p.inputVersion?p.result??null:null,lastEventSeq:p.eventSeq??0,lastProgressAt:p.lastProgressAt??null,
+      blockers:[...(p.blocker?[p.blocker]:[]),...(p.finalDropped?['final-dropped:'+p.finalDropped]:[]),...(items.some(i=>i.kind==='final'&&['failed','unknown'].includes(i.state))?['final-delivery-unconfirmed']:[])],result:task.inputVersion===p.inputVersion?p.result??null:null,lastEventSeq:p.eventSeq??0,lastProgressAt:p.lastProgressAt??null,
       finalDelivery:items.filter(i=>i.kind==='final').map(i=>({id:i.id,state:i.state})),workerThreadId:p.threadId??null};
   }
   snapshots(){return this.tasks().slice(-4).map(t=>this.snapshot(t.id));}
@@ -52,8 +52,9 @@ export class ParallelTasks {
   }
   current(item) {
     const t=item.taskId?this.router.state.tasks[item.taskId]:null;
-    if(item.expiresAt<=this.now()||item.executionEpoch!==this.router.state.executionEpoch)return false;
-    if(!item.taskId)return true;
+    if(item.expiresAt<=this.now())return false;
+    // A worker's items follow its task's epoch; a force switch elsewhere does not stale them.
+    if(!item.taskId)return item.executionEpoch===this.router.state.executionEpoch;
     return Boolean(t&&!t.cancelRequested&&t.inputVersion===item.inputVersion&&t.executionEpoch===item.executionEpoch&&
       (item.kind==='final'?t.parallel?.state==='completed':!terminal.has(t.parallel?.state)));
   }
@@ -108,7 +109,7 @@ export class ParallelTasks {
       if(!t.cancelRequested&&t.status!=='canceled'&&p.state==='canceled')await this.write(()=>{
         const updates=t.inputIds.filter(id=>id!==p.sourceInputId).map(id=>({id,text:this.router.state.inputs[id]?.text??this.router.state.recent.find(r=>r.id===id)?.text??''}));
         Object.assign(p,{state:'admitted',runId:randomUUID(),capability:randomUUID(),inputVersion:t.inputVersion,executionEpoch:t.executionEpoch,
-          brief:'任务要求已更新，沿当前线程继续，先核对已有动作和结果，不重复已完成动作。'+JSON.stringify(updates),tools:{},eventSeq:0,revision:p.revision+1});
+          brief:'任务要求已更新，沿当前线程继续，先核对已有动作和结果，不重复已完成动作。'+JSON.stringify(updates),tools:{},eventSeq:0,finalDropped:null,revision:p.revision+1});
       });
       return;
     }
@@ -158,6 +159,12 @@ export class ParallelTasks {
       p.state='completed';delete p.final;p.revision++;
     });
   }
+  /** A dropped final is a blocker of its run, told to Kin once by the notification pass. */
+  drop(item,reason) {
+    item.state='dropped';item.reason=reason;
+    const p=item.kind==='final'?this.router.state.tasks[item.taskId]?.parallel:null;
+    if(p&&p.runId===item.runId)p.finalDropped=reason;
+  }
   async tick() {
     if(this.closed||this.pumping)return;this.pumping=true;
     try {
@@ -166,14 +173,14 @@ export class ParallelTasks {
       }
       for(const item of Object.values(this.router.state.visibleItems)) {
         if(doneItem.has(item.state)||item.state==='submitting'||item.state==='unknown')continue;
-        if(!this.current(item)){await this.write(()=>{item.state='dropped';item.reason='stale-expression';});continue;}
+        if(!this.current(item)){await this.write(()=>this.drop(item,'stale-expression'));continue;}
         if(item.state==='admitted'&&!this.preparing.has(item.id)) {
           await this.write(()=>{item.state='preparing';});
           let timeout;
           const deadline=new Promise((_,reject)=>{timeout=setTimeout(()=>reject(Error('Media preparation deadline')),item.important?Math.min(5000,this.prepareTimeoutMs):this.prepareTimeoutMs);timeout.unref?.();});
           const job=Promise.race([Promise.resolve().then(()=>this.prepare(copy(item))),deadline]).then(value=>this.write(()=>{
             if(this.closed||item.state!=='preparing')return;
-            this.prepared.set(item.id,value);item.state=this.current(item)?'ready':'dropped';
+            this.prepared.set(item.id,value);if(this.current(item))item.state='ready';else this.drop(item,'stale-expression');
           })).catch(()=>this.write(()=>{
             if(this.closed||item.state!=='preparing')return;
             if(item.important&&item.publicText!=='[MEME]'){item.meme=null;item.presentation={mode:'text',style:''};item.state='ready';}
@@ -185,7 +192,7 @@ export class ParallelTasks {
       // Preparation never holds the send lane; optional older items yield to ready results.
       for(const item of Object.values(this.router.state.visibleItems).sort((a,b)=>a.sequence-b.sequence)) {
         if(!['ready','submitting','unknown'].includes(item.state))continue;
-        if(item.state==='ready'&&!this.current(item)){await this.write(()=>{item.state='dropped';});continue;}
+        if(item.state==='ready'&&!this.current(item)){await this.write(()=>this.drop(item,'stale-expression'));continue;}
         for(const earlier of Object.values(this.router.state.visibleItems))if(earlier.sequence<item.sequence&&earlier.state==='preparing'&&!earlier.important)
           await this.write(()=>{earlier.state='dropped';earlier.reason='newer-expression-ready';});
         const lookupOnly=item.state!=='ready';await this.write(()=>{if(!lookupOnly)item.state='submitting';});
@@ -193,8 +200,9 @@ export class ParallelTasks {
         await this.write(()=>{
           item.state=receipt?.state==='accepted'?'accepted':['rejected','undeliverable','partial'].includes(receipt?.state)?'failed':receipt?.state==='retired'?'dropped':receipt?.state==='not-submitted'?'admitted':'unknown';
           if(item.state==='accepted')item.receipt=receipt;
+          if(item.state==='dropped')this.drop(item,'delivery-retired');
           const t=this.router.state.tasks[item.taskId];
-          if(item.kind==='final'&&t?.parallel?.state==='completed'&&t.inputVersion===item.inputVersion&&
+          if(item.kind==='final'&&t?.parallel?.state==='completed'&&!t.closure&&t.inputVersion===item.inputVersion&&
             Object.values(this.router.state.visibleItems).filter(i=>i.taskId===t.id&&i.inputVersion===t.inputVersion&&i.kind==='final').every(i=>i.state==='accepted')) {
             t.status='completed';t.completedAt=this.now();t.outcome='completed';this.router.state.autoRestoreDue=true;t.parallel.finalDeliveredAt=this.now();
           }
@@ -209,7 +217,7 @@ export class ParallelTasks {
         if(!terminal.has(p.state)||this.notifying.has(p.runId)||this.router.frozen?.())continue;
         const notificationKey=p.state+':'+(p.finalDeliveredAt?'delivered':'unsettled');
         if(p.notificationKey===notificationKey&&['accepted','unknown'].includes(p.notification))continue;
-        if(p.state==='completed'&&!p.finalDeliveredAt&&!Object.values(this.router.state.visibleItems).some(i=>i.taskId===t.id&&i.inputVersion===t.inputVersion&&i.kind==='final'&&['failed','unknown'].includes(i.state)))continue;
+        if(p.state==='completed'&&!p.finalDeliveredAt&&!p.finalDropped&&!Object.values(this.router.state.visibleItems).some(i=>i.taskId===t.id&&i.inputVersion===t.inputVersion&&i.kind==='final'&&['failed','unknown'].includes(i.state)))continue;
         const snapshot=this.snapshot(t.id);
         await this.write(()=>{p.notification='submitting';p.notificationKey=notificationKey;});
         const job=Promise.resolve().then(()=>this.onChange(snapshot)).then(receipt=>this.write(()=>{

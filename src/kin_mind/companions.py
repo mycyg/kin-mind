@@ -1,7 +1,7 @@
 """Identity/visibility projections in the existing memory database, never a second memory.
 
-Historical sources and their timestamps are immutable. A reviewed annotation only adds
-who spoke, who an event concerns, and which audience may recall it. Unknown stays unknown.
+Historical sources and their timestamps are immutable. An annotation only adds who spoke
+and who an event concerns; what to share is Kin's judgment. Unknown stays unknown.
 """
 from __future__ import annotations
 import json
@@ -12,7 +12,6 @@ from eventmem.core.models import Scope
 XIAOGUANG, YIYI = 'person:xiaoguang', 'person:yiyi'
 PEOPLE = {XIAOGUANG, YIYI}
 FAMILY = 'group:family'
-PROTECTED = {'private', 'intimate', 'health', 'financial', 'uncertain'}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS mind_companion_sources(
  scope TEXT NOT NULL,source_id TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL,
@@ -30,27 +29,27 @@ class Companions:
         with engine.db.connect() as conn:
             conn.executescript(SCHEMA)
 
-    def annotate(self, *, source_id, speaker_person_id, conversation_key, classification,
+    def annotate(self, *, source_id, speaker_person_id, conversation_key,
                  command_id, evidence_id, expected_revision=0, subject_ids=(), participants=(),
-                 sharing='private', basis='explicit', recipient_person_id=None):
+                 basis='explicit', recipient_person_id=None):
         if speaker_person_id not in PEOPLE | {'agent:kin', None}:
             raise ValueError('Unknown speaker')
         if recipient_person_id is not None and recipient_person_id not in PEOPLE | {FAMILY}: raise ValueError('Unknown recipient')
-        if classification not in PROTECTED | {'ordinary'} or sharing not in {'private', 'ordinary-shared', 'pending'}:
-            raise ValueError('Explicit content classification and sharing choice required')
         if not command_id or not evidence_id or basis not in {'explicit','observed','inferred','internal_thought'}:
             raise ValueError('Annotation provenance required')
         if any(not isinstance(p, dict) or not p.get('person_id') or not p.get('role') for p in participants):
             raise ValueError('Participants need independent identities and roles')
         data = dict(source_id=source_id, speaker_person_id=speaker_person_id, conversation_key=conversation_key,
-                    classification=classification, sharing=sharing, subject_ids=list(subject_ids),
+                    subject_ids=list(subject_ids),
                     participants=list(participants), basis=basis, evidence_id=evidence_id,recipient_person_id=recipient_person_id)
         with self.engine.db.connect(write=True) as conn:
             previous=conn.execute('SELECT data FROM mind_companion_changes WHERE scope=? AND command_id=?',
                                   (self.scope.key(),command_id)).fetchone()
             if previous:
                 old=json.loads(previous[0])
-                if old['intent'] != data: raise Conflict('Annotation command reused with different intent')
+                # Older annotations also stored a sharing classification, which is no longer part of an intent.
+                if {k:v for k,v in old['intent'].items() if k not in ('classification','sharing')} != data:
+                    raise Conflict('Annotation command reused with different intent')
                 return old['result']
             source=conn.execute('SELECT scope,deleted FROM sources WHERE id=?',(source_id,)).fetchone()
             if not source or source['deleted'] or source['scope']!=self.scope.key(): raise Missing(source_id)
@@ -71,7 +70,7 @@ class Companions:
 
     def visible(self, conn, sid, audience, seen=None, memo=None):
         # A source DAG can reach the same ancestor through many paths.
-        # Memo belongs to this one read, so deletion/reclassification is fresh next time.
+        # Memo belongs to this one read, so a deletion is fresh next time.
         memo={} if memo is None else memo
         if sid in memo:return memo[sid]
         result=self._visible(conn,sid,audience,seen,memo)
@@ -85,9 +84,8 @@ class Companions:
         seen.add(sid)
         row=conn.execute('SELECT scope,namespace,data,deleted FROM sources WHERE id=?',(sid,)).fetchone()
         if not row or row['deleted'] or row['scope']!=self.scope.key(): return False
-        # KIN has one memory across conversations. Subject, provenance and any
-        # explicit confidentiality annotation are facts for her judgment; they
-        # do not recursively turn a derived experience into an inaccessible one.
+        # Kin has one memory across conversations. Speaker and subject are facts
+        # for Kin's judgment; they never make a derived experience inaccessible.
         return True
 
     def source_view(self, source_id, audience):
@@ -98,16 +96,13 @@ class Companions:
             return {'source_id':source_id,'text':self.engine.source(source_id,content=True).read_bytes()[:24000].decode('utf-8',errors='replace') if data.get('media_type','text/plain').startswith(('text/','application/json')) else '[附件来源：'+data.get('media_type','unknown')+']','occurred_at':data.get('metadata',{}).get('original_occurred_at',row['occurred_at']),
                     'time_basis':data.get('metadata',{}).get('time_basis','source'),
                     'conversation_kind':data.get('metadata',{}).get('conversation_kind','autonomous' if a and a['speaker_person_id']=='agent:kin' and not a.get('conversation_key') else 'p2p' if a and a.get('conversation_key') else 'unknown'),
-                    'chat_id':data.get('metadata',{}).get('chat_id'),
                     'received_at':row['received_at'], 'speaker_person_id':a['speaker_person_id'] if a else data.get('metadata',{}).get('speaker_person_id'),
-                    'conversation_key':a['conversation_key'] if a else data.get('metadata',{}).get('conversation_key'),
                     'subject_ids':a['subject_ids'] if a else [],'participants':a['participants'] if a else [],
-                    'classification':a['classification'] if a else None,'sharing':a['sharing'] if a else None,
                     'basis':a['basis'] if a else 'unknown','knowledge_basis':data.get('metadata',{}).get('knowledge_basis'),
                     'external_sources':data.get('metadata',{}).get('sources',[]),'observation_ids':data.get('metadata',{}).get('observation_ids',[]),'perspective':data.get('metadata',{}).get('perspective')}
 
     def history_preview(self, source_ids):
-        """No writes, no guessed timestamps/actors. Caller supplies reviewed classifications."""
+        """No writes, no guessed timestamps/actors."""
         with self.engine.db.connect() as conn:
             result=[]
             for sid in source_ids:
@@ -124,7 +119,7 @@ class Companions:
                     'annotation':a,'original_metadata':deepcopy(data.get('metadata',{}))})
             return result
 
-    def migrate_legacy(self, *, source_ids, classifications, command_id, evidence_id):
+    def migrate_legacy(self, *, source_ids, command_id, evidence_id):
         """Reviewed labels only; immutable originals retain their exact timestamps and bytes."""
         preview=self.history_preview(source_ids);results=[]
         for item in preview:
@@ -134,8 +129,7 @@ class Companions:
                 results.append({'source_id':item['source_id'],'state':'unknown-speaker'});continue
             meta=item['original_metadata']
             results.append(self.annotate(source_id=item['source_id'],speaker_person_id=item['candidate_speaker'],
-                conversation_key=meta.get('conversation_key'),classification=classifications.get(item['source_id'],'uncertain'),
-                sharing='ordinary-shared',participants=meta.get('participants',[]),subject_ids=meta.get('subject_ids',[]),
+                conversation_key=meta.get('conversation_key'),participants=meta.get('participants',[]),subject_ids=meta.get('subject_ids',[]),
                 command_id=command_id+':'+item['source_id'],evidence_id=evidence_id,basis='observed'))
         return {'items':results}
 

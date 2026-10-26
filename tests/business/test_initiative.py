@@ -121,7 +121,7 @@ def test_an_idle_review_must_answer_with_a_contact_decision_and_is_shown_the_sil
 
 
 @pytest.mark.parametrize("answer,expected", [
-    ("contact", "contact"), ("nothing", "missing"), ("reply-without-wish", "missing")])
+    ("contact", "contact"), ("nothing", "not-now"), ("reply-without-wish", "not-now")])
 def test_what_an_idle_review_decided_about_contacting_is_kept_with_its_result(setup, answer, expected):
     mind, source, clock = setup
     memory, actions = world(setup)
@@ -138,9 +138,13 @@ def test_what_an_idle_review_decided_about_contacting_is_kept_with_its_result(se
     assert decision["state"] == expected
     if expected == "contact":
         assert decision["desire_ids"] == [d["id"] for d in mind.read()["desires"] if d["kind"] == "contact"]
+    else:
+        # No decision given is booked as not now, marked as the host's default (feature 5).
+        assert decision["defaulted"] is True
     with mind.engine.db.connect() as conn:
         counted = conn.execute("SELECT data FROM metrics WHERE name='idle_contact_decision'").fetchall()
     assert [json.loads(row[0])["state"] for row in counted] == [expected]
+    assert [json.loads(row[0]).get("defaulted", False) for row in counted] == [expected != "contact"]
 
 
 def test_an_assessment_without_an_idle_review_is_asked_for_no_contact_decision(setup):

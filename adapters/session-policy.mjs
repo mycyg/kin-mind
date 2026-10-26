@@ -5,11 +5,14 @@ export const SESSION_DEFAULTS=Object.freeze({version:'compact-first-v1',observe:
   pausedTaskHandover:false,preparePressure:0.55,compactPressure:0.65,criticalPressure:0.85,rotationCooldownMs:1800000,
   compactCooldownMs:1800000,outputReserve:32768,toolReserve:8192,restoreBudget:2000});
 
+/** Auto chat on the chat model is compacted early, once its input nears `tokens` (feature 6). */
+export const CHAT_COMPACTION=Object.freeze({model:'deepseek-flash',tokens:120000});
 export function windowPressure(runtime,config=SESSION_DEFAULTS) {
-  const window=runtime.modelContextWindow;
+  const output=runtime.outputReserve??config.outputReserve,tools=runtime.toolReserve??config.toolReserve;
+  const chat=runtime.model===CHAT_COMPACTION.model?Math.ceil((CHAT_COMPACTION.tokens+output+tools)/SESSION_DEFAULTS.compactPressure):Infinity;
+  const window=Number.isFinite(runtime.modelContextWindow)?Math.min(runtime.modelContextWindow,chat):runtime.modelContextWindow;
   const measured=runtime.lastTokenUsage?.inputTokens;
   const next=runtime.contextWindowExceeded?window:(runtime.expectedInputTokens??measured);
-  const output=runtime.outputReserve??config.outputReserve,tools=runtime.toolReserve??config.toolReserve;
   const known=[window,next,output,tools].every(v=>Number.isFinite(v)&&v>=0)&&window>0;
   const ratio=known?(next+output+tools)/window:null;
   return {known,effectiveWindow:window??null,inputTokens:measured??null,expectedInputTokens:next??null,outputReserve:output,toolReserve:tools,ratio,

@@ -8,6 +8,7 @@ import {parseContactDraft} from '../../adapters/contact-draft.mjs';
 import {TransportManifests} from '../../adapters/transport-manifest.mjs';
 import {createContactBatch} from '../../adapters/contact-batch.mjs';
 import {speechDelivery} from '../../adapters/local-speech.mjs';
+import {VOICE_MAX_CHARS} from '../../adapters/reply-presentation.mjs';
 import {bubblePieces} from '../../adapters/reply-tail.mjs';
 import {replyOutcomeFacts} from '../../adapters/reply-outcomes.mjs';
 
@@ -105,4 +106,19 @@ test('long voice waits only its recipient, while another recipient text complete
  await begun;const deadline=Date.now()+2000;while(!sent.length&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));assert.deepEqual(sent,['b1']);release();
  assert.equal((await run).manifest.state,'accepted');assert.deepEqual(sent,['b1','a1','a2']);
  await m.run(draft.group_id,{transport:{send:()=>{throw Error('duplicate');}}});
+});
+for(const mode of ['voice','both'])test('a '+mode+' bubble too long to say goes as text, once',async t=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'kin-speech-long-'));t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
+ const sent=[],receipts=new Map(),text='合成长句。'.repeat(61);assert.ok(text.length>VOICE_MAX_CHARS);
+ const m=new TransportManifests({directory,receipt:id=>receipts.get(id),sleep:async()=>{}});
+ const draft=m.createDraft({entries:[{request:{draft_id:'draft',reply_id:'input',text},delivery:{id:'bubble',text,presentation:{mode,style:''}}}],ownerEpoch:1});
+ const r=await m.run(draft.group_id,{transport:{receipt:id=>receipts.get(id),send:async delivery=>{sent.push(delivery);const receipt={state:'accepted',messageId:'m'+sent.length,acceptedAt:new Date().toISOString()};receipts.set(delivery.id,receipt);return receipt;}}});
+ assert.equal(r.manifest.state,'accepted');assert.ok(sent.length>=1&&sent.every(d=>!d.speech),'no fragment asks for speech');
+ assert.equal(sent.map(d=>d.text).join(''),text,'the words go once, as text');
+});
+test('a contact voice bubble too long to say goes as text',async()=>{
+ const store=new Map(),sent=[],text='合成长句。'.repeat(61);
+ const batch=createContactBatch({read:id=>store.get(id),write:(id,v)=>store.set(id,structuredClone(v)),send:async x=>{sent.push(x);return {state:'accepted',messageId:x.id};}});
+ const r=await batch({id:'contact',bubbles:[text],presentation:{mode:'voice'},channel:'feishu'});
+ assert.equal(r.state,'accepted');assert.ok(sent.length>=1&&sent.every(x=>!x.speech));assert.equal(sent.map(x=>x.text).join(''),text);
 });

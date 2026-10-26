@@ -218,7 +218,7 @@ class DesireChange(Model):
     expires_at: str | None = None
     completion: str | None = Field(default=None, min_length=1)
     concern_ids: list[str] | None = Field(default=None, max_length=10)
-    exploration_target: Literal["knowledge", "computer"] | None = None
+    exploration_target: Literal["knowledge", "computer", "play"] | None = None
     exploration_id: str | None = Field(default=None, max_length=100)
     activity_ref: dict | None = None
     reason: str = ""
@@ -402,6 +402,7 @@ class Mind(Continuity):
         # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
         self._curves = {}
         from .energy import SCHEMA as ENERGY_SCHEMA
+        from .drives import SCHEMA as DRIVES_SCHEMA
         from .archive_memory import SCHEMA as ARCHIVE_MEMORY_SCHEMA
         from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
         from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
@@ -410,7 +411,7 @@ class Mind(Continuity):
         from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
         if not ensure_schema(self.engine, "mind", SCHEMA + recipient.CURSOR_SCHEMA + ";" + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA + EVIDENCE_KEY_SCHEMA
                              + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA
-                             + EVIDENCE_REF_SCHEMA + ENERGY_SCHEMA):
+                             + EVIDENCE_REF_SCHEMA + ENERGY_SCHEMA + DRIVES_SCHEMA):
             return
         with self.engine.db.connect() as conn:
             index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
@@ -1803,6 +1804,9 @@ class Mind(Continuity):
         with self.engine.db.connect(write=True) as conn:
             state, at = self._load(conn), self.clock()
             due = []
+            # With energy high, Kin's own timed waits come round in half the time (2026-10-26).
+            from .energy import view as energy_view
+            eager = energy_view(conn, self.scope.key(), at).get("tier") == "high"
             for desire in state["desires"].values():
                 if not recipient.belongs(desire):
                     continue
@@ -1828,7 +1832,10 @@ class Mind(Continuity):
                             "AND COALESCE(json_extract(data,'$.metadata.recipient_person_id'),json_extract(data,'$.metadata.speaker_person_id'),'person:xiaoguang')=? LIMIT 1",
                             (self.scope.key(), wait.get("since", at), recipient.current()),
                         ).fetchone())
-                if (wait.get("condition") == "time" and wait.get("retry_at") and timestamp(wait["retry_at"]) <= timestamp(at)) or replied:
+                ready_at = timestamp(wait["retry_at"]) if wait.get("condition") == "time" and wait.get("retry_at") else None
+                if ready_at and eager and wait.get("since"):
+                    ready_at -= (ready_at - timestamp(wait["since"])) / 2
+                if (ready_at and ready_at <= timestamp(at)) or replied:
                     due.append(desire)
             if not due:
                 return {"state": "unchanged", "resumed": []}

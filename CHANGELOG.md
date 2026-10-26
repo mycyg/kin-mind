@@ -19,6 +19,160 @@
 - Include companion conversations in activity windows and use one authoritative rhythm phase.
 - Project shared energy from activity receipts, elapsed wake/rest time and local night-time tiredness; retain logical activity deduplication and execution recovery.
 
+## 0.1.99
+
+- Isolate enrichment deadlines by recipient and retain assessment failure details.
+- Preserve tool discovery across provider handoff.
+
+## 0.1.98
+
+- Fix shared companion execution and the editable prompt lifecycle.
+
+## 0.1.97
+
+- Accept model selections interpreted in the authenticated owner turn.
+
+## 0.1.96
+
+- Carry memory link guidance with reference repair feedback.
+
+## 0.1.95
+
+- Explain memory references and keep actionable repair feedback.
+
+## 0.1.94
+
+- Avoid repeated ancestry traversal in companion memory reads.
+
+## 0.1.93
+
+- Preserve the latest companion context and deliver each recipient lane independently.
+
+## 0.1.92
+
+- Support current Kimi coding models, including K3.1 Pro.
+
+## 0.1.91
+
+- Simplify shared component loading, memory projection and editable project prompts.
+
+## 0.1.90
+
+- Align maintenance findings with the dialogue actually reviewed.
+
+## 0.1.89
+
+- Keep maintenance pending when required advice is rejected; cover maintenance-only schemas and editable prompt defaults.
+
+## 0.1.88
+
+- Fix the maintenance contract and live editable prompt defaults.
+
+## 0.1.87
+
+- Simplify companion decisions and unify memory and recipient execution.
+
+## 0.1.86
+
+- Reduce unified assessment agendas and preserve cache prefixes.
+
+## 0.1.85
+
+- Index terminal plans in appraisals and attest detached context.
+
+## 0.1.84
+
+- Correct relay continuation.
+
+## 0.1.83
+
+- Correct the runtime build source.
+
+## 0.1.82
+
+- Decouple self-contained background assessments from the main chat model.
+
+## 0.1.81
+
+- Validate cross-contact requests.
+
+## 0.1.80
+
+- Require explicit session advice for maintenance appraisals.
+
+## 0.1.79
+
+- Bind unified reviews to the host.
+
+## 0.1.78
+
+- Fix the DeepSeek assessment schema and protected contact claim recovery.
+
+## 0.1.77
+
+- Support explicit companion voice delivery modes.
+- Fix native timeout defaults and recipient-owned startup recovery.
+
+## 0.1.76
+
+- Isolate internal execution and handle addressed interjections.
+
+## 0.1.75
+
+- Require session advice before settling a merged maintenance review, and complete its receipt.
+
+## 0.1.74
+
+- Reuse sourced checkpoint segments and coalesce state reviews.
+
+## 0.1.73
+
+- Use native recovery headroom and report checkpoint preparation state; exercise a metadata-heavy restore budget.
+
+## 0.1.72
+
+- Measure the complete restore payload before choosing original history.
+
+## 0.1.71
+
+- Reserve provenance and summary space when preparing recovery checkpoints.
+
+## 0.1.70
+
+- Allow background checkpoint summaries to complete shared-session recovery.
+
+## 0.1.69
+
+- Unify idle decisions and retain capacity pressure with bounded continuity.
+
+## 0.1.68
+
+- Stop an invalid contact JSON scan at the beginning of input.
+
+## 0.1.67
+
+- Keep companion autonomy and reviews in one native session.
+
+## 0.1.66
+
+- Inherit the primary model choice in companion routing without interrupting active replies.
+- Keep recipient wishes and schedules independent within one Kin state.
+
+## 0.1.64
+
+- Preserve fresh companion sessions through gateway setup and support selective companion group chat.
+- Distinguish observed companion speech from direct mentions; classify recipient and protected sharing conflicts.
+- Complete companion provenance projection and generated API contracts.
+
+## 0.1.63
+
+- Preserve native companion sessions, source attribution and companion routing.
+- Add sourced companion identities and recipient-aware shared memory.
+
+## 0.1.62
+
+- Keep rejected MEME items as durable unsent delivery feedback and fix MEME steering delivery.
+
 ## 0.1.61
 
 - Keep the main conversation responsive while one owned task worker continues, with event-backed progress, revision/cancellation fences, and separately acknowledged public items and final results.

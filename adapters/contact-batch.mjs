@@ -1,4 +1,4 @@
-import {replyPresentation} from './reply-presentation.mjs';
+import {replyPresentation,spokenMode} from './reply-presentation.mjs';
 import {splitChatText} from './chat-bubbles.mjs';
 import {CHANNEL_CONTRACTS,channelContract,classifyReceipt,normalizeReceipt} from './channel-contract.mjs';
 import {fragmentText,fileFragment} from './text-fragments.mjs';
@@ -91,7 +91,7 @@ export function createContactBatch({read,write,send,receipt=()=>null,eligible=()
       const checked=verdict.checked?.[index]??{};
       if(Array.isArray(checked.references))item.references=checked.references;
       item.sourceReferences=item.references;
-      const presentation=item.presentation??batch.presentation,mode=presentation?.mode??'text';
+      const presentation=item.presentation??batch.presentation,mode=spokenMode(presentation?.mode??'text',item.text);
       if(begun||mode==='text')items.push(...(begun?[item]:cut(item,limit)));
       else {
         if(mode==='both')items.push(...cut(item,limit));

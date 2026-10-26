@@ -939,3 +939,19 @@ test('an unknown submission the owner\'s stop settled holds the session no more,
   await router.watch({reconcileInput:async id=>{assert.equal(id,'stop','nothing she stopped is looked up');return {state:'found'};}});
   assert.deepEqual(boundary(router),{safe:true});
 });
+
+test('a stopped background worker closes on Kin\'s declaration; a running one never does',async t=>{
+  const f=fixture(t);
+  await f.router.dispatch({id:'job',kind:'owner',text:'写一份报告'},async()=> 'new-turn');
+  await f.router.requestMode({commandId:'take-job',mode:'work',sourceInputId:'job',reason:'KIN takes this work on'});
+  const task=f.router.tasks()[0];task.status='running';task.parallel={state:'running',inputVersion:task.inputVersion,executionEpoch:0,runId:'worker'};
+  await assert.rejects(f.router.requestMode({commandId:'early',mode:'auto',reason:'x',taskOutcome:'partial',completedTaskId:task.id,completedInputVersion:task.inputVersion}),/still executing/);
+  for(const state of ['failed','blocked']) {
+    task.parallel.state=state;await f.router.reconcile();
+    assert.equal(f.router.state.tasks[task.id].status,'running','undeclared, the stopped worker waits for Kin');
+  }
+  await chat(f,'facts','后台任务状态');
+  await f.router.requestMode({commandId:'declare',mode:'auto',reason:'worker blocked; told what is known',taskOutcome:'partial',completedTaskId:task.id,completedInputVersion:task.inputVersion,sourceInputId:'facts'});
+  await f.router.reconcile();
+  assert.deepEqual([task.status,task.closure.outcome,f.router.openWork().length],['partial','partial',0]);
+});

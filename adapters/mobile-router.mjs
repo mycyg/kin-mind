@@ -12,6 +12,7 @@ import {inputSettled,inputInFlight,inputSummary,unsettledView,emptySummary,owner
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const clone = value => structuredClone(value);
 const open=openTask;
+const workerStopped=task=>['completed','failed','canceled','blocked'].includes(task.parallel?.state);
 /** What Kin may declare about a task. The host verifies facts, never the choice. */
 export const TASK_OUTCOMES=Object.freeze(['completed','partial','declined','deferred']);
 export {TASK_CLOSED,openTask};
@@ -902,7 +903,9 @@ export class MobileRouter {
       }
       // The literal stop is read before any model is asked, and answers on its own when none can be.
       const stop=STOP_LITERAL.test(input.text.trim());
-      const command=stop?'stop':owner&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
+      // Only the owner's own literal commands run directly; another speaker's are words for Kin.
+      const ownerSpeaker=(input.speaker_person_id??'person:xiaoguang')==='person:xiaoguang';
+      const command=stop?'stop':owner&&ownerSpeaker&&!input.attachments?.length?(modeCommand(input.text)??(input.text.trim()==='/compact'?'compact':null)):null;
       if(this.frozen()&&!(owner&&(stop||['work','auto'].includes(command))))throw frozenError(this.state.freeze.reason);
       const runtime=await this.inspect();
       const priorTask=this.currentTask();
@@ -2293,7 +2296,7 @@ export class MobileRouter {
     const proposal=task.completion;
     if(!proposal?.outcome||proposal.state==='historical-proposal'||proposal.inputVersion!==task.inputVersion||
       proposal.turnFence!==task.executionEpoch||!runtime||this.busy(runtime))return false;
-    return Boolean(proposal.interruptedBy||proposal.turnStartedAt===undefined&&(task.turnEndedAt??0)>=proposal.at||
+    return Boolean(proposal.interruptedBy||workerStopped(task)||proposal.turnStartedAt===undefined&&(task.turnEndedAt??0)>=proposal.at||
       proposal.turnStartedAt!==undefined&&proposal.turnStartedAt<=proposal.at&&proposal.turnEndedAt>=proposal.at);
   }
   /** Declared, the turn and its tools done, and past the report wait still without a
@@ -2436,8 +2439,8 @@ export class MobileRouter {
       }
       if(this.lapseProposals())changed=true;
       for(const task of this.tasks()) {
-        // Independent worker lifecycle and delivery are settled by ParallelTasks.
-        if(task.parallel)continue;
+        // A running worker is settled by ParallelTasks; a stopped one closes on Kin's declaration.
+        if(task.parallel&&!workerStopped(task))continue;
         if(task.cancelRequested){this.cancelTask(task);changed=true;continue;}
         if(this.recoverDeclarationEnd(task))changed=true;
         // Kin's declared outcome closes the task once the host's facts are in (N1).

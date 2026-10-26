@@ -351,7 +351,10 @@ export class SessionManager {
     this.state.observation={...content,reviewBasis:basis,id,at:changed?now:previous.at};
     if(changed)this.save('observation',{id});
     if(this.state.config.compact&&pressure.known&&pressure.ratio>=this.state.config.compactPressure)return;
-    const urgent=['elevated','critical'].includes(window.level)||evidence.length>0||requested.length>0;
+    // A compaction that left the window between preparation and compaction pressure is not asked for
+    // again on that pressure alone each cooldown; capacity compaction and critical pressure still act.
+    const quietElevated=window.level==='elevated'&&last?.after?.level==='elevated'&&last.after.effectiveWindow===window.effectiveWindow;
+    const urgent=window.level==='critical'||window.level==='elevated'&&!quietElevated||evidence.length>0||requested.length>0;
     await this.review(id,{entered:previous?.id!==id,worth:urgent||semantic,spaced:!urgent&&semantic});
   }
   /** One review per cause. The same cause again is the same question: already answered,

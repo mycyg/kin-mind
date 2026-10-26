@@ -1,5 +1,5 @@
 import {frozenMemeMedia} from './meme-session.mjs';
-import {replyPresentation} from './reply-presentation.mjs';
+import {replyPresentation,spokenMode} from './reply-presentation.mjs';
 /** The durable delivery record of one phone reply group: which bubbles it has,
  * how each frozen bubble is cut into transport fragments, and what is known
  * about every fragment. This module is the only writer of
@@ -302,7 +302,7 @@ export class TransportManifests {
         continue;
       }
       const presentation=replyPresentation(bubble.presentation);
-      if(presentation.mode==='voice') {
+      if(spokenMode(presentation.mode,text)==='voice') {
         bubble.fragments=[{transport_id:transportId(bubble.bubble_id,0),index:0,start:0,end:text.length,kind:'speech',state:'unsent',receipt:null}];
         continue;
       }
@@ -315,7 +315,7 @@ export class TransportManifests {
         if(Buffer.byteLength(text,'utf8')>contract.file.maxBytes)Object.assign(bubble,{state:'undeliverable',reason:'file-exceeds-channel-limit'});
       }
     }
-    for(const bubble of manifest.bubbles)if(!bubble.file&&!bubble.meme&&bubble.presentation?.mode==='both'&&!started(bubble)&&open(bubble)) {
+    for(const bubble of manifest.bubbles)if(!bubble.file&&!bubble.meme&&spokenMode(bubble.presentation?.mode,bubble.text)==='both'&&!started(bubble)&&open(bubble)) {
       const index=bubble.fragments.length;
       bubble.fragments.push({transport_id:transportId(bubble.bubble_id,index),index,start:0,end:bubble.text.length,kind:'speech',state:'unsent',receipt:null});
     }

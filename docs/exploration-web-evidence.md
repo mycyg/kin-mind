@@ -11,6 +11,17 @@ each redirect before requesting the next destination. It does not change system
 DNS, proxy settings or browser permissions. Browser navigation retains its own
 address restrictions; enabling HTTP transport does not relax those restrictions.
 
+## Paid calls
+
+Search and the provider's page fetch are paid. Each paid request is counted in
+`mind_paid_calls` (scope, local day, service, purpose: calls and failures). A chat
+turn may make 8 and a purpose 120 a day; past either the tool returns
+`web-budget-exhausted` without a request. An exploration run has no turn budget,
+only its time budget and the daily one. A page host is fetched at most 4 times a
+turn or run. A request that times out may have been charged: it is reported
+`unconfirmed`, and the same request is not sent again in that turn. Results carry
+`content_is_untrusted: true`.
+
 ## Read contract
 
 `read_page(url, offset=0, limit=16000, evidence_id=None, expected_version=None)`

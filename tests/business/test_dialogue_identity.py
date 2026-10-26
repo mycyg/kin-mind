@@ -42,8 +42,9 @@ def assert_identity(items, events):
     actual = {item["id"]: item for item in items}
     assert set(actual) == {event["id"] for event in events}
     for event in events:
-        for field in ("speaker_person_id", "recipient_person_id", "conversation_key", "conversation_kind", "chat_id", "actor", "audience_person_ids"):
+        for field in ("speaker_person_id", "recipient_person_id", "conversation_kind", "actor", "audience_person_ids"):
             assert actual[event["id"]].get(field) == event[field], (event["id"], field)
+        assert "conversation_key" not in actual[event["id"]] and "chat_id" not in actual[event["id"]]
         assert actual[event["id"]]["role"] == ("user" if event["kind"] == "owner-message" else "assistant")
 
 
@@ -146,8 +147,9 @@ def test_revalidation_preserves_identity(setup):
     stored = SimpleNamespace(receipt={}, conflict={}, proposal={})
     request = _request(SimpleNamespace(mind=mind), {}, {"recent_dialogue": recent}, stored, [])
     for expected, shown in zip(events, request["recent_dialogue"]):
-        for field in ("speaker_person_id", "recipient_person_id", "conversation_key", "actor", "audience_person_ids"):
+        for field in ("speaker_person_id", "recipient_person_id", "actor", "audience_person_ids"):
             assert shown.get(field) == expected[field]
+        assert "conversation_key" not in shown and "chat_id" not in shown
 
 
 def test_model_source_projection_preserves_recipient_actor_and_audience():
@@ -155,4 +157,6 @@ def test_model_source_projection_preserves_recipient_actor_and_audience():
                 if key in {"speaker_person_id", "recipient_person_id", "conversation_key", "conversation_kind", "chat_id", "actor", "audience_person_ids"}}
     shown = for_model({"id": "src_" + "a" * 32, "text": "same words", "metadata": {**identity, "index_only": "private-index"}})
     assert "metadata" not in shown and "index_only" not in shown
-    assert all(shown.get(field) == value for field, value in identity.items())
+    routes = {"conversation_key", "chat_id"}
+    assert all(shown.get(field) == value for field, value in identity.items() if field not in routes)
+    assert not routes & set(shown)

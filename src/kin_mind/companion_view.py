@@ -57,9 +57,7 @@ class CompanionView:
                 'subject_ids':annotation.get('subject_ids',[]),
                 'occurred_at':metadata.get('original_occurred_at',row['occurred_at']),
                 'received_at':row['received_at'],
-                'basis':annotation.get('basis','unknown'),
-                'classification':annotation.get('classification'),
-                'sharing':annotation.get('sharing')})
+                'basis':annotation.get('basis','unknown')})
         return result
 
     def filter(self, value):

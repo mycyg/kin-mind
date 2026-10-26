@@ -7,8 +7,8 @@ export const XIAOGUANG='person:xiaoguang',YIYI='person:yiyi',FAMILY='group:famil
 export const conversationKey=(app,chat)=>'feishu:'+app+':'+chat;
 export const messageKey=(app,id)=>'inj_feishu_'+createHash('sha256').update(app+':'+id).digest('hex').slice(0,32);
 export function companionSeed() {return {schema:1,enabled:false,revision:1,people:{
-  [XIAOGUANG]:{name:'小光',aliases:['小光','Ica'],sharing:'ordinary-shared',binding:null,proactive:false},
-  [YIYI]:{name:'一一',address:'一一',aliases:['一一'],sharing:'pending',binding:null,proactive:false}},
+  [XIAOGUANG]:{name:'小光',aliases:['小光','Ica'],binding:null,proactive:false},
+  [YIYI]:{name:'一一',address:'一一',aliases:['一一'],binding:null,proactive:false}},
   groups:{[FAMILY]:{name:'家庭群',members:[XIAOGUANG,YIYI],binding:null,mention_only:false}},
   relationshipFacts:[]};}
 export function validateDirectory(d) {
@@ -16,7 +16,7 @@ export function validateDirectory(d) {
   if(!d.people||Object.keys(d.people).sort().join()!==[XIAOGUANG,YIYI].sort().join())throw Error("companion-people-required");
   const seen=new Set(),chats=new Set();
   for(const [id,p] of Object.entries(d.people??{})) {
-    if(![XIAOGUANG,YIYI].includes(id)||!p.name||!['pending','private','ordinary-shared'].includes(p.sharing))throw Error('companion-person-invalid');
+    if(![XIAOGUANG,YIYI].includes(id)||!p.name)throw Error('companion-person-invalid');
     if(!p.binding)continue;
     const b=p.binding,key=b.app_id+':'+b.open_id;
     if(!token(b.app_id,'cli_')||!token(b.open_id,'ou_')||!token(b.chat_id,'oc_')||!Number.isSafeInteger(b.revision)||b.revision<1||!b.confirmation_source_id||seen.has(key)||chats.has(b.app_id+':'+b.chat_id))throw Error('companion-binding-invalid');
@@ -55,7 +55,7 @@ export class CompanionDirectory {
     if(route.chat_id!==chat_id||p.binding.sender_tenant_key&&p.binding.sender_tenant_key!==sender_tenant_key)throw Error('companion-chat-mismatch');
     // Cross-organization senders need not share the app/event tenant.
     return {speaker_person_id:person,conversation_key:route.conversation_key,source_message_id:message_id,
-      app_id,sender_tenant_key,event_tenant_key,chat_type,mentions,reply_requested,route,sharing:p.sharing,...(chat_type==='group'?{audience_person_ids:d.groups[FAMILY].members}: {})};
+      app_id,sender_tenant_key,event_tenant_key,chat_type,mentions,reply_requested,route,...(chat_type==='group'?{audience_person_ids:d.groups[FAMILY].members}: {})};
   }
 }
 /** Sequential per window, concurrent across windows. A failed turn never poisons its queue. */

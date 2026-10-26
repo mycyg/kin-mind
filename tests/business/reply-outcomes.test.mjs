@@ -19,3 +19,13 @@ test('an unknown fragment is looked up by its existing group before context or n
   const manifests={status:()=>({groups:{g}}),reconcileGroup:async id=>{calls.push(id);g.bubbles[0].state='accepted';g.bubbles[0].fragments[0].state='accepted';}};
   assert.deepEqual(await readReplyOutcomeFacts({},manifests,{now:at}),[]);assert.deepEqual(calls,['g']);
 });
+test('an inbound turn hears only unsettled delivered groups, and unknown receipts are looked up for a day at a bounded rate',async()=>{
+  const accepted={...group('accepted'),group_id:'done',state:'accepted'},partial={...group('accepted'),group_id:'partial',state:'pending',bubbles:[{state:'accepted',fragments:[]},{state:'unsent',fragments:[]}]};
+  assert.deepEqual(replyOutcomeFacts({},{done:accepted,partial},{now:at,includeAccepted:true}).map(f=>f.groupId),['partial']);
+  const fresh=group('unknown'),stale={...group('unknown'),group_id:'stale',updated_at:at-86400001};
+  for(const g of [fresh,stale])g.bubbles[0].fragments=[{transport_id:'synthetic-'+g.group_id,state:'unknown'}];
+  const calls=[],manifests={status:()=>({groups:{g:fresh,stale}}),reconcileGroup:async id=>{calls.push(id);}};
+  await readReplyOutcomeFacts({},manifests,{now:at});await readReplyOutcomeFacts({},manifests,{now:at+60000});
+  assert.deepEqual(calls,['g'],'only the recent group, and not again within the interval');
+  await readReplyOutcomeFacts({},manifests,{now:at+5*60000});assert.deepEqual(calls,['g','g']);
+});

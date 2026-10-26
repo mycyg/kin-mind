@@ -361,14 +361,15 @@ def _stub_site():
 
 
 def test_a_failed_citation_keeps_what_the_run_read_and_its_draft(tmp_path, monkeypatch):
-    """K2-08: one unread citation fails the run, but the page it did read and its draft stay in
-    the checkpoint the next attempt starts from."""
+    """K2-08: a run whose only citation was never read fails, but the page it did read and its
+    draft stay in the checkpoint the next attempt starts from."""
     monkeypatch.setenv("KIN_TEST_DS_KEY", "sk-synthetic")
     server, base = _stub_site()
     driver = tmp_path / "codex-driver"
     body = DRIVER.format(python=sys.executable).replace(
         "'sources': [{'url': page['locator'], 'title': 'Probe Page'}]",
-        "'sources': [{'url': page['locator'], 'title': 'Probe Page'}, {'url': 'https://unread.example/x', 'title': 'Never read'}]")
+        "'sources': [{'url': 'https://unread.example/x', 'title': 'Never read'}]").replace(
+        "'evidence_map': {'1': [page['evidence_id']]}", "'evidence_map': None")
     assert "unread.example" in body
     driver.write_text(body)
     driver.chmod(0o700)
@@ -470,8 +471,9 @@ emit({{'type': 'turn.completed', 'usage': {{'input_tokens': 50, 'output_tokens':
 
 def test_a_page_read_encoded_is_cited_in_unicode_and_a_refused_read_is_counted(tmp_path, monkeypatch):
     """ws6-cite through the host's own reader: a page read by its %-encoded address and cited in
-    Unicode with a #fragment completes the run; citing the page whose read got a 403 fails it, and
-    the receipt says why in classes and counts that keep through the settled run's word removal."""
+    Unicode with a #fragment completes the run; a citation of the page whose read got a 403, and a
+    cut evidence id, are dropped while the read page still backs the finding, and the receipt says
+    why in classes and counts that keep through the settled run's word removal."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -513,7 +515,8 @@ def test_a_page_read_encoded_is_cited_in_unicode_and_a_refused_read_is_counted(t
     source = cited["result"]["sources"][0]
     assert source["url"] == base + "/wiki/中文#section" and source["receipt"]["locator"] == encoded
     assert "citation_rejections" not in cited
-    assert refused["state"] == "failed" and refused["reason"] == "unbacked-citation"
+    assert refused["state"] == "complete", refused.get("reason")
+    assert [s["url"] for s in refused["result"]["sources"]] == [base + "/wiki/中文"] and refused["result"]["findings"] == ["The page says teal."]
     counts = refused["citation_rejections"]
     assert counts == {"sources": {"failed-read": 1}, "evidence_map": {"id-shape": 1}}
     words = json.dumps(counts, ensure_ascii=False, separators=(",", ":"))
@@ -873,3 +876,19 @@ def test_native_start_callback_precedes_result_and_terminal_receipt_does_not_rep
     report=run_codex(None,TOPIC,tmp_path/"native-live",native_exchange=exchange,cli_version="native-main",
         on_started=lambda:started.append("start"),**codex_kwargs())
     assert report["state"] == "failed" and started == ["start"]
+
+
+def test_an_unbacked_citation_is_dropped_and_an_unbacked_finding_becomes_a_question():
+    """Feature 7: one bad citation no longer voids a run. What no receipt backs goes; a finding
+    whose mapped evidence all went is kept as an open question; nothing backed left still fails."""
+    from kin_mind.exploration import Findings
+    from kin_mind.source_ledger import drop_unbacked
+    found = Findings.model_validate({"summary": "Synthetic", "findings": ["backed", "unbacked", "unmapped"],
+        "sources": [{"url": "https://read.example/a", "title": "A"}, {"url": "https://unread.example/b", "title": "B"}],
+        "open_questions": [], "evidence_map": {"1": ["web_a", "web_cut"], "2": ["web_cut"]}})
+    fixed = drop_unbacked(found, ["https://unread.example/b"], ["web_cut"])
+    assert [s.url for s in fixed.sources] == ["https://read.example/a"]
+    assert fixed.findings == ["backed", "unmapped"] and fixed.evidence_map == {"1": ["web_a"]}
+    assert fixed.open_questions == ["未能核实：unbacked"]
+    lone = Findings.model_validate({**found.model_dump(), "sources": [{"url": "https://unread.example/b", "title": "B"}], "evidence_map": None})
+    assert drop_unbacked(lone, ["https://unread.example/b"], []) is None

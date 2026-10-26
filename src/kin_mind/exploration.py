@@ -152,7 +152,6 @@ class AssistanceHint(Model):
 
 
 class Findings(Model):
-    sharing_classification: Literal['ordinary','private','intimate','health','financial','uncertain'] = Field(default='uncertain', description='普通日常可共享；私密、情色亲密、健康财务及不能判断的材料受保护。只判断本次结果，不改变其输入来源的保护。')
     topic_tags: list[str] = Field(default_factory=list, max_length=8)
     perspective: Literal['external_commentary','reported_facts','kin_reflection','mixed'] = 'mixed'
     summary: str = Field(min_length=1)
@@ -160,6 +159,9 @@ class Findings(Model):
     sources: list[Citation]
     open_questions: list[str]
     suggested_share: str | None = None
+    # Kin's own word on the run and what it sparked (play.after_activity); free strings never fail a result.
+    enjoyment: str | None = Field(default=None, description="这一趟你自己觉得好玩写 fun，没意思写 meh，说不上来就 null。")
+    new_interests: list[str] = Field(default_factory=list, description="这一趟里冒出来、以后还想再碰的新兴趣，几个字的短词；没有就留空。")
     assistance_needed: AssistanceHint | None = None
     # Backward-compatible: claims keyed by their 1-based finding index, mapped to
     # evidence ids from the run's source ledger (read receipts or memory:// ids).
@@ -268,7 +270,9 @@ class Explorations:
             settled = {row["id"]: row["state"] for row in conn.execute(
                 "SELECT id,state FROM mind_explorations WHERE scope=? AND state!='running'", (self.mind.scope.key(),))}
         try:
-            return workdirs.sweep(directory, settled)
+            swept = workdirs.sweep(directory, settled)
+            workdirs.archive(directory, settled)
+            return swept
         except OSError:
             return []
 
@@ -341,6 +345,9 @@ class Explorations:
             return {"state": "waiting", "reason": "exploration-intent-changed"}
         # The selected wish is the reviewed brief; an external wake cannot replace it.
         budget_seconds = min(1200, max(1, int(budget_seconds)))
+        if target == "play":
+            from .play import budget
+            budget_seconds = budget(self.mind, budget_seconds)
         at = self.mind.clock()
         eid = "explore_" + digest([self.mind.scope.key(), desire["id"], desire["revision"]])[:32]
         data = {"desire_id": desire["id"], "selected_brief": desire["content"], "exploration_target": target,
@@ -424,7 +431,7 @@ class Explorations:
             shown.extend(sources_named(options.get("continuation")))
             reviewed_brief = execution_brief(self.mind, question=desire["content"], evidence_ids=data["evidence_ids"], shown=shown, since=mark)
             output = runner(executable, {**reviewed_brief, "topic": desire["topic"],
-                "source_ids": data["evidence_ids"]}, Path(directory)/eid,
+                "source_ids": data["evidence_ids"], **({"mode": "play"} if target == "play" else {})}, Path(directory)/eid,
                 budget_seconds=budget_seconds, canceled=self._stop_when(canceled, desire["id"]), model=model, **options)
             output = normalize_execution_report(output)
             data.update(output)
@@ -515,10 +522,9 @@ class Explorations:
                 source = self.engine.receive(report())
         from .companions import Companions
         companion_memory=Companions(self.engine,self.mind.scope)
-        classification=(data.get("result") or {}).get("sharing_classification","uncertain")
         for sid in [source["id"],*observation_ids]:
             companion_memory.annotate(source_id=sid,speaker_person_id="agent:kin",conversation_key=None,
-                classification=classification,sharing="ordinary-shared",recipient_person_id=desire.get("recipient_person_id", "person:xiaoguang"),basis="internal_thought" if sid==source["id"] else "observed",
+                recipient_person_id=desire.get("recipient_person_id", "person:xiaoguang"),basis="internal_thought" if sid==source["id"] else "observed",
                 participants=[{"person_id":"agent:kin","role":"explorer"}],command_id="exploration-actor:"+sid,evidence_id=eid)
         data["source_id"] = source["id"]
         data["observation_ids"] = observation_ids
@@ -547,8 +553,11 @@ class Explorations:
                     failures = (active.get("exploration_retry") or {}).get("failures", 0) + 1
                     code = next((value for value in (data.get("inputs_withheld"), data.get("waiting_reason"), data.get("error"), data.get("reason"))
                                  if isinstance(value, str) and FAILURE_CODE.fullmatch(value)), None)
+                    # With energy high the pause before that retry is halved (2026-10-26).
+                    from .energy import view as energy_view
+                    pause = EXPLORATION_RETRY_SECONDS / (2 if energy_view(conn, self.mind.scope.key(), self.mind.clock()).get("tier") == "high" else 1)
                     retry = {"failures": failures, "state": state, **({"code": code} if code else {}), "at": self.mind.clock(),
-                             "not_before": (timestamp(self.mind.clock()) + timedelta(seconds=EXPLORATION_RETRY_SECONDS)).isoformat()}
+                             "not_before": (timestamp(self.mind.clock()) + timedelta(seconds=pause)).isoformat()}
                     action = "resume" if failures <= EXPLORATION_RETRIES else "abandon"
                     reason = ("Exploration ended without a result; tried once more at the next idle window" if action == "resume"
                               else "Exploration ended without a result again after its retry: " + state + (": " + code if code else ""))
@@ -570,6 +579,9 @@ class Explorations:
                 self.mind._save(conn, current)
                 self.mind._history(conn, event_id, current, "exploration-result", data)
             conn.execute("UPDATE mind_explorations SET state=?,data=? WHERE id=?", (state, dumps(data), eid))
+            if state == "complete" and data.get("result"):
+                from .play import after_activity
+                after_activity(conn, self.mind, desire["topic"], data["result"], [source["id"]])
             memory = MemoryContinuity.__new__(MemoryContinuity)
             memory.mind, memory.engine, memory.scope = self.mind, self.engine, self.mind.scope
             if memory.settings(conn).get("sharing") or memory.settings(conn).get("graph"):

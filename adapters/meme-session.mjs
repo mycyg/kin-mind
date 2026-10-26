@@ -11,7 +11,10 @@ export function verifiedMemeVision(context,proofs=[]) {
     proofs.some(p=>p?.state==='verified'&&p.mode==='pixels'&&p.model===context.model&&p.provider===context.provider&&p.path===memeVisionPath(context)&&p.lane===context.lane&&typeof p.nativeTurnId==='string'&&p.nativeTurnId&&p.fixtureSha256?.match(/^[a-f0-9]{64}$/)));
 }
 export class MemeSession {
-  constructor({library,proofs=()=>[],clock=()=>Date.now()}={}){if(!(library instanceof MemeLibrary))throw Error('meme-library-required');this.library=library;this.proofs=proofs;this.clock=clock;this.inputs=new Map();this.views=new Map();}
+  constructor({library,proofs=()=>[],clock=()=>Date.now(),runtime=null}={}){if(!(library instanceof MemeLibrary))throw Error('meme-library-required');this.library=library;this.proofs=proofs;this.clock=clock;this.runtime=runtime;this.inputs=new Map();this.views=new Map();}
+  // A pixel proof holds only on the runtime it was probed on; after an upgrade it is stale until the real probe runs again.
+  current(){return this.proofs().filter(p=>(p?.runtime??null)===this.runtime);}
+  unverified(){return fail(this.proofs().length&&!this.current().length?'vision-proof-stale':'vision-unverified');}
   prune(){for(const m of [this.inputs,this.views]){for(const [id,v] of m)if(v.expires<this.clock())m.delete(id);while(m.size>32)m.delete(m.keys().next().value);}
     let bytes=0;for(const entry of [...this.inputs.values()].reverse())bytes+=entry.images.reduce((n,i)=>n+i.data.length,0);
     while(bytes>32*1024*1024&&this.inputs.size){const id=this.inputs.keys().next().value;bytes-=this.inputs.get(id).images.reduce((n,i)=>n+i.data.length,0);this.inputs.delete(id);}}
@@ -31,18 +34,18 @@ export class MemeSession {
     // Explicit intent is a declared conversation action, not inferred from OCR. The
     // host limits the source to the authenticated current owner turn.
     const explicit=args.basis==='explicit';
-    if(!explicit&&!verifiedMemeVision({...context,visionPath:'owner-image-input/v1'},this.proofs()))return fail('vision-unverified');
+    if(!explicit&&!verifiedMemeVision({...context,visionPath:'owner-image-input/v1'},this.current()))return this.unverified();
     return this.library.collect({data:image.data,source:image.source,metadata:args.metadata??{},group:args.group??'collected',intent:explicit?{kind:'explicit'}:{kind:'interesting',visual:true,isMeme:args.is_meme===true}});
   }
   inspect(ids,context) {
-    this.prune();if(!verifiedMemeVision(context,this.proofs()))return fail('vision-unverified');
+    this.prune();if(!verifiedMemeVision(context,this.current()))return this.unverified();
     if(!Array.isArray(ids)||!ids.length||ids.length>MEME_LIMITS.candidates||new Set(ids).size!==ids.length)return fail('invalid-candidates');
     const images=ids.map(id=>this.library.readImage(id));
     const token='view-'+randomUUID();this.views.set(token,{identity:identity(context),images:images.map(i=>({id:i.item.id,hash:i.item.hash})),expires:this.clock()+10*60*1000});
     return {state:'pixels',inspection_id:token,images:images.map(({item,data})=>({id:item.id,sha256:item.hash,mimeType:item.mime,data:data.toString('base64')}))};
   }
   resolve(reference,context) {
-    this.prune();if(!verifiedMemeVision(context,this.proofs()))return null;
+    this.prune();if(!verifiedMemeVision(context,this.current()))return null;
     const view=this.views.get(reference?.inspection_id);if(!view||view.identity!==identity(context))return null;
     const found=view.images.find(i=>i.id===reference.meme_id);if(!found)return null;
     const {item,data}=this.library.readImage(found.id);if(item.hash!==found.hash)return null;

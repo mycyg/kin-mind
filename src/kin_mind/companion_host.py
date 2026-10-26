@@ -21,14 +21,6 @@ def dispatch_companion(engine, config, action, request):
         if operation.startswith('companion-'):raise ValueError('Nested companion dispatch unavailable')
         if operation=='private-note-save':body.update(person_id=person,conversation_key=conversation)
         if operation in {'sharing-preflight','share-references','share-history'}:body['recipient']=person
-        if operation=='sharing-preflight':
-            from .state import Mind
-            from .sharing import ShareLedger
-            ledger=ShareLedger(Mind(engine,scope))
-            with engine.db.connect() as conn:
-                refs=[r for e in body.get('entries',[]) for r in e.get('references',[])] or body.get('references',[])
-                for sid in ledger.reference_sources(conn,refs):
-                    if not memory.visible(conn,sid,person):raise Missing('Sharing source protected')
         for identifier in named_in(body):
             view.require(identifier)
         scoped_config={**config,'session_id':request.get('session_id') or conversation}
@@ -51,13 +43,16 @@ def dispatch_companion(engine, config, action, request):
                     origin=(annotation or {}).get('conversation_key') or meta.get('conversation_key')
                     if not request.get('shared_session') and origin!=conversation and not (person==XIAOGUANG and not origin and meta.get('recipient_person_id',XIAOGUANG)==XIAOGUANG):continue
                     if sid and not memory.visible(conn,sid,person):continue
-                    item.update(speaker_person_id=(annotation or {}).get('speaker_person_id') or meta.get('speaker_person_id') or (XIAOGUANG if item.get('role')=='user' else 'agent:kin'),conversation_key=origin,conversation_kind=meta.get('conversation_kind','p2p' if person!=FAMILY else 'group'),chat_id=meta.get('chat_id'))
+                    item.update(speaker_person_id=(annotation or {}).get('speaker_person_id') or meta.get('speaker_person_id') or (XIAOGUANG if item.get('role')=='user' else 'agent:kin'),conversation_kind=meta.get('conversation_kind','p2p' if person!=FAMILY else 'group'))
                     own.append(item)
             result['items']=own
             ids={i['id'] for i in own};result['cursors']['public']=[i for i in result['cursors'].get('public',[]) if i['id'] in ids]
             result['sourceRevisions']={k:v for k,v in result.get('sourceRevisions',{}).items() if k in ids}
         if operation in {'read','state-overview'} and isinstance(result,dict):
             result=view.filter(result)
+            if person!=XIAOGUANG:
+                from .drives import without_intimacy
+                result=without_intimacy(result)
             result['relationship']=memory.relationship(person)
             return result
         from .host import MODEL_FACING
@@ -101,7 +96,7 @@ def dispatch_companion(engine, config, action, request):
                       'conversation_kind':identity.get('chat_type','p2p'),'chat_id':identity['route']['chat_id'],'audience_person_ids':identity.get('audience_person_ids',[]),
                       'channel':'feishu','original_occurred_at':at,'time_basis':'platform' if at else 'receipt-only'}))
         memory.annotate(source_id=source['id'],speaker_person_id=speaker,conversation_key=identity['conversation_key'],
-            classification='uncertain',recipient_person_id=FAMILY if identity['route'].get('person_id',speaker)==FAMILY else None,sharing=identity['sharing'],command_id='input:'+request['id'],evidence_id=identity['source_message_id'])
+            recipient_person_id=FAMILY if identity['route'].get('person_id',speaker)==FAMILY else None,command_id='input:'+request['id'],evidence_id=identity['source_message_id'])
         # Existing runtime ledger / event graph, with a human actor distinct from event participants.
         from .state import Mind
         from .memory import MemoryContinuity
@@ -116,12 +111,6 @@ def dispatch_companion(engine, config, action, request):
             with companion_scope(CompanionView(engine,scope,speaker,identity['conversation_key'])):
                 Appraisals(mind).enqueue([source['id']],config['agent_version'])
         return {'source_id':source['id']}
-    if action=='companion-classify':
-        with engine.db.connect() as conn: a=memory.annotation(conn,request['source_id'])
-        if not a or a['speaker_person_id']!=request['person_id']:raise Conflict('Source speaker mismatch')
-        return memory.annotate(source_id=a['source_id'],speaker_person_id=a['speaker_person_id'],conversation_key=a['conversation_key'],
-            classification=request['classification'],sharing=a['sharing'],command_id=request['command_id'],evidence_id=a['evidence_id'],
-            expected_revision=a['revision'],subject_ids=request.get('subject_ids',[]),participants=request.get('participants',[]),basis=a['basis'],recipient_person_id=a.get('recipient_person_id'))
     if action=='companion-context':
         person=request['person_id'];conversation=request['conversation_key'];ids=[]
         if person not in {XIAOGUANG,YIYI,FAMILY}:raise ValueError('Unknown person')
@@ -170,7 +159,7 @@ def dispatch_companion(engine, config, action, request):
                 view=memory.source_view(event['source_id'],person) if event.get('source_id') else None
             except Missing:view=None
             quotes.append({'input_id':reference.get('input_id'),'id':target,**({'source_id':view['source_id'],'speaker_person_id':view['speaker_person_id'],
-                     'conversation_key':view['conversation_key'],'text_excerpt':view['text'][:2000],
+                     'text_excerpt':view['text'][:2000],
                      'occurred_at':view['occurred_at']} if view else {'state':'unavailable'})})
         from eventmem.core.models import now
         tasks=[]
@@ -194,14 +183,14 @@ def dispatch_companion(engine, config, action, request):
                 status=mind.read()
                 agenda={'wishes':status.get('desires',[]),'plans':AutonomousPlans(mind).read(limit=20)['plans'],
                         'interaction_timing':status.get('interaction_timing',{})}
-        return {**agenda,**({'quoted_messages':quotes} if quotes else {}),'person_id':person,'conversation_key':conversation,'sources':views,'relationship':memory.relationship(person),
+        return {**agenda,**({'quoted_messages':quotes} if quotes else {}),'person_id':person,'sources':views,'relationship':memory.relationship(person),
                 'contact_preferences':__import__('kin_mind.companions',fromlist=['contact_preference']).contact_preference(memory,person) if person!=FAMILY else {},'preferences':preferences,'tasks':tasks,'kin_interests':kin_interests(engine,scope,memory,person),'sharing_candidates':select_sharing_topics(sharing_candidates(engine,scope,memory,person),preferences)}
     if action=='companion-output':
         identity=request['identity']
         source=engine.receive(SourceInput(namespace='kin-companion-output',key=request['id'],scope=scope,session=identity['conversation_key'],
             text=request['text'],occurred_at=request['at'],authority='model',extract=False,metadata={'role':'assistant','speaker_person_id':'agent:kin','conversation_key':identity['conversation_key']}),derived_from=list(dict.fromkeys([sid for sid in [request.get('source_input_id'),*request.get('referenced_source_ids',[])] if sid])))
-        memory.annotate(source_id=source['id'],speaker_person_id='agent:kin',conversation_key=identity['conversation_key'],classification='ordinary',
-            sharing=identity['sharing'],recipient_person_id=identity['speaker_person_id'],command_id='output:'+request['id'],evidence_id=request['receipt']['messageId'])
+        memory.annotate(source_id=source['id'],speaker_person_id='agent:kin',conversation_key=identity['conversation_key'],
+            recipient_person_id=identity['speaker_person_id'],command_id='output:'+request['id'],evidence_id=request['receipt']['messageId'])
         return {'source_id':source['id']}
     if action=='companion-share-prepare':
         from .state import Mind
@@ -213,8 +202,6 @@ def dispatch_companion(engine, config, action, request):
                 if ledger.coverage(conn,ref.unit_id,recipient=person)['state'] in {'shared','unconfirmed'}:raise Conflict('Already shared or awaiting receipt')
                 held=conn.execute("SELECT draft_id,state FROM mind_share_reservations WHERE scope=? AND recipient=? AND unit_id=? AND version=?",(scope.key(),person,ref.unit_id,ref.version)).fetchone()
                 if held and held['draft_id']!=request['id'] and held['state']!='canceled':raise Conflict('Original share still reserved')
-                for sid in ledger.reference_sources(conn,[raw]):
-                    if not memory.visible(conn,sid,person):raise Missing('Sharing source protected')
         return ledger.prepare({'draft_id':request['id'],'recipient':person,'references':refs})
     if action=='companion-history-migrate':return memory.migrate_legacy(**request)
     if action=='companion-history-preview':return memory.history_preview(request['source_ids'])

@@ -47,6 +47,45 @@ def test_rejected_maintenance_is_not_completed(setup, monkeypatch):
     assert result['state']!='complete'
     assert jobs.status(job['id'])['state']!='complete'
 
+def test_a_review_refused_twice_for_one_snapshot_settles_on_a_fixed_fallback_alone_or_merged(setup, monkeypatch):
+    """Item 14: alone or merged into a batch, a session review the host refuses is retried, and at the
+    limit for one snapshot settles on keep (defer for an unverified compaction) instead of being paid for again."""
+    import json
+    from kin_mind import appraisal
+    from kin_mind.session_advice import SessionAdvice, AdviceRejected
+    mind, source, _ = setup
+    real = appraisal.advice_record
+    def reject(proposal, *args, **kwargs):
+        if proposal.reason.startswith('host-fallback'):
+            return real(proposal, *args, **kwargs)
+        raise AdviceRejected('finding-source-mismatch', 'Session finding needs an exact owner source')
+    monkeypatch.setattr(appraisal, 'advice_record', reject)
+    context = {'id': 'snapshot', 'binding': {'generation': 1}, 'evidence': [], 'recent': []}
+    for merged, proposed, fallback in ((False, 'keep', 'keep'), (True, 'compact', 'defer')):
+        jobs = appraisal.Appraisals(mind, session_context=context)
+        review = jobs.enqueue([source('pressure-%s' % merged)], 'synthetic-v1', origin='reflection', stimulus='session-maintenance')
+        with mind.engine.db.connect(write=True) as conn:
+            row = conn.execute("SELECT data FROM mind_appraisals WHERE id=?", (review['id'],)).fetchone()
+            conn.execute("UPDATE mind_appraisals SET data=? WHERE id=?", (json.dumps({**json.loads(row[0]), 'session_snapshot_id': 'snapshot'}), review['id']))
+        if merged:
+            jobs.enqueue([source('quiet-%s' % merged)], 'synthetic-v1', origin='reflection', stimulus='idle-review')
+        reviewer = FakeReviewer(Appraisal(session_advice=SessionAdvice(action=proposed, reason='Current state')))
+        def run():
+            with mind.engine.db.connect(write=True) as conn:
+                conn.execute("UPDATE mind_appraisals SET available=0 WHERE state='pending'")
+            return jobs.run_one(reviewer)
+        assert run()['state'] == 'pending'
+        assert jobs.status(review['id'])['state'] != 'complete'
+        if merged:
+            with mind.engine.db.connect() as conn:
+                assert conn.execute("SELECT COUNT(*) FROM mind_appraisals WHERE json_extract(data,'$.batch_ids') IS NOT NULL "
+                                    "AND json_extract(data,'$.stimulus')='internal-batch'").fetchone()[0] == 1, 'the review was merged'
+        assert run()['state'] == 'complete', merged
+        assert jobs.status(review['id'])['state'] == 'complete'
+        with mind.engine.db.connect() as conn:
+            advice = json.loads(conn.execute("SELECT data FROM mind_session_advice").fetchone()[0])
+        assert advice['decision']['action'] == fallback and advice['decision']['reason'] == 'host-fallback:finding-source-mismatch'
+
 from test_kin_mind import setup, FakeReviewer
 
 def test_review_accepts_the_user_source_it_displayed():

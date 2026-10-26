@@ -325,6 +325,11 @@ class ActionEvents:
                     if verified_decision(d.get("decision_receipt", {}))
                     and (not semantic or self.mind.decision_current(conn, d.get("decision_receipt", {})))
                 ]
+        # Play waits for the next day once today's explorations are used up (play.py).
+        if any(d.get("exploration_target") == "play" for d in choices):
+            from .play import play_left
+            if not play_left(self.mind):
+                choices = [d for d in choices if d.get("exploration_target") != "play"]
         # A wish whose run ended without a result waits out a pause before its one retry (exploration.py).
         now = timestamp(self.mind.clock())
         pause = lambda d: (d.get("exploration_retry") or {}).get("not_before")

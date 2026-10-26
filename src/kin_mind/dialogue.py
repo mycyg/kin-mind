@@ -14,8 +14,8 @@ from eventmem.core.read_policy import HOST_PREFIXES, envelope_prefixes, host_env
 
 TIMEZONE = "Asia/Singapore"
 RECENT_EXCHANGES = 4
-DIALOGUE_IDENTITY_FIELDS = ("speaker_person_id", "recipient_person_id", "conversation_key",
-                            "conversation_kind", "chat_id", "actor", "audience_person_ids")
+# What a model sees of a turn's identity. Platform routes (conversation_key, chat_id) stay with the host.
+DIALOGUE_IDENTITY_FIELDS = ("speaker_person_id", "recipient_person_id", "conversation_kind", "actor", "audience_person_ids")
 STATE_TIME_GUIDANCE = "结合当前时间、原消息/记录时间、经过时长和后续更新判断活动状态。过去说正在做的事，不等于现在仍在做；也不因时间过去就断言已经结束。用户新明确陈述优先。区分已确认事实与此刻推测；缺少更新时可保持未知，用自然、带余地的话回应，不必每句追问确认。推测不冒充用户确认的事实，保留其推断身份，不能成为后续确认的来源。历史日期按本轮时区理解。"
 
 

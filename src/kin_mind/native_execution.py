@@ -10,11 +10,58 @@ import sys
 from contextlib import AsyncExitStack
 
 
-def native_exploration_exchange(request, servers, on_started=None):
-    return asyncio.run(_exchange(request, servers, on_started))
+# A safety ceiling for one exploration, not a squeeze: about 1.3 times the largest successful run so
+# far (p90 6.1M, max 6.5M tokens, cached input included). Past it, tools answer that the budget is
+# spent, so the run finishes with what it has instead of failing.
+TOKEN_BUDGET = 8_000_000
+BUDGET_SPENT = "本次探索的 token 预算已用完：不再调用工具，用已有来源完成最终结果；没有来源支撑的部分写成待查问题。"
 
 
-async def _exchange(request, servers, on_started=None):
+def usage_meter(file):
+    """Tokens the gateway reports for exploration requests from now on, read from its usage log
+    (one exploration runs at a time). None when there is no log to read."""
+    try:
+        seen = [0, file.stat().st_size]
+    except OSError:
+        return None
+
+    def spent():
+        try:
+            with open(file, "rb") as log:
+                log.seek(seen[1])
+                chunk = log.read()
+        except OSError:
+            return seen[0]
+        end = chunk.rfind(b"\n") + 1
+        for line in chunk[:end].splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("purpose") == "native-exploration":
+                total = (row.get("usage") or {}).get("total_tokens")
+                seen[0] += total if isinstance(total, int) else 0
+        seen[1] += end
+        return seen[0]
+    return spent
+
+
+def native_exploration_exchange(request, servers, on_started=None, spent=None, budget=TOKEN_BUDGET):
+    return asyncio.run(_exchange(request, servers, on_started, lambda: bool(spent and budget and spent() >= budget)))
+
+
+async def _tool_result(call, clients, allowed, over_budget):
+    if over_budget():
+        return {"isError": True, "content": [{"type": "text", "text": BUDGET_SPENT}]}
+    try:
+        if (call.get("server"), call.get("name")) not in allowed:
+            raise ValueError("execution-tool-not-advertised")
+        return (await clients[call["server"]].call_tool(call["name"], call.get("arguments") or {})).model_dump(mode="json")
+    except Exception as error:
+        return {"isError": True, "content": [{"type": "text", "text": type(error).__name__}]}
+
+
+async def _exchange(request, servers, on_started=None, over_budget=lambda: False):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     from . import worker_groups
@@ -53,12 +100,7 @@ async def _exchange(request, servers, on_started=None):
                     if on_started:
                         on_started()
             elif call:
-                try:
-                    if (call.get("server"), call.get("name")) not in allowed:
-                        raise ValueError("execution-tool-not-advertised")
-                    result = (await clients[call["server"]].call_tool(call["name"], call.get("arguments") or {})).model_dump(mode="json")
-                except Exception as error:
-                    result = {"isError": True, "content": [{"type": "text", "text": type(error).__name__}]}
+                result = await _tool_result(call, clients, allowed, over_budget)
                 print(json.dumps({"native_tool_result": {"id": call["id"], "result": result}}, ensure_ascii=False), flush=True)
             elif frame.get("id") == request["id"]:
                 return frame

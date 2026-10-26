@@ -225,4 +225,8 @@ def accept_result(mind, config, request, provider=None):
     with mind.engine.db.connect(write=True) as conn:
         ActionEvents(mind).emit(conn, "creation-result", run_id,
             {"evidence_ids": [outcome.get("source_id") or artifact_source], "agent_version": config["agent_version"], "plan_id": plan["id"], "run_id": run_id})
+        if complete:
+            # The interests the plan was about were spent time on (play.py).
+            from .play import after_activity
+            after_activity(conn, mind, plan["goal"])
     return settled
