@@ -2,7 +2,7 @@
 
 ## 0.1.105
 
-- Apply the owner-approved factual-correction contract to live understanding, concern content and topics, and unfinished wishes in the same assessment.
+- Apply the owner-approved factual-correction contract to live understanding, concern content and topics, and unfinished wishes in the same assessment. Name the existing concern and wish `action` fields explicitly.
 - Cover the effective assessment request, durable state, foreground and background projections, and the next contact candidate with a synthetic correction regression.
 
 ## 0.1.104

@@ -27,7 +27,8 @@ def assert_correction_contract(system):
     # The instructions must reach the actual request, including the operational-only lane.
     assert "事实更正必须优先于先前的推测" in system
     assert "避免只做 `ease` 却保留错误前提" in system
-    assert "wish_updates.abandon" in system
+    assert '在 `wish_updates` 中使用 `action: "abandon"`' in system
+    assert "将 `action` 标记为 `resolve`" in system
     assert "在同一轮中需要将相关状态一起修正" in system
 
 
@@ -37,7 +38,7 @@ def test_both_assessment_providers_receive_the_correction_contract(provider_clas
     for stimulus in ("interaction-batch", "idle-review"):
         assert_correction_contract(provider._system({"stimulus": stimulus, "operational_only": True}, None))
     # A history-only pass cannot change current inner state.
-    assert "wish_updates.abandon" not in provider._system({"stimulus": "memory-enrichment"}, None)
+    assert '在 `wish_updates` 中使用 `action: "abandon"`' not in provider._system({"stimulus": "memory-enrichment"}, None)
 
 
 @pytest.mark.parametrize("transition", ["update", "resolve"])
