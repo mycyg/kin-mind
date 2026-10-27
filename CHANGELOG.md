@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.105
+
+- Apply the owner-approved factual-correction contract to live understanding, concern content and topics, and unfinished wishes in the same assessment.
+- Cover the effective assessment request, durable state, foreground and background projections, and the next contact candidate with a synthetic correction regression.
+
 ## 0.1.104
 
 - Kin's own creations start while 小光 is chatting instead of being skipped; a creation held back before it starts is retried up to three times without using the day's allowance.
