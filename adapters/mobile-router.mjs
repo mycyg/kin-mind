@@ -2044,6 +2044,13 @@ export class MobileRouter {
       }
     return {delivered:records.some(r=>(r.delivered??0)>0),unknown:records.some(r=>r.uncertainDeliveries?.length)};
   }
+  /** Inputs in one known failed native turn share one operational notice, not an answer.
+   * A later successful turn settles them only through answeredInputIds or replyHandoff. */
+  nativeFailureInputs(record) {
+    if(!record?.nativeFailure||!record.turnStartedAt)return [record];
+    return Object.values(this.state.inputs).filter(other=>other.nativeFailure&&other.turnStartedAt===record.turnStartedAt&&
+      other.executionEpoch===record.executionEpoch&&other.submit?.sessionId===record.submit?.sessionId);
+  }
   settleReplyHandoffs() {
     const changed=[];let moved=true;
     while(moved) {
@@ -2567,6 +2574,13 @@ export class MobileRouter {
           }
           continue;
         }
+        const failureInputs=this.nativeFailureInputs(record);
+        const reported=failureInputs.find(other=>other!==record&&other.ownerNotice?.state==='accepted');
+        if(!record.ownerNotice&&reported) {
+          record.ownerNotice={...reported.ownerNotice};record.settledAt??=reported.settledAt??now;changed=true;
+        }
+        // A still-pending notice owns the failed turn too; retry or reconcile that same id.
+        if(!record.ownerNotice&&failureInputs.some(other=>other!==record&&other.ownerNotice&&!answered(other)&&!other.canceledBy))continue;
         const summary=inputSummary(record),notice=record.ownerNotice;
         if(['answered','superseded','canceled-by-owner','failed-notified'].includes(summary))continue;
         // The successor owns the same unfinished chat obligation. Its own failure
@@ -2609,7 +2623,8 @@ export class MobileRouter {
           if(!inflight&&reconcileInput&&(!reconciliation||reconciliation.state==='unknown'&&now-(reconciliation.at??0)>=stuckMs))list.push({kind:'reconcile',id:record.id});
           if(reconciliation)verdict='unknown';
         } else if(record.state==='accepted') {
-          const evidence=this.replyHandoffEvidence(record);
+          const facts=failureInputs.map(input=>this.replyHandoffEvidence(input));
+          const evidence={unknown:facts.some(f=>f.unknown),delivered:facts.some(f=>f.delivered)};
           if(record.operationFailed||record.nativeFailure)verdict=evidence.unknown?'unknown':evidence.delivered?'partial':'stopped';
           else if(idle&&replyOutcomes.some(f=>f.inputIds.includes(record.id)&&['format-failed','send-failed'].includes(f.state)))verdict=evidence.unknown?'unknown':evidence.delivered?'partial':'stopped';
           else if(record.route==='control') {
@@ -2699,7 +2714,7 @@ export class MobileRouter {
         if(action.mayStart&&['accepted','rejected','unknown'].includes(kind))this.state.lastOwnerNoticeAt=startedAt;
         if(kind==='accepted'){notice.state='accepted';notice.messageId=receipt.messageId;notice.acceptedAt=this.now();record.settledAt=this.now();
           const group=replyOutcomes.find(f=>f.groupId&&f.inputIds.includes(record.id));
-          for(const id of group?.inputIds??[]) {const other=this.state.inputs[id];
+          for(const id of new Set([...(group?.inputIds??[]),...this.nativeFailureInputs(record).map(r=>r.id)])) {const other=this.state.inputs[id];
             if(other&&other!==record&&!other.answer&&!other.ownerNotice){other.ownerNotice={...notice};other.settledAt=this.now();}}
           this.settleReplyHandoffs();
         }

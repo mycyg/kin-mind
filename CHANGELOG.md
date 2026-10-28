@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.106
+
+- Share one operational notification receipt across inputs in the same failed native turn, including restored inputs and emoji messages. Keep actual reply settlement tied to explicit coverage or handoff evidence.
+- Route operational notices privately to the owner with the original conversation name for context. Keep successful release reports and inactive runtime candidate status in maintenance logs; preserve failure and rollback notifications.
+
 ## 0.1.105
 
 - Apply the owner-approved factual-correction contract to live understanding, concern content and topics, and unfinished wishes in the same assessment. Name the existing concern and wish `action` fields explicitly.

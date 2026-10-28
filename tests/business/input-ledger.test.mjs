@@ -30,10 +30,13 @@ test('a known failed native turn reports stopped or partial, while unknown submi
   for(const inputId of ['original','steered'])await f.router.observe('native-failure',{inputId,turnFence:0});
   const notices=[];
   await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'synthetic-notice'};}});
-  assert.deepEqual(notices,[['stopped','original']],'explicit failure is not reported as a pending lookup');
+  assert.deepEqual(notices,[['partial','original']],'the failed turn reports its delivered prefix in one notice');
   f.clock.now+=11*60000;
   await f.router.watch({notifyOwner:async(kind,id)=>{notices.push([kind,id]);return {state:'accepted',messageId:'synthetic-notice-2'};}});
-  assert.deepEqual(notices.at(-1),['partial','steered'],'a delivered prefix remains delivered');
+  assert.deepEqual(notices,[['partial','original']],'the same failed turn does not notify again for its steered input');
+  assert.equal(f.router.state.inputs.steered.ownerNotice.messageId,'synthetic-notice');
+  assert.equal(f.router.state.inputs.steered.delivered,1,'the delivered prefix remains a delivery fact');
+  assert.equal(f.router.state.inputs.steered.answer,undefined,'a shared failure notice is not an answer');
   let submitted=0;
   await f.router.dispatch({id:'original',text:'synthetic chat'},async()=>{submitted++;return 'new-turn';});
   assert.equal(submitted,0,'a known failed turn is not authority to repeat its input');
