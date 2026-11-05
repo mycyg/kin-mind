@@ -23,7 +23,7 @@ jobs:
         working-directory: core
       - run: uv run python scripts/prepare_test_tokenizer.py
         working-directory: core
-      - run: uv run pytest -q
+      - run: uv run python -m pytest -q
         working-directory: core
       - run: node --test core/tests/business/*.test.mjs
       - run: npm ci && npm run typecheck && npm run build

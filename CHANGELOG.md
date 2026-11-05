@@ -6,6 +6,7 @@
 - Restore original persona and migration settings, source-aware recall, direct persona edits, ordered model fallback, and active-only plan context.
 - Fix diary/dream text layout, pause unfocused animations and polling, retain worker result scope, and stop only the originating conversation’s workers.
 - Adapt model selection and subagent composition to DSH 0.2.2-rc.1; refresh dependency lock and illustrated README.
+- Run pytest through Python so repository scripts resolve on clean CI runners.
 - Verification: 106 integration checks, 1385 Core tests (1 skipped), and 10 Node checks passed.
 
 

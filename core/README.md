@@ -5,7 +5,7 @@ Python 内核，负责带来源的记忆、情绪、评估、日记、梦境和�
 ```bash
 uv sync --python 3.13 --frozen --extra dev
 TIKTOKEN_CACHE_DIR=../.dev/tiktoken uv run python scripts/prepare_test_tokenizer.py
-TIKTOKEN_CACHE_DIR=../.dev/tiktoken uv run pytest -q
+TIKTOKEN_CACHE_DIR=../.dev/tiktoken uv run python -m pytest -q
 ```
 
 可按需添加 `vector`、`graph` 或 `media`。`media` 与 `local-embedding` 的依赖冲突，需分别安装到独立环境，不要使用 `--all-extras`。
