@@ -163,14 +163,17 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
 
   // 小明 writes twice within twenty seconds (one second at the dev pace): one message to her, and her answer goes back on WeChat.
   arrive({ chat: 'wx-ming', sender: 'wx-ming', senderName: 'Ming', text: '在吗' })
-  await pause(300)
+  // Same tick: both really arrive inside the burst window even when the runner is overloaded.
   arrive({ chat: 'wx-ming', sender: 'wx-ming', senderName: 'Ming', text: '我今天看到星星了' })
   report.ming = await until(async () => {
     const key = sessions()['wechat:wx-ming']
     const turns = key && (await events(ctx, key.sessionId)).filter((e) => e.source === 'kin-channel')
     return turns?.length && wechat.sent.some((s) => s.chat === 'wx-ming') ? { turns, conversation: key } : undefined
   }, 60_000)
-  report.typing = wechat.typing_.filter((t) => t.chat === 'wx-ming')
+  report.typing = await until(() => {
+    const typing = wechat.typing_.filter((t) => t.chat === 'wx-ming')
+    return typing.some(t => t.on) && typing.at(-1)?.on === false ? typing : undefined
+  }, 30_000) ?? []
 
   // The family group: plain talk is heard but not answered; an @ is answered, with what was said before it.
   arrive({ chat: 'family@chatroom', kind: 'group', sender: 'wx-ming', text: '今晚吃什么' })

@@ -96,6 +96,23 @@ try {
   assert.equal(attempts.filter(x => x.id === 'recover:0').length, 2)
   assert.equal(attempts.filter(x => x.id === 'recover:1').length, 1)
   console.log('PASS: unknown receipts retry the same part three times; confirmed parts do not repeat; recovery continues the remainder')
+  let finishArrival, flushed = 0
+  conversations.arrivals = new Promise(resolve => { finishArrival = resolve })
+  conversations.flush = async () => { flushed++ }
+  conversations.schedule('owner-chat', 1)
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.equal(flushed, 0, 'a burst must not flush while an already-arrived message is still being ingested')
+  let finishNextArrival
+  const nextArrival = new Promise(resolve => { finishNextArrival = resolve })
+  conversations.arrivals = conversations.arrivals.then(() => nextArrival)
+  finishArrival()
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.equal(flushed, 0, 'arrivals queued while waiting must finish too')
+  conversations.schedule('owner-chat', 1)
+  finishNextArrival()
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.equal(flushed, 1, 'only the latest timer may flush the combined burst')
+  console.log('PASS: slow ingestion cannot split a burst; superseded timers do not flush')
   conversations.close()
   console.log('PASS: channel stop ends the current conversation and its running workers, leaving other sessions alone')
 } finally {

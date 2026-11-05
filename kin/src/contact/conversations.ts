@@ -98,6 +98,7 @@ export class Conversations {
 
   close() {
     for (const timer of this.timers.values()) clearTimeout(timer)
+    this.timers.clear()
   }
 
   /** One arrival from a platform, taken in order. */
@@ -155,7 +156,15 @@ export class Conversations {
 
   private schedule(key: string, ms: number) {
     clearTimeout(this.timers.get(key))
-    this.timers.set(key, setTimeout(() => void this.flush(key).catch((error: Error) => this.host.log(`contact: ${key} did not reach her: ${error.message}`)), this.host.ms(ms)).unref())
+    const timer = setTimeout(() => void (async () => {
+      // An arrival may still be waiting on Core. Its completed intake resets this timer.
+      let arriving
+      do { arriving = this.arrivals; await arriving } while (arriving !== this.arrivals)
+      if (this.timers.get(key) !== timer) return
+      this.timers.delete(key)
+      await this.flush(key)
+    })().catch((error: Error) => this.host.log(`contact: ${key} did not reach her: ${error.message}`)), this.host.ms(ms)).unref()
+    this.timers.set(key, timer)
   }
 
   /** A burst into its session as one message, with the group's talk since she last spoke there. */
@@ -194,6 +203,7 @@ export class Conversations {
   /** The literal stop: what waits is dropped and what she is doing there ends. */
   private async stop(key: string) {
     clearTimeout(this.timers.get(key))
+    this.timers.delete(key)
     delete this.inbox.bursts[key]
     this.save()
     const conversation = this.host.conversations()[key]
