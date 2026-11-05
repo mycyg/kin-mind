@@ -9,6 +9,8 @@
 - Decode explicit relay thought/answer envelopes before streaming or remembering replies; clean older assistant excerpts on read.
 - Check unknown receipts before up to three same-ID retries; notify only after retry exhaustion.
 - Include queued output and pending platform receipts in health activity; retain unknown delivery IDs across restarts.
+- Wait for silent group arrivals and their graph nodes before checking multi-person memory ownership.
+- Restore the playful first-person README and illustrate the current DSH/plugin/Core architecture.
 - Keep the cross-session fixture within the recent-message window on slower CI runners.
 - Run pytest through Python so repository scripts resolve on clean CI runners.
 - Verification: 106 integration checks, 1385 Core tests (1 skipped), and 10 Node checks passed.

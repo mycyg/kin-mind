@@ -68,8 +68,6 @@ try {
   // Read beside her mind, which may be writing: wait for its lock as Core does.
   const db = new DatabaseSync(join(dsh.dataDir, 'db', 'memory.sqlite3'), { readOnly: true, timeout: 30_000 })
   // Each message as Core's runtime ledger keeps it, under the id its event node names (`runtime_…`).
-  const said = Object.fromEntries(db.prepare("SELECT id,data FROM mind_runtime_events WHERE kind='owner-message'").all()
-    .map(({ id, data }) => ({ ...JSON.parse(data), row: id })).map((event) => [event.text, event]))
   const expected = {
     '我12月底回中国': [OWNER, OWNER, 'app'],
     '小美：下周三去杭州出差': [MEI, MEI, 'feishu:oc_mei'],
@@ -78,12 +76,21 @@ try {
     '小红：今晚吃什么呀': [HONG, FAMILY, 'feishu:oc_family'],
     '小美：吃火锅吧': [MEI, FAMILY, 'feishu:oc_family'],
   }
-  const actors = Object.fromEntries(db.prepare(`SELECT n.data AS node, a.data AS actor FROM mind_graph_nodes n
+  // Private-chat replies do not acknowledge silent group arrivals. Wait for every source and its graph node.
+  let said = {}, actors = {}
+  const complete = await until(() => {
+    said = Object.fromEntries(db.prepare("SELECT id,data FROM mind_runtime_events WHERE kind='owner-message'").all()
+    .map(({ id, data }) => ({ ...JSON.parse(data), row: id })).map((event) => [event.text, event]))
+    actors = Object.fromEntries(db.prepare(`SELECT n.data AS node, a.data AS actor FROM mind_graph_nodes n
     JOIN mind_graph_edges e ON e.object=n.id AND e.predicate='participates' AND e.state='active'
     JOIN mind_graph_nodes a ON a.id=e.subject WHERE json_extract(n.data,'$.runtime_event_id') IS NOT NULL`).all()
     .map((found) => [JSON.parse(found.node).runtime_event_id, JSON.parse(found.actor).title]))
+    return Object.keys(expected).every(text => said[text] && actors[said[text].row])
+  })
+  if (!complete) console.log('incomplete memory arrivals:', Object.keys(expected).filter(text => !said[text] || !actors[said[text].row]))
+
   db.close()
-  checks['Core keeps every line with its own speaker and conversation, the speaker as its actor'] = Object.entries(expected)
+  checks['Core keeps every line with its own speaker and conversation, the speaker as its actor'] = Boolean(complete) && Object.entries(expected)
     .every(([text, [speaker, recipient, key]]) => {
       const event = said[text]
       return event?.speaker_person_id === speaker && event.recipient_person_id === recipient && event.conversation_key === key
