@@ -1,0 +1,629 @@
+import json
+
+from concurrent.futures import ThreadPoolExecutor
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from eventmem.core import Engine
+
+from eventmem.core.db import Conflict
+
+from eventmem.core.models import Scope, SourceInput
+
+from kin_mind.actions import ActionEvents
+
+from kin_mind.memory import MemoryContinuity
+
+from kin_mind.plans import AutonomousPlans
+
+from kin_mind.state import AffectiveEvent, Mind
+
+@pytest.fixture
+def env(tmp_path):
+    clock = [datetime.now(timezone.utc)]
+    mind = Mind(Engine(tmp_path), Scope(persona="synthetic-planning"), clock=lambda: clock[0].isoformat())
+    def source(key, authority="explicit"):
+        return mind.engine.receive(SourceInput(namespace="planning-test", key=key, text=key, scope=mind.scope,
+            authority=authority, occurred_at=mind.clock(), metadata={"role": "user" if authority == "explicit" else "assistant", "host_event": "message"}))["id"]
+    initial = source("owner-authorizes-autonomous-work")
+    mind.initialize(agent_version="planning-v1", evidence_ids=[initial])
+    memory = MemoryContinuity(mind)
+    memory.configure({"records": True, "semantic_actions": True, "autonomous_plans": True, "creative_execution": True, "usage_reinforcement": True})
+    return mind, AutonomousPlans(mind), source, clock, initial
+
+def create(env, *, actor="create", steps=None, key="idea", **extra):
+    mind, plans, source, clock, initial = env
+    return plans.manage({"command_id": "create:" + key, "action": "create", "key": key, "goal": "Make a small illustrated clock",
+        "motivation": "Continue a shared interest", "reason": "A sourced idea", "evidence_ids": [initial],
+        "steps": steps or [{"id": "make", "actor": actor, "goal": "Make the clock", "completion": "A verified SVG is saved"}], **extra})
+
+def decide(env, plan, action="execute", step_id="make", evidence=None, **extra):
+    mind, plans, source, clock, initial = env
+    with mind.engine.db.connect(write=True) as conn:
+        refs = mind._evidence(conn, evidence or [initial])
+        return plans.decide(conn, {"plan_id": plan["id"], "step_id": step_id, "expected_revision": plan["revision"], "action": action,
+            "reason": "Context supports this decision", "evidence_ids": evidence or [initial], **extra},
+            "decision:" + action + ":" + str(plan["revision"]), {"provider": "deepseek", "reasoning": "high", "agent_version": "planning-v1"}, refs)
+
+@pytest.mark.parametrize("case", [
+    "implicit-goal", "long-term", "singapore-time", "before-window", "missed-window", "dependency-wait", "dependency-cycle", "dependency-missing",
+    "owner-proposed", "owner-accepted", "owner-completed", "owner-declined", "owner-fabricated", "defer", "abandon", "pause", "resume", "reschedule",
+    "cancel", "goal-change", "new-chat", "duplicate-command", "conflicting-command", "model-unavailable",
+])
+def test_planning_replay_24(env, case):
+    mind, plans, source, clock, initial = env
+    owner_case = case.startswith("owner-")
+    steps = [{"id": "make", "actor": "owner" if owner_case else "create", "goal": "Bring a photograph" if owner_case else "Make a clock", "completion": "Actual result exists"}]
+    if case == "before-window":
+        steps[0]["not_before"] = (clock[0] + timedelta(days=1)).isoformat()
+    if case == "missed-window":
+        steps[0]["not_after"] = (clock[0] - timedelta(minutes=1)).isoformat()
+    if case in {"dependency-wait", "dependency-cycle", "dependency-missing"}:
+        steps[0]["depends_on"] = ["input"]
+        if case != "dependency-missing":
+            steps.append({"id": "input", "actor": "owner", "goal": "Choose a photo", "completion": "Photo supplied", "depends_on": ["make"] if case == "dependency-cycle" else []})
+    if case in {"dependency-cycle", "dependency-missing"}:
+        with pytest.raises(ValueError):
+            create(env, steps=steps)
+        return
+    plan = create(env, steps=steps, next_review_at="2028-02-01T12:00:00" if case in {"long-term", "singapore-time"} else None)
+    if case == "implicit-goal":
+        assert plan["motivation"] and plan["steps"][0]["state"] == "pending"
+    elif case == "long-term":
+        assert plan["next_review_at"].startswith("2028") and "expires_at" not in plan
+    elif case == "singapore-time":
+        assert plan["next_review_at"].endswith("+08:00")
+    elif case == "owner-proposed":
+        assert plan["steps"][0]["owner_status"] == "proposed"
+        assert plans.claim("create", "worker")["state"] == "waiting"
+    elif case in {"owner-accepted", "owner-completed", "owner-declined", "owner-fabricated"}:
+        evidence = [source("actual-owner-response", "model" if case == "owner-fabricated" else "explicit")]
+        if case == "owner-fabricated":
+            with pytest.raises(Conflict):
+                decide(env, plan, "owner_accepted", evidence=evidence)
+        else:
+            updated = decide(env, plan, case.replace("-", "_"), evidence=evidence)
+            assert updated["steps"][0]["owner_status"] == case.split("-")[1]
+            assert updated["steps"][0]["state"] == {"owner-accepted": "waiting", "owner-completed": "completed", "owner-declined": "abandoned"}[case]
+    elif case in {"defer", "abandon"}:
+        updated = decide(env, plan, "wait" if case == "defer" else "abandon")
+        assert updated["steps"][0]["state"] in {"waiting", "abandoned"}
+        assert plans.claim("create", "worker")["state"] == "waiting"
+    elif case in {"pause", "resume", "reschedule", "cancel", "goal-change"}:
+        plan = decide(env, plan)
+        action = "update" if case == "goal-change" else "pause" if case == "resume" else case
+        request = {"command_id": case, "id": plan["id"], "expected_revision": plan["revision"], "action": action,
+                   "reason": "Owner changes the arrangement", "evidence_ids": [source(case)], "next_review_at": "2027-01-01T08:00:00"}
+        if case == "goal-change":
+            request["goal"] = "Make a poem instead"
+        updated = plans.manage(request)
+        if case == "resume":
+            updated = plans.manage({**request, "command_id": "resume-now", "action": "resume", "expected_revision": updated["revision"]})
+        assert updated["id"] == plan["id"] and not updated["steps"][0].get("decision")
+        assert plans.claim("create", "worker")["state"] == "waiting"
+    elif case == "duplicate-command":
+        assert create(env, steps=steps) == plan
+    elif case == "conflicting-command":
+        assert create(env, key="idea", goal="Different content") == plan
+    elif case == "model-unavailable":
+        assert plans.claim("create", "worker")["state"] == "waiting"
+    else:
+        plan = decide(env, plan)
+        if case == "new-chat":
+            MemoryContinuity(mind).ingest({"id": "new-input", "kind": "owner-message", "at": mind.clock(), "text": "I changed my mind"})
+        reason = plans.read(plan["id"])["plans"][0]["steps"][0]["waiting_reason"]
+        assert reason == {"before-window": "time-window-not-open", "missed-window": "missed-window-review-required", "dependency-wait": "dependency-unfinished", "new-chat": "new-owner-evidence"}[case]
+        assert plans.claim("create", "worker")["state"] == "waiting"
+
+def test_concurrent_claim_restart_and_late_result(env):
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda owner: plans.claim("create", owner), ["one", "two"]))
+    assert [r["state"] for r in results].count("claimed") == 1
+    claimed = next(r for r in results if r["state"] == "claimed")
+    run = claimed["run"]
+    with pytest.raises(Conflict):
+        plans.settle(run["id"], run["owner"], run["fence"], state="completed", result={"verified": True})
+    # The winner's lease has not expired: a restart recovery reports that row and
+    # leaves it alone, however confidently the caller declares the workers stopped.
+    held = plans.recover()
+    assert held["recovered"] == [] and [r["id"] for r in held["still_leased"]] == [run["id"]]
+    assert plans.recover(workers_stopped=True)["recovered"] == []
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=0 WHERE id=?", (run["id"],))
+    assert plans.recover(workers_stopped=True)["recovered"] == [run["id"]]
+    assert plans.read(plan["id"])["plans"][0]["steps"][0]["state"] == "waiting"
+    with pytest.raises(Conflict):
+        plans.settle(run["id"], run["owner"], run["fence"], state="failed", result={})
+
+def test_due_review_is_deduplicated_not_an_action(env):
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    actions = ActionEvents(mind)
+    assert plans.tick(actions) == plans.tick(actions)
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events").fetchone()[0] == 1
+    assert plans.claim("create", "worker")["state"] == "waiting"
+    updated = decide(env, plan, "wait", next_review_at=(clock[0] + timedelta(days=30)).isoformat())
+    assert plans.tick(actions) == []
+    assert updated["next_review_at"]
+
+@pytest.mark.parametrize("score,action,eligible", [(12, "execute", True), (99, "wait", False)])
+def test_scores_are_context_not_action_gates(env, score, action, eligible):
+    mind, plans, source, clock, initial = env
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        state["dimensions"]["initiative"].update(score=score, baseline=score, at=mind.clock())
+        mind._save(conn, state)
+    plan = decide(env, create(env, actor="contact"), action)
+    plans.sync_wishes()
+    assert mind.contact_candidate()["eligible"] is eligible
+    if eligible:
+        attempt = mind.claim_contact(owner_epoch="same-input")
+        assert mind.check_contact(attempt["id"], "same-input")["eligible"]
+        mind.settle_contact(attempt_id=attempt["id"], state="pending")
+        mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="synthetic-receipt")
+        assert plans.read(plan["id"])["plans"][0]["steps"][0]["state"] == "completed"
+        assert not mind.contact_candidate()["eligible"]
+        assert plan["id"] not in {item["id"] for item in plans.read()["plans"]}
+
+def test_scores_and_desire_strength_rise_and_fall_without_authorizing_action(env):
+    mind, plans, source, clock, initial = env
+    plan = create(env, actor="contact")
+    desire_id = None
+    for index, (score, action, target) in enumerate([(12, "execute", 92), (99, "wait", 19), (19, "execute", 7)]):
+        evidence = source("new-context-" + str(index))
+        mind.record(AffectiveEvent(command_id="affect-" + str(index), agent_version="planning-v1",
+            expected_revision=mind.read()["revision"], evidence_ids=[evidence], reason="New sourced experience changes current motivation",
+            values={"initiative": score, "curiosity": score},
+            motivations={key: {"target": target, "half_life_minutes": 20, "reason": "Current intention"} for key in ("initiative", "curiosity")}))
+        plan = decide(env, plan, action, evidence=[evidence], strength=score)
+        plans.sync_wishes()
+        current = mind.read()
+        assert current["dimensions"]["initiative"]["value"] == score
+        assert current["dimensions"]["curiosity"]["value"] == score
+        assert mind.contact_candidate()["eligible"] is (action == "execute")
+        with mind.engine.db.connect() as conn:
+            wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+        assert wish["strength"] == score
+        assert wish["status"] == ("wanted" if action == "execute" else "waiting")
+        assert desire_id in {None, wish["id"]}
+        desire_id = wish["id"]
+        clock[0] += timedelta(minutes=20)
+        projected = mind.read()["dimensions"]
+        assert projected["initiative"]["value"] == pytest.approx((score + target) / 2)
+        assert projected["curiosity"]["value"] == pytest.approx((score + target) / 2)
+        assert plans.claim("contact", "clock-alone")["state"] == "waiting"
+    history = plans.read(plan["id"], history=True)["plans"][0]["history"]
+    assert [p["steps"][0]["strength"] for p in history if p["steps"][0].get("decision")] == [12, 99, 19]
+
+def test_omitted_strength_uses_current_motivation_then_preserves_existing_wish(env):
+    mind, plans, source, clock, initial = env
+    mind.record(AffectiveEvent(command_id="curious", agent_version="planning-v1", expected_revision=mind.read()["revision"],
+        evidence_ids=[source("an-intriguing-question")], values={"curiosity": 23}, reason="Current curiosity is modest"))
+    plan = decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+    assert wish["strength"] == 23
+    plan = decide(env, plan, "wait", strength=81)
+    plans.sync_wishes()
+    plan = decide(env, plan, "execute")
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        assert mind._load(conn)["desires"][wish["id"]]["strength"] == 81
+
+@pytest.mark.parametrize("strength", [-1, 101, 75.5, "75"])
+def test_decision_strength_is_a_bounded_integer(env, strength):
+    with pytest.raises(ValueError):
+        decide(env, create(env), strength=strength)
+
+def test_partial_contact_does_not_complete_plan(env):
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="contact"))
+    plans.sync_wishes()
+    attempt = mind.claim_contact(owner_epoch="same-input")
+    mind.settle_contact(attempt_id=attempt["id"], state="pending")
+    mind.settle_contact(attempt_id=attempt["id"], state="accepted", message_id="synthetic-first-only", partial=True, canceled_bubbles=1)
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and step["receipts"][0]["partial"]
+
+def test_source_change_requires_review(env):
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    with mind.engine.db.connect(write=True) as conn:
+        rid = mind._evidence(conn, [initial])[0]["record_id"]
+        row = mind.engine._get(conn, rid)
+        row["status"] = "superseded"
+        conn.execute("UPDATE records SET status='superseded',data=? WHERE id=?", (json.dumps(row), rid))
+    assert plans.claim("create", "worker")["state"] == "waiting"
+
+def test_pause_invalidates_running_worker(env):
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    claimed = plans.claim("create", "worker")
+    current = plans.read(plan["id"])["plans"][0]
+    plans.manage({"command_id": "pause", "action": "pause", "id": current["id"], "expected_revision": current["revision"], "reason": "Owner needs the computer", "evidence_ids": [initial]})
+    assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "interrupt"
+
+def test_owner_message_does_not_interrupt_a_running_step(env):
+    """N7: a new message from the owner reaches Kin; it does not end her running step."""
+    mind, plans, source, clock, initial = env
+    decide(env, create(env))
+    claimed = plans.claim("create", "worker")
+    MemoryContinuity(mind).ingest({"id": "owner-interjects", "kind": "owner-message", "text": "By the way", "at": mind.clock()})
+    assert plans.renew(claimed["run"]["id"], "worker", 1)["state"] == "renewed"
+    verified = source("verified-clock", authority="operation")
+    run = plans.settle(claimed["run"]["id"], "worker", 1, state="completed", result={"verified": True, "source_id": verified})
+    assert run["state"] == "completed"
+
+def test_a_deferred_owner_task_becomes_kins_plan_at_her_time(env):
+    """N10, plan side: the router released the lock; the task comes back as Kin's plan at her time."""
+    from kin_mind.plans import local_time
+    mind, plans, source, clock, initial = env
+    MemoryContinuity(mind).ingest({"id": "wechat:task-1", "kind": "owner-message", "text": "Sort my photos", "at": mind.clock()})
+    later = (clock[0] + timedelta(hours=3)).isoformat()
+    request = {"task_id": "task-1", "goal": "Sort the photos", "reason": "After dinner", "not_before": later, "input_ids": ["wechat:task-1"]}
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    plan = plans.read(created["planId"])["plans"][0]
+    assert plan["steps"][0]["owner_request_id"] == "task-1" and plan["steps"][0]["actor"] == "contact"
+    assert plan["next_review_at"] == local_time(later)
+    assert plans.defer_owner_task(request) == created
+    # CR-MIND-03: a source not in memory yet is the router's to retry; a time already past is due now.
+    unknown = plans.defer_owner_task({**request, "task_id": "task-2", "input_ids": ["wechat:never-seen"]})
+    assert unknown == {"state": "retry", "reason": "owner-source-unavailable"}
+    past = plans.defer_owner_task({**request, "task_id": "task-3", "not_before": mind.clock()})
+    assert past["state"] == "created" and past["due"] == "now"
+    late = plans.read(past["planId"])["plans"][0]
+    assert late["next_review_at"] == mind.clock() and not late["steps"][0].get("not_before")
+    assert plans.tick(ActionEvents(mind)), "a plan due now wakes its review at once"
+    # The router's own call (WS3 plan-deferral): the task text as `request`, its input ids as evidence.
+    MemoryContinuity(mind).ingest({"id": "wechat:task-4", "kind": "owner-message", "text": "Print the tickets", "at": mind.clock()})
+    routed = plans.defer_owner_task({"task_id": "task-4", "request": "Print the tickets", "reason": "Tomorrow morning",
+                                     "not_before": later, "evidence_ids": ["wechat:task-4"]})
+    assert routed["state"] == "created" and routed["plan_id"] == routed["planId"]
+
+def test_a_review_retires_the_queued_reviews_it_answered(env):
+    """K2-04: reviews of a plan queued before a review read it are answered by that review;
+    those not yet started are retired instead of paid for again. A started one is left alone."""
+    from kin_mind.appraisal import Appraisals
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    actions = ActionEvents(mind)
+    Appraisals(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        first = plans._emit_review(conn, actions, plan, [plan["id"], "a"], "test", "planning-v1")
+        second = plans._emit_review(conn, actions, plan, [plan["id"], "b"], "test", "planning-v1")
+        conn.execute("UPDATE mind_action_events SET data=json_set(data,'$.job_id','job-running') WHERE id=?", (second,))
+        conn.execute("INSERT INTO mind_appraisals(id,scope,state,available,data) VALUES('job-running',?,'running',0,'{}')", (mind.scope.key(),))
+    clock[0] += timedelta(seconds=5)
+    with mind.engine.db.connect(write=True) as conn:
+        assert plans.retire_answered_reviews(conn, [plan["id"]], before=mind.clock(), answered_by="appraise_x") == [first]
+        states = dict(conn.execute("SELECT id,state FROM mind_action_events WHERE kind='plan-review'").fetchall())
+    assert states == {first: "superseded", second: "pending"}
+
+def test_waiting_plan_rechecks_new_evidence_before_its_distant_review(env):
+    mind, plans, source, clock, initial = env
+    p=decide(env, create(env), 'wait', next_review_at='2028-01-01T09:00:00+08:00')
+    actions=ActionEvents(mind)
+    assert plans.tick(actions)==[]
+    MemoryContinuity(mind).ingest({'id':'new-owner-photo','kind':'owner-message','text':'Here is the requested photo','at':mind.clock()})
+    assert len(plans.tick(actions))==1
+    assert plans.claim('create','worker')['state']=='waiting'
+
+def test_disabling_plans_revokes_linked_contact_without_losing_history(env):
+    mind, plans, *_ = env
+    p=decide(env, create(env,actor='contact'))
+    plans.sync_wishes()
+    MemoryContinuity(mind).configure({'autonomous_plans':False})
+    with mind.engine.db.connect() as conn:
+        desire=next(d for d in mind._load(conn)['desires'].values() if d.get('plan_id')==p['id'])
+        assert not plans.linked_ready(conn,desire)
+    assert plans.read(identifier=p['id'],history=True)['plans'][0]['history']
+
+@pytest.mark.parametrize('model,reasoning', [('gpt-6-astra','medium'),('deepseek-flash','high')])
+def test_native_main_profile_authorizes_plan_and_contact_without_ds_label(env,model,reasoning):
+    mind,plans,source,clock,initial=env
+    plan=create(env,actor='contact')
+    native={'model':model,'provider':'custom-gateway','reasoning':reasoning,
+            'native_turn_id':'original-turn','native_session_id':'same-main','verified_at':mind.clock()}
+    receipt={**native,'native_receipt':native,'agent_version':'planning-v1'}
+    proposal={'plan_id':plan['id'],'step_id':'make','expected_revision':plan['revision'],'action':'execute',
+              'reason':'当前主会话决定联系','evidence_ids':[initial]}
+    with mind.engine.db.connect(write=True) as conn:
+        bad={**receipt,'model':'different-model'}
+        with pytest.raises(Conflict,match='verified assessment'):
+            plans.decide(conn,proposal,'invalid',bad,mind._evidence(conn,[initial]))
+        plans.decide(conn,proposal,'native',receipt,mind._evidence(conn,[initial]))
+    plans.sync_wishes()
+    assert mind.contact_candidate()['eligible'] is True
+
+@pytest.mark.parametrize('explanations', [
+    ['卡片已产出并核验：已有完成回执；当前联系条件由宿主核对。'],
+    ['作品已准备好，接下来送给她。'],
+    [],
+])
+def test_semantic_preconditions_accept_explanation_without_exact_prose_tokens(env, explanations):
+    mind, plans, *_ = env
+    p = create(env, actor='contact', steps=[{'id':'make','actor':'contact','goal':'Share a thought',
+        'completion':'Platform accepted','preconditions':['卡片已产出并核验','宿主核对免打扰与联系偏好']}])
+    p = decide(env, p, conditions_met=explanations)
+    assert p['steps'][0]['decision']['conditions_met'] == explanations
+    plans.sync_wishes()
+    assert mind.contact_candidate()['eligible'] is True
+
+
+def test_semantic_assurance_cannot_bypass_unfinished_dependency(env):
+    mind, plans, *_ = env
+    p = create(env, steps=[
+        {'id':'input','actor':'owner','goal':'Choose a photo','completion':'Photo received'},
+        {'id':'make','actor':'create','goal':'Make the card','completion':'Saved card',
+         'depends_on':['input'],'preconditions':['Photo is ready']},
+    ])
+    p = decide(env, p, conditions_met=['The requested photo is already here.'])
+    assert plans.claim('create','worker')['state'] == 'waiting'
+    assert plans.read(p['id'])['plans'][0]['steps'][1]['waiting_reason'] == 'dependency-unfinished'
+
+
+def test_only_proven_unsent_attempt_can_release_persistent_contact_slot(env):
+    mind, plans, *_ = env
+    p = decide(env, create(env, actor='contact'))
+    plans.sync_wishes()
+    attempt = mind.claim_contact(owner_epoch='original')
+    mind.settle_contact(attempt_id=attempt['id'],state='pending')
+    # A new host instance reads the same durable state, not an in-memory flag.
+    restarted = Mind(mind.engine, mind.scope, clock=mind.clock)
+    with pytest.raises(Conflict):
+        restarted.settle_contact(attempt_id=attempt['id'],state='canceled')
+    assert restarted.contact_candidate()['reason'] == 'attempt-in-progress'
+    retired = restarted.settle_contact(attempt_id=attempt['id'],state='canceled',
+        aborted_before_send=True,reason='Delivery conditions changed before sending')
+    assert retired['aborted_before_send'] and retired['state'] == 'canceled'
+    assert restarted.contact_candidate()['eligible'] is True
+    next_attempt = restarted.claim_contact(owner_epoch='current')
+    assert next_attempt['id'] != attempt['id']
+    restarted.settle_contact(attempt_id=next_attempt['id'],state='accepted',message_id='real-receipt')
+    with pytest.raises((Conflict,ValueError)):
+        restarted.settle_contact(attempt_id=next_attempt['id'],state='canceled',aborted_before_send=True)
+
+
+def test_plan_explanations_are_not_limited_to_twelve_items(env):
+    explanations = ['Context explanation ' + str(i) for i in range(20)]
+    plan = decide(env, create(env), conditions_met=explanations)
+    assert plan['steps'][0]['decision']['conditions_met'] == explanations
+
+
+def test_an_expired_run_is_taken_back_at_the_next_claim(env):
+    """K2-01: a creation whose host vanished no longer reserves the executor until a lucky restart;
+    the next claim takes it back, and the old executor's late answer is refused."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    assert plans.claim("create", "creator-2") == {"state": "waiting", "reason": "executor-reserved", "run_id": run["id"]}
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("UPDATE mind_plan_runs SET lease_until=? WHERE id=?", (0, run["id"]))
+    assert plans.claim("create", "creator-2")["state"] == "waiting"  # the step now needs Kin's new decision
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and step["receipts"][-1]["reason"] == "lease-expired"
+    with pytest.raises(Conflict):
+        plans.renew(run["id"], "creator-1", run["fence"])
+    with pytest.raises(Conflict):
+        plans.settle(run["id"], "creator-1", run["fence"], state="interrupted", result={})
+
+
+def test_the_host_reason_for_a_stop_reaches_the_plan(env):
+    """K2-02: plan-interrupt carries the host's static reason into the step's receipts."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env))
+    run = plans.claim("create", "creator-1")["run"]
+    settled = plans.settle(run["id"], "creator-1", run["fence"], state="interrupted",
+                           result={"checkpoint_retained": True, "reason": "creation-artifact-invalid"})
+    assert settled["result"]["reason"] == "creation-artifact-invalid"
+    assert plans.read(plan["id"])["plans"][0]["steps"][0]["receipts"][-1]["reason"] == "creation-artifact-invalid"
+
+
+def test_a_revised_step_keeps_its_wish_and_the_cursor_counts_the_real_page(env):
+    """K2-05: revising a plan keeps the wish its step carries; K2-07: the cursor follows the
+    page size the query used."""
+    mind, plans, source, clock, initial = env
+    plan = create(env)
+    with mind.engine.db.connect(write=True) as conn:
+        stored = plans.get(conn, plan["id"])
+        stored["steps"][0]["desire_id"] = "desire-linked"
+        stored["revision"] += 1
+        plans._save(conn, stored, "link")
+    revised = plans.manage({"command_id": "revise", "id": plan["id"], "expected_revision": stored["revision"], "action": "update",
+                            "reason": "Sharper completion", "evidence_ids": [initial],
+                            "steps": [{"id": "make", "actor": "create", "goal": "Make the clock", "completion": "A verified SVG with hands is saved"}]})
+    assert revised["steps"][0]["desire_id"] == "desire-linked"
+    for index in range(3):
+        create(env, key="more-" + str(index))
+    page = plans.read(limit=500)
+    assert len(page["plans"]) == 4 and page["next_cursor"] is None
+    first = plans.read(limit=2)
+    assert first["next_cursor"] == 2 and len(plans.read(cursor=2, limit=2)["plans"]) == 2
+
+
+@pytest.mark.parametrize("open_questions,step_state", [([], "completed"), (["Which year was it built?"], "waiting")])
+def test_an_exploration_with_open_questions_leaves_its_step_to_kin(env, tmp_path, open_questions, step_state):
+    """K2-10: a finished run completes its step only when nothing is left open; otherwise the
+    step waits with the questions in its receipt and Kin decides at the next review."""
+    from kin_mind.exploration import Explorations
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="explore"))
+    plans.sync_wishes()
+    def runner(executable, topic, directory, **kwargs):
+        return {"state": "complete", "partial": False, "attempt": 1,
+                "result": {"summary": "Found the clock's maker", "findings": ["A sourced finding"],
+                           "sources": [{"url": "memory://" + initial, "title": "Owner note"}],
+                           "open_questions": open_questions, "suggested_share": None}}
+    result = Explorations(mind).run("codex", str(tmp_path / "explore"), "planning-v1", runner=runner)
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == step_state
+    assert step["receipts"][-1].get("open_questions", []) == open_questions
+
+def test_a_completed_plan_is_read_for_its_wish_once_and_then_left_out(env):
+    """K2-21: an abandon that ends the plan still settles its wish; afterwards the completed plan
+    is found by index only while flagged, so completed plans are not read on every review."""
+    mind, plans, source, clock, initial = env
+    plan = decide(env, create(env, actor="contact"))
+    plans.sync_wishes()
+    plan = decide(env, plans.read(plan["id"])["plans"][0], "abandon")
+    assert plan["status"] == "completed" and plan["wish_sync"] == "pending"
+    plans.sync_wishes()
+    with mind.engine.db.connect() as conn:
+        wish = next(d for d in mind._load(conn)["desires"].values() if d.get("plan_id") == plan["id"])
+        stored = json.loads(conn.execute("SELECT data FROM mind_plans WHERE id=?", (plan["id"],)).fetchone()[0])
+        query = conn.execute("EXPLAIN QUERY PLAN SELECT data FROM mind_plans WHERE scope=? AND status='completed' "
+                             "AND json_extract(data,'$.wish_sync')='pending'", (plans.scope,)).fetchall()
+    assert wish["status"] == "abandoned" and "wish_sync" not in stored
+    assert "mind_plan_wish_sync" in " ".join(str(r[-1]) for r in query)
+    assert plans.sync_wishes() == []
+
+
+def test_a_pass_over_many_steps_loads_the_mind_state_once(env, monkeypatch):
+    """K2-21: claim reads the state once for all its steps, not once per step."""
+    mind, plans, source, clock, initial = env
+    for index in range(3):
+        create(env, actor="explore", key="idea-" + str(index))
+    loads = []
+    original = type(mind)._load
+    monkeypatch.setattr(type(mind), "_load", lambda self, conn: loads.append(1) or original(self, conn))
+    assert plans.claim("explore", "worker")["state"] == "waiting"
+    assert len(loads) <= 1
+
+
+def test_a_deployment_leaves_decided_steps_ready_and_wakes_no_plan(env):
+    """T-03 (K1-13, K2-04): moving agent_version keeps a decided step claimable and queues no
+    per-plan review; only a change of what decides behaviour asks again."""
+    mind, plans, source, clock, initial = env
+    actions = ActionEvents(mind)
+    first = decide(env, create(env, actor="explore", key="deploy-a"))
+    second = decide(env, create(env, actor="explore", key="deploy-b"))
+    plans.tick(actions)
+    with mind.engine.db.connect(write=True) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0]
+        state = mind._load(conn)
+        state["agent_version"] = "planning-v2"
+        mind._save(conn, state)
+    assert plans.tick(actions) == []
+    with mind.engine.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM mind_action_events WHERE kind='plan-review'").fetchone()[0] == before
+    reasons = {p["id"]: p["steps"][0]["waiting_reason"] for p in plans.read()["plans"]}
+    assert reasons[first["id"]] is None and reasons[second["id"]] is None
+
+
+def test_a_deferral_answers_whether_it_can_ever_be_a_plan(env):
+    """CR-MIND-03 with WS3's router: a passing failure answers `retry`; one that can never be a
+    plan answers `needs-kin` with a stable reason and `permanent`, which the router keeps and tells
+    Kin once. The mind tells her nothing itself; a plan already made answers `created` again even
+    after its time has passed."""
+    mind, plans, source, clock, initial = env
+    later = (clock[0] + timedelta(hours=3)).isoformat()
+
+    def events():
+        with mind.engine.db.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM mind_action_events").fetchone()[0]
+    before = events()
+    request = {"task_id": "task-9", "request": "Book the tickets", "not_before": later, "evidence_ids": ["wechat:task-9"]}
+    assert plans.defer_owner_task(request) == {"state": "retry", "reason": "owner-source-unavailable"}
+    MemoryContinuity(mind).ingest({"id": "wechat:task-9", "kind": "owner-message", "text": "Book the tickets", "at": mind.clock()})
+    created = plans.defer_owner_task(request)
+    assert created["state"] == "created"
+    clock[0] += timedelta(hours=4)
+    again = plans.defer_owner_task(request)
+    assert again["state"] == "created" and again["planId"] == created["planId"]
+    MemoryContinuity(mind).configure({"autonomous_plans": False})
+    refused = plans.defer_owner_task({**request, "task_id": "task-10"})
+    assert refused == {"state": "needs-kin", "reason": "autonomous-plans-disabled", "permanent": True}
+    assert events() == before
+
+
+
+
+def _foreground(mind):
+    from kin_mind.lifecycle import foreground_lease
+    with mind.engine.db.connect(write=True) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS mind_foreground_leases(scope TEXT NOT NULL,session TEXT NOT NULL,"
+                     "expires_at REAL NOT NULL,PRIMARY KEY(scope,session))")
+    foreground_lease(mind.engine, mind.scope.key(), "read:synthetic")
+
+
+def test_kins_own_creation_is_claimed_during_the_owners_chat_and_a_held_off_one_is_ready_again_uncounted(env):
+    """2026-10-26: a foreground session no longer holds a creation's claim. A run the host held off
+    before anything ran goes back to ready on its own decision, a bounded number of times, and is not
+    one of the day's creations."""
+    from kin_mind.play import config, left
+    mind, plans, source, clock, initial = env
+    _foreground(mind)
+    plan = decide(env, create(env))
+    seen = set()
+    for attempt in range(4):
+        claimed = plans.claim("create", "creator-1")
+        assert claimed["state"] == "claimed", attempt
+        run = claimed["run"]
+        assert run["id"] not in seen and "origin" not in run
+        seen.add(run["id"])
+        plans.settle(run["id"], "creator-1", run["fence"], state="interrupted", result={"checkpoint_retained": True, "reason": "not-started"})
+        with mind.engine.db.connect() as conn:
+            assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] is None
+    # The fourth hold-off in a row goes to Kin, as any other stop does.
+    step = plans.read(plan["id"])["plans"][0]["steps"][0]
+    assert step["state"] == "waiting" and [r["reason"] for r in step["receipts"]] == ["not-started"] * 4
+
+
+def test_explicit_creation_cap_is_honored_while_owner_work_continues(env):
+    from kin_mind.play import config, left, configure
+    mind, plans, source, clock, initial = env
+    configure(mind, {"create_per_day": 3})
+    with mind.engine.db.connect(write=True) as conn:
+        for index in range(3):
+            conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", ("done-" + str(index), mind.scope.key(), "elsewhere", "s",
+                         "create", "completed" if index else "failed", 0, "creator-0", 1, json.dumps({"started_at": mind.clock()})))
+    decide(env, create(env, key="idea-2"))
+    assert plans.claim("create", "creator-1") == {"state": "waiting", "reason": "daily-limit-reached"}
+    owners = decide(env, create(env, key="owners", steps=[{"id": "make", "actor": "create", "goal": "Make what the owner asked for",
+                                                       "completion": "A verified file is saved", "owner_request_id": "task-1"}]))
+    claimed = plans.claim("create", "creator-1")
+    assert claimed["state"] == "claimed" and claimed["plan"]["id"] == owners["id"] and claimed["run"]["origin"] == "owner"
+    with mind.engine.db.connect() as conn:
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 0
+    clock[0] += timedelta(days=1)
+    with mind.engine.db.connect(write=True) as conn:
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 3
+        for index, origin in enumerate(["owner", None]):
+            conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", ("next-" + str(index), mind.scope.key(), "elsewhere", "s",
+                         "create", "completed", 0, "creator-0", 1, json.dumps({"started_at": mind.clock(), **({"origin": origin} if origin else {})})))
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] == 2, "the owner's is not one of Kin's three"
+
+
+def test_default_creation_capacity_has_no_implicit_daily_cap(env):
+    from kin_mind.play import config, left
+    mind, plans, source, clock, initial = env
+    with mind.engine.db.connect(write=True) as conn:
+        for index in range(8):
+            conn.execute("INSERT INTO mind_plan_runs VALUES(?,?,?,?,?,?,?,?,?,?)", ("prior-" + str(index), mind.scope.key(), "elsewhere", "s",
+                         "create", "completed", 0, "creator-0", 1, json.dumps({"started_at": mind.clock()})))
+        assert left(conn, mind.scope.key(), mind.clock(), config(conn))["create"] is None
+    plan = decide(env, create(env, key="another-idea"))
+    claimed = plans.claim("create", "creator-1")
+    assert claimed["state"] == "claimed" and claimed["plan"]["id"] == plan["id"]
+
+
+def test_current_plan_is_not_hidden_by_terminal_history(env):
+    mind, plans, source, clock, initial = env
+    for index in range(25):
+        plan = create(env, key=f"old-{index}")
+        plans.manage({"command_id": f"cancel-{index}", "action": "cancel", "id": plan["id"],
+                      "expected_revision": plan["revision"], "reason": "No longer needed", "evidence_ids": [initial]})
+    current = create(env, key="still-to-do", next_review_at=(clock[0] + timedelta(hours=1)).isoformat())
+    page = plans.read(limit=24)
+    assert page["plans"][0]["id"] == current["id"]
+    assert page["plans"][0]["status"] == "active"
+    assert len(page["plans"]) == 1
+    assert page["next_cursor"] is None
+    assert len(plans.read(status="canceled")["plans"]) == 24

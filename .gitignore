@@ -1,36 +1,24 @@
-# 密钥只在环境变量，.env 永不入库
-.env
-
-# 运行时数据（被管理项目内的记忆目录）
-.memory/
-.memorypalace/
-.env.*
-!.env.example
-node_modules/
-coverage/
-playwright-report/
-test-results/
-.work/
-*.sqlite*
-*.db-wal
-*.db-shm
-
-# 手动运行 -m llm 套件留下的回执（真实模型输出与用量），只在本机查看，永不入库
-private/
-
-# Python 构建与缓存产物
-__pycache__/
-*.egg-info/
-.pytest_cache/
-*.py[cod]
-build/
+node_modules
 dist/
-.venv/
-
-# macOS
+# dsh-kin build output (npm run build)
+kin/lib/
+dist-native/
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.tsbuildinfo
 .DS_Store
 
-*.tsbuildinfo
+# local dev runtime: isolated DSH home, synthetic mind data, logs
+.dev/
 
-# Console assets are built into distributions, not committed.
-src/eventmem/web/
+# SQLite sidecar files
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Private live data and rollback snapshots
+/data/
+/backups/
+/runtime/

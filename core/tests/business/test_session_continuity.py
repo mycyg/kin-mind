@@ -1,0 +1,466 @@
+import json
+"""Session continuity storage: where a maintenance judgment travels, what a checkpoint
+build leaves behind, and how much one automatic injection may add to a native window."""
+from kin_mind.context import INJECTION_CEILING, Contexts
+from kin_mind.memory import MemoryContinuity
+from kin_mind.session_advice import latest, submit
+from kin_mind.session_checkpoint import SessionCheckpoint
+import pytest
+from eventmem.core.engine import root_id
+from eventmem.core.models import RecordInput, RevisionInput
+from eventmem.core.read_policy import ReadPolicy
+
+pytest_plugins = ('test_kin_mind',)
+
+
+def test_shared_session_background_checkpoint_can_compress_but_dispatch_cannot(setup, monkeypatch):
+    from kin_mind import host
+    mind, _, _ = setup
+    config = {'root': str(mind.engine.db.root), 'scope': mind.scope.model_dump(),
+              'agent_version': 'synthetic-v1', 'session_id': 'same-main',
+              'companion': {'shared_session': True}}
+    calls, providers = [], []
+    compressor = object()
+    def configured_compressor(engine, *, role):
+        assert role == 'memoryCompression'
+        providers.append(engine)
+        return compressor
+    monkeypatch.setattr(host.DeepSeek, 'from_engine', configured_compressor)
+    def build(self, snapshot, binding, **kwargs):
+        calls.append(kwargs)
+        return {'complete': True}
+    monkeypatch.setattr(SessionCheckpoint, 'build', build)
+    request = {'snapshot': {}, 'binding': {'conversationId': 'one-kin', 'generation': 5}}
+    host.dispatch(config, 'session-checkpoint', dict(request))
+    host.dispatch(config, 'session-checkpoint', {**request, 'allow_model': False})
+    host.dispatch(config, 'session-checkpoint', {**request, 'allow_model': False, 'shadow': True})
+    assert len(providers) == 1
+    assert [c['allow_model'] for c in calls] == [True, False, False]
+    assert [c['provider'] for c in calls] == [compressor, None, None]
+
+
+@pytest.mark.parametrize('metadata_heavy,capacity', [(False,None),(True,None),(True,20000)])
+def test_large_checkpoint_recovers_full_coverage_with_existing_summarizer(setup, metadata_heavy, capacity):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    snapshot['items'] = [dict(id=f'event-{i}', revision=1, role='user' if i % 2 == 0 else 'assistant',
+        text=f'合成事件{i}：用户甲转述用户乙看过灯塔。' + '这是完整保存的合成日常资料。' * (0 if metadata_heavy else 150),
+        at=f'2026-10-22T01:{i:02}:00Z', basis='explicit', speaker_person_id='person:person_a',
+        conversation_kind='private', conversation_key='synthetic-x', actor='synthetic-x' * (300 if metadata_heavy else 1), recipient_person_id='person:person_a') for i in range(16)]
+    binding = {'conversationId': 'one-kin', 'generation': 5}
+    waiting = checkpoints.build(snapshot, binding, allow_model=False, adaptive_budget=True,restore_capacity=capacity)
+    assert not waiting['complete'] and waiting['coverage']['omitted_ids']
+    calls = []
+    class Compressor:
+        def structured(self, name, schema, system, payload, **kwargs):
+            calls.append(payload)
+            return Compression(entries=[{'item_ids': payload['allowed_item_ids'],
+                'summary': '合成私聊中用户甲转述用户乙看过灯塔，并非用户乙直接发言；原文与原时间按来源编号保留。'}], omitted_ids=[]), {'model': 'synthetic', 'usage': {}}
+    restored = checkpoints.build(snapshot, binding, provider=Compressor(), adaptive_budget=True,restore_capacity=capacity)
+    assert calls and restored['complete'], restored.get('waitReason')
+    assert not restored['coverage']['omitted_ids'] and restored['tokens'] <= (capacity or INJECTION_CEILING)
+    if capacity:
+        assert restored['budgetPlan']['reason']=='native-window' and restored['budgetPlan']['limit']==capacity
+        assert restored['tokens'] > INJECTION_CEILING, 'large native recovery is not blocked at the legacy 8k cap'
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' not in i['text'] for i in calls[0]['items'])
+    assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
+
+
+def test_checkpoint_reserves_space_for_summary_provenance(setup):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    snapshot['items'] = [dict(id=f'event-{i}-' + 'source-identity-' * 3, revision=1, role='user' if i % 2 == 0 else 'assistant',
+        text=f'合成事件{i}：用户甲转述用户乙看过灯塔。' + '这是完整保存的合成日常资料。' * 75,
+        at=f'2026-10-22T01:{i:02}:00Z', basis='explicit', speaker_person_id='person:person_a',
+        conversation_kind='private', conversation_key='synthetic-x', recipient_person_id='person:person_a') for i in range(64)]
+    binding = {'conversationId': 'one-kin', 'generation': 5}
+    waiting = checkpoints.build(snapshot, binding, allow_model=False, adaptive_budget=True)
+    assert not waiting['complete'] and waiting['coverage']['omitted_ids']
+    calls = []
+    class Compressor:
+        def structured(self, name, schema, system, payload, **kwargs):
+            calls.append(payload)
+            return Compression(entries=[{'item_ids': payload['allowed_item_ids'],
+                'summary': '合成私聊中用户甲转述用户乙看过灯塔，并非用户乙直接发言；原文与原时间按来源编号保留。'}], omitted_ids=[]), {'model': 'synthetic', 'usage': {}}
+    restored = checkpoints.build(snapshot, binding, provider=Compressor(), adaptive_budget=True)
+    assert calls and restored['complete'], restored.get('waitReason')
+    assert len(restored['items']) < len(snapshot['items']), 'old exchanges are summarized, not dropped'
+    assert not restored['coverage']['omitted_ids'] and restored['tokens'] <= INJECTION_CEILING
+    assert all('speaker_person_id' in i['text'] and 'conversation_key' not in i['text'] for i in calls[0]['items'])
+    assert restored['generation'] == 5 and restored['conversationId'] == 'one-kin'
+
+
+def public_message(mind, kind='owner-message'):
+    memory = MemoryContinuity(mind)
+    memory.configure({'records': True, 'manifests': True, 'recall_purpose_policy': True})
+    event = {'id': 'synthetic-public-root', 'kind': kind, 'at': mind.clock(), 'text': 'We agreed to visit the synthetic lighthouse.'}
+    if kind == 'delivery':
+        event.update(state='accepted', channel='synthetic', message_id='synthetic-receipt')
+    receipt = memory.ingest(event)
+    return root_id(receipt['source_id']), receipt['source_id']
+
+
+@pytest.mark.parametrize('kind', ['owner-message', 'assistant-message', 'delivery'])
+def test_public_message_checkpoint_does_not_depend_on_self_knowledge_derived_from_it(setup, kind):
+    mind, _, _ = setup
+    original, source_id = public_message(mind, kind)
+    derived = mind.engine.add_record(RecordInput(kind='fact', scope=mind.scope, source_ids=[source_id], valid_from=mind.clock(),
+        content='A synthetic self-description derived from the same message.', attributes={'self_knowledge': True}),
+        'synthetic-derived-self-description')
+    policy = ReadPolicy.load(mind.engine, mind.scope, 'experience_recall')
+    assert policy.refusal(mind.engine.get(derived['id'])) == 'self_knowledge_requires_versioned_view'
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    assert snapshot['items'][0]['dependencies'] == [{'id': original, 'revision': 1}]
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, budget=4000, allow_model=False)
+    assert built['complete'] and checkpoints.validate(built)['valid']
+
+
+def test_public_checkpoint_still_checks_an_original_message_that_becomes_unavailable(setup):
+    mind, _, _ = setup
+    original, _ = public_message(mind)
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    built = checkpoints.build(checkpoints.snapshot(), {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    assert checkpoints.validate(built)['valid']
+    mind.engine.delete(original)
+    assert not checkpoints.validate(built)['valid']
+    snapshot = checkpoints.snapshot()
+    assert not snapshot['items'] and 'synthetic-public-root' in snapshot['invalidatedSources']
+
+
+def test_public_checkpoint_still_refuses_an_original_message_outside_the_read_purpose(setup):
+    mind, _, _ = setup
+    original, _ = public_message(mind)
+    mind.engine.revise(original, RevisionInput(command_id='synthetic-original-classification', expected_revision=1,
+        action='correct', attributes={'self_knowledge': True}))
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    assert snapshot['items'][0]['dependencies'] == [{'id': original, 'revision': 2}]
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    assert not checkpoints.validate(built)['valid']
+
+
+def test_selected_semantic_memory_keeps_its_own_dependency_and_rejects_a_correction(setup):
+    mind, _, _ = setup
+    _, source_id = public_message(mind)
+    semantic = mind.engine.add_record(RecordInput(kind='fact', scope=mind.scope, source_ids=[source_id], valid_from=mind.clock(),
+        content='The synthetic lighthouse visit is still planned.'), 'synthetic-selected-memory')
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    dependency = {'id': semantic['id'], 'revision': 1}
+    snapshot['linked'] = {'items': [{'id': 'synthetic-selected-memory', 'revision': 1, 'text': semantic['content'],
+        'basis': 'explicit', 'priority': 0, 'dependencies': [dependency]}], 'critical_ids': ['synthetic-selected-memory']}
+    built = checkpoints.build(snapshot, {'conversationId': 'synthetic-conversation', 'generation': 1}, budget=4000, allow_model=False)
+    selected = next(i for i in built['contextDependencies'] if i['id'] == 'synthetic-selected-memory')
+    assert selected['dependencies'] == [dependency] and checkpoints.validate(built)['valid']
+    mind.engine.revise(semantic['id'], RevisionInput(command_id='synthetic-memory-correction', expected_revision=1,
+        action='correct', content='The synthetic lighthouse visit was cancelled.'))
+    assert not checkpoints.validate(built)['valid']
+
+
+def record(event, snapshot='observation-1', action='keep'):
+    return {'decision': {'action': action, 'reason': 'Synthetic judgment', 'evidenceIds': []},
+            'snapshotId': snapshot, 'generation': 1, 'receipt': {'model': 'synthetic'}, 'eventId': event}
+
+
+def tables(mind):
+    with mind.engine.db.connect() as conn:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_a_judgment_reaches_the_host_without_a_mind_revision(setup):
+    # DB1-03: saving one session judgment used to rewrite the whole versioned mind state
+    # and append a history event. It now rides a single replaced row to the registry.
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    assert 'sessionAdvice' not in checkpoints.snapshot()
+    before = mind.read()['revision']
+    with mind.engine.db.connect(write=True) as conn:
+        submit(conn, mind.scope.key(), record('event-1'), mind.clock())
+    assert checkpoints.snapshot()['sessionAdvice'] == record('event-1')
+    with mind.engine.db.connect(write=True) as conn:
+        submit(conn, mind.scope.key(), record('event-2', action='compact'), mind.clock())
+    assert checkpoints.snapshot()['sessionAdvice']['eventId'] == 'event-2'
+    assert mind.read()['revision'] == before
+    with mind.engine.db.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM mind_session_advice').fetchone()[0] == 1
+
+
+def test_a_store_from_an_older_release_still_answers_from_its_state(setup):
+    mind, _, _ = setup
+    legacy = record('legacy-event', snapshot='legacy-observation')
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        state['session_advice'] = legacy
+        mind._save(conn, state)
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    assert 'mind_session_advice' not in tables(mind)
+    assert checkpoints.snapshot()['sessionAdvice'] == legacy
+    with mind.engine.db.connect(write=True) as conn:
+        submit(conn, mind.scope.key(), record('event-3'), mind.clock())
+        assert latest(conn, mind.scope.key(), mind._load(conn))['eventId'] == 'event-3'
+    assert checkpoints.snapshot()['sessionAdvice']['eventId'] == 'event-3'
+
+
+def test_checkpoints_are_not_copied_into_the_mind_store(setup):
+    # K3-12: every build used to insert the full checkpoint, dialogue included, into a
+    # table nothing read. The registry holds the checkpoint; the store keeps no copy.
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'manifests': True})
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    snapshot = checkpoints.snapshot()
+    assert snapshot['manifestVersion'] == 'continuity-manifest-v1'
+    snapshot['items'] = [{'id': 'owner-1', 'revision': 'r1', 'role': 'user', 'text': '今天去看海了。', 'at': '2026-09-24T01:00:00Z',
+                          'basis': 'owner-statement', 'delivery': 'not-confirmed-by-this-record'}]
+    built = checkpoints.build(snapshot, {'conversationId': 'c', 'generation': 1}, adaptive_budget=True, allow_model=False)
+    assert built['complete']
+    assert 'mind_continuity_manifests' not in tables(mind)
+
+
+def test_automatic_background_has_a_fixed_ceiling_and_ignores_free_room(setup):
+    # Current runtime information is shown without content fingerprints. Its
+    # automatic injection allowance remains bounded independently of free room.
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'context': True, 'native_window_context': True})
+    contexts = Contexts(mind)
+    first = contexts.build('', purpose='chat', session='main', runtime={'model': 'synthetic', 'contextAvailableTokens': 90000})
+    assert any(i['id'] == 'host-runtime' for i in first['index'])
+    again = contexts.build('', purpose='chat', session='main', runtime={'model': 'synthetic', 'contextAvailableTokens': 60000})
+    assert any(i['id'] == 'host-runtime' for i in again['index'])
+    changed = contexts.build('', purpose='chat', session='main', runtime={'model': 'another', 'contextAvailableTokens': 60000})
+    assert any(i['id'] == 'host-runtime' for i in changed['index'])
+    large = contexts.build('', purpose='chat', session='other', runtime={'model': 'synthetic', 'contextAvailableTokens': 200000,
+                                                                          'note': '很长的运行说明。' * 6000})
+    assert large['budget'] == INJECTION_CEILING and large['tokens'] <= INJECTION_CEILING
+
+
+def test_snapshot_cursors_name_actual_events_without_a_body_fingerprint(setup):
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'manifests': True})
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    event = {'id': 'synthetic-public-event', 'seq': 51, 'kind': 'owner-message', 'at': mind.clock(), 'text': '我在海边看到纸鹤。'}
+    before = checkpoints.snapshot([event])
+    after = checkpoints.snapshot([{**event, 'text': '我在海边看到一盏灯。'}])
+    assert before['cursors']['public'] == after['cursors']['public'] == [{'id': event['id'], 'seq': 51}]
+    assert before['sourceRevisions'] == after['sourceRevisions'] == {event['id']: 51}
+    assert before['watermarks']['pending_event_ids'] == [event['id']]
+    assert 'pending_digest' not in before['watermarks']
+    assert before['items'][0]['text'] != after['items'][0]['text']
+    built = checkpoints.build(before, {'conversationId': 'synthetic-conversation', 'generation': 1}, allow_model=False)
+    correlation = built['id']
+    assert correlation.startswith('checkpoint:') and len(correlation) == len('checkpoint:') + 32
+    built['items'][0]['text'] = '整理后的公开历史资料。'
+    checkpoints._seal(built)
+    assert built['id'] == correlation, 'one prepared object retains its correlation ID independently of its body'
+
+
+def test_the_injected_state_keeps_items_awaiting_review_marked_within_the_new_bounds(setup):
+    """CR-MIND-09: the memory projection follows interactionView: a dimension or a concern waiting
+    for review stays, marked 待复核, and six concerns are shown, not three."""
+    from kin_mind.context import affect_projection, REVIEW_MARK
+    layers = {"version": "affect-layers-v1", "basis": "derived",
+              "undertone": {"status": "tracking", "tau_hours": 24.0, "text": "踏实", "dimensions": ["contentment"], "leaning": {"contentment": 68}},
+              "feeling": {"text": "有点酸", "dimensions": ["jealousy"]},
+              "lingering": {"text": "那点小醋意还没散", "dimension": "jealousy", "direction": "up", "since": "2026-09-27T01:00:00+00:00", "strength": 9.3},
+              "vitals": {"heart_rate_bpm": 77, "breaths_per_min": 15, "basis": "derived", "status": "current"}}
+    view = {"dimensions": {"mood": {"value": 61.4}, "missing": {"value": 70.2, "needs_review": True}},
+            "continuity": {"activation": "active", "needs_review": False},
+            "appraisal_summary": {"understanding": {"text": "她今天很累", "needs_review": True}},
+            "expression": {"guidance": [{"text": g} for g in "abcd"]},
+            "selected_concerns": [{"id": "c" + str(i), "content": "心事" + str(i), "status": "active", "basis": "inferred",
+                                   "needs_review": i == 4} for i in range(8)],
+            "affect_layers": layers}
+    shown = affect_projection(view)
+    assert shown["dimensions"] == {"mood": 61, "missing": {"value": 70, "review": REVIEW_MARK}}
+    assert shown["understanding"]["review"] == REVIEW_MARK and len(shown["expression"]) == 3
+    assert [c["id"] for c in shown["concerns"]] == ["c" + str(i) for i in range(6)]
+    assert shown["concerns"][4]["review"] == REVIEW_MARK and "review" not in shown["concerns"][0]
+    # The derived layers in words, and a pulse coarse enough that the item's revision holds between turns.
+    assert shown["affect_layers"] == {"basis": "derived", "undertone": {"status": "tracking", "text": "踏实", "leaning": {"contentment": 68}},
+                                      "feeling": "有点酸", "lingering": "那点小醋意还没散",
+                                      "vitals": {"heart_rate_bpm": 75, "breaths_per_min": 16, "basis": "derived", "status": "current"}}
+    shadow = affect_projection({**view, "continuity": {"activation": "shadow"}})
+    assert shadow["concerns"] == [] and shadow["understanding"] is None and "affect_layers" not in shadow
+    # And it is what a built context injects.
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'context': True})
+    mind.read = lambda **_: view
+    built = Contexts(mind).build('', purpose='chat')
+    assert "待复核" in built["text"] and "missing" in built["text"] and "c5" in built["text"]
+    assert "有点酸" in built["text"] and "那点小醋意还没散" in built["text"]
+
+
+def test_each_review_attempt_is_its_own_job_and_its_answer_names_it(setup):
+    # CR-RT-08: the queue key was the snapshot alone, so a second attempt about the same
+    # snapshot came back as the first, finished job and nothing new was ever judged.
+    from kin_mind import session_advice
+    from kin_mind.appraisal import Appraisal, Appraisals
+    from kin_mind.session_advice import SessionAdvice
+    from test_kin_mind import FakeReviewer
+
+    class Reviewer(FakeReviewer):
+        def appraise(self, context):
+            self.calls += 1
+            return self.proposal, {"provider": "deepseek", "model": "synthetic"}
+
+    mind, _, _ = setup
+    context = {"id": "snapshot-8", "binding": {"generation": 2}, "evidence": [], "recent": []}
+    jobs = Appraisals(mind, session_context=context)
+    first = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")
+    assert (first["created"], first["state"], first["requestId"], first["snapshotId"]) == (True, "pending", "review:snapshot-8:1", "snapshot-8")
+    again = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")
+    assert again["id"] == first["id"] and again["created"] is False, "the same attempt is the same job"
+    reviewer = Reviewer(Appraisal(reason="Keep the session", session_advice=SessionAdvice(action="keep", reason="Fine")))
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:1")["state"] == "complete"
+    second = jobs.enqueue_maintenance("snapshot-8", "synthetic-v1", request_id="review:snapshot-8:2")
+    assert second["id"] != first["id"] and second["created"] and second["state"] == "pending", "a new attempt is a new job"
+    assert jobs.run_one(reviewer)["state"] == "complete"
+    assert reviewer.calls == 2
+    with mind.engine.db.connect() as conn:
+        carried = session_advice.latest(conn, mind.scope.key())
+    assert (carried["snapshotId"], carried["requestId"]) == ("snapshot-8", "review:snapshot-8:2")
+    # Without an attempt (an older host) the snapshot alone is the key, as it was.
+    assert jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"] == jobs.enqueue_maintenance("snapshot-9", "synthetic-v1")["id"]
+
+
+def test_the_tasks_a_migration_puts_into_its_snapshot_reach_the_restore_payload(setup):
+    # CR-RT-07: the snapshot action uses the tasks it is given to choose linked material but
+    # returns none, so a caller that does not put them back builds a checkpoint without them.
+    # The migration puts them back the way the host's collector does, and the payload the new
+    # thread is given carries every one of them.
+    mind, _, _ = setup
+    checkpoints = SessionCheckpoint(mind, agent_version='synthetic-v1')
+    tasks = [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张', 'private': 'not carried'}]
+    binding = {'conversationId': 'c', 'generation': 1}
+    snapshot = checkpoints.snapshot([], tasks=tasks)
+    assert 'tasks' not in snapshot
+    snapshot['items'] = [{'id': 'owner-1', 'revision': 'r1', 'role': 'user', 'text': '照片整理到哪了？', 'at': '2026-09-24T01:00:00Z',
+                          'basis': 'owner-statement', 'delivery': 'not-confirmed-by-this-record'}]
+    assert checkpoints.build(dict(snapshot), binding, budget=4000, allow_model=False, adaptive_budget=True)['payload']['tasks'] == []
+    snapshot['tasks'] = tasks
+    built = checkpoints.build(snapshot, binding, budget=4000, allow_model=False, adaptive_budget=True)
+    assert built['complete']
+    assert built['payload']['tasks'] == [{'id': 'task-1', 'status': 'running', 'goal': '整理照片', 'remaining': '还差两张'}]
+
+def test_recent_dialogue_excludes_platform_metadata(setup):
+    from kin_mind.dialogue import recent_dialogue
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'records':True})
+    MemoryContinuity(mind).ingest({'id':'metadata-projection','kind':'owner-message','at':mind.clock(),'text':'Synthetic message',
+        'conversation_id':'external-conversation','platform_message_id':'external-message','reply_context':{'text':'platform-context'}})
+    items = recent_dialogue(mind)
+    assert items and not any(k in item for item in items for k in ('conversation_id','platform_message_id','reply_context','reply_resolution'))
+
+def test_model_views_carry_no_platform_route_ids(setup):
+    """A Feishu route (feishu:<app>:<chat>, chat and open ids) stays with the host: what a model is
+    shown names people and the conversation kind only."""
+    import re
+    from kin_mind.companion_host import dispatch_companion
+    from kin_mind.companions import person_b as Y
+    from kin_mind.dialogue import recent_dialogue
+    from kin_mind.model_view import for_model
+    mind,_,_=setup;memory=MemoryContinuity(mind);memory.configure({'records':True,'manifests':False})
+    cfg={'root':str(mind.engine.db.root),'scope':mind.scope.model_dump(),'agent_version':'synthetic-v1','session_id':'synthetic-session'}
+    chat='oc_synthetic0000';key='feishu:cli_synthetic0000:'+chat
+    identity={'speaker_person_id':Y,'conversation_key':key,'source_message_id':'om_synthetic','chat_type':'p2p','route':{'person_id':Y,'chat_id':chat}}
+    got=dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'route-synthetic','text':'今天看了星星','at':'2026-10-22T03:10:00Z','received_at':'2026-10-22T03:10:01Z','identity':identity})
+    snapshot=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':key,'action':'session-snapshot','request':{}})
+    context=dispatch_companion(mind.engine,cfg,'companion-context',{'person_id':Y,'conversation_key':key,'query':'星星'})
+    with mind.engine.db.connect() as conn:
+        metadata=json.loads(conn.execute('SELECT data FROM sources WHERE id=?',(got['source_id'],)).fetchone()[0])['metadata']
+    assert metadata['conversation_key']==key and metadata['chat_id']==chat
+    shown={'recent':recent_dialogue(mind),'snapshot':snapshot,'checkpoint':SessionCheckpoint(mind).snapshot()['items'],
+           'context':context,'source':for_model({'id':got['source_id'],'metadata':metadata})}
+    assert shown['recent'] and snapshot['items'] and context['sources']
+    found=re.search(r'feishu:|\b(?:oc|ou|cli)_',json.dumps(shown,ensure_ascii=False))
+    assert not found, found
+    assert snapshot['items'][0]['recipient_person_id']==Y and snapshot['items'][0]['conversation_kind']=='p2p'
+
+
+def test_appraisal_recipient_targets_hide_delivery_routes():
+    from kin_mind.appraisal import _appraisal_context
+    route={'chat_id':'oc_synthetic0000','conversation_key':'feishu:cli_synthetic0000:oc_synthetic0000'}
+    shown=_appraisal_context({'recipient_targets':{'person:person_b':{'route':route,'person_id':'person:person_b','plans':[],'wishes':[]}}})
+    assert shown['recipient_targets']['person:person_b']['person_id']=='person:person_b' and 'route' not in shown['recipient_targets']['person:person_b']
+
+
+def test_companion_checkpoint_keeps_direct_conversation_separate_from_shared_sources(setup):
+    from kin_mind.companion_host import dispatch_companion
+    from kin_mind.companions import person_a as X,person_b as Y
+    mind,_,_=setup;memory=MemoryContinuity(mind);memory.configure({'records':True,'manifests':False})
+    cfg={'root':str(mind.engine.db.root),'scope':mind.scope.model_dump(),'agent_version':'synthetic-v1','session_id':'synthetic-session'}
+    for person,chat,text in [(X,'chat:x','用户甲转述：用户乙喜欢星星'),(Y,'chat:y','用户乙接入后的第一句')]:
+        identity={'speaker_person_id':person,'conversation_key':chat,'source_message_id':'om_'+chat[-1],'route':{'chat_id':chat}}
+        dispatch_companion(mind.engine,cfg,'companion-ingest',{'id':'anchor-'+chat,'text':text,'at':'2026-10-22T03:10:00Z','received_at':'2026-10-22T03:10:01Z','identity':identity})
+    result=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':'chat:y','action':'session-snapshot','request':{}})
+    assert [i['text'] for i in result['items']]==['用户乙接入后的第一句']
+    assert result['items'][0]['speaker_person_id']==Y
+    built=dispatch_companion(mind.engine,cfg,'companion-host-call',{'person_id':Y,'conversation_key':'chat:y','action':'session-checkpoint','request':{'snapshot':result,'binding':{'conversationId':'chat:y','generation':0},'allow_model':False}})
+    assert built['complete'] and '用户甲转述' not in json.dumps(built,ensure_ascii=False)
+
+def test_shared_checkpoint_preserves_people_scene_and_business_indices_without_model(setup):
+    from test_kin_mind import wish
+    from kin_mind.companion_view import CompanionView,companion_scope
+    mind,source,clock=setup
+    public_message(mind)
+    with companion_scope(CompanionView(mind.engine,mind.scope,'person:person_b','chat:y')):
+        wish(mind,source,'y-future',content='synthetic Y wish')
+    cp=SessionCheckpoint(mind,agent_version='synthetic-v1')
+    snap=cp.snapshot(include_business=True)
+    snap['items'][0].update(speaker_person_id='person:person_b',recipient_person_id='group:family',conversation_kind='group',conversation_key='chat:family',chat_id='oc_synthetic')
+    built=cp.build(snap,{'conversationId':'one','generation':5},allow_model=False,adaptive_budget=True)
+    assert built['complete']
+    payload=built['payload'];item=payload['publicHistory'][0]
+    assert item['speaker_person_id']=='person:person_b' and item['conversation_kind']=='group' and not {'chat_id','conversation_key'}&set(item)
+    assert payload['businessState']['wishes'][0]['recipient_person_id']=='person:person_b'
+    assert payload['businessState']['affect']['mood']['value']==mind.read()['dimensions']['mood']['value']
+    assert 'synthetic Y wish' not in json.dumps(payload['businessState'])
+    assert cp.validate(built)['valid']
+
+@pytest.mark.parametrize('capacity',[0,499,True,1000])
+def test_known_insufficient_native_capacity_never_falls_back_to_8k(setup,capacity):
+    mind,_,_=setup
+    cp=SessionCheckpoint(mind,agent_version='synthetic-v1')
+    with pytest.raises(ValueError):
+        cp.build(cp.snapshot(),{'conversationId':'one','generation':1},budget=2000,restore_capacity=capacity)
+
+
+def test_checkpoint_segments_reuse_only_unchanged_sources_and_compress_new_tail(setup):
+    from kin_mind.context import Compression
+    mind, _, _ = setup
+    ctx=Contexts(mind);calls=[]
+    class Compressor:
+        def structured(self,name,schema,system,payload,**kw):
+            calls.append(payload['allowed_item_ids'])
+            return Compression(entries=[{'item_ids':payload['allowed_item_ids'],'summary':'合成历史摘要，来源时间和对象保持。'}],omitted_ids=[]),{'model':'synthetic','usage':{}}
+    items=[{'id':'event-a','revision':1,'text':'原始合成历史。'*600,'basis':'explicit','facts':{}}]
+    one=ctx.pack_incremental(items,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert one['state']=='compressed' and one['model_requests']==1
+    two=ctx.pack_incremental([*items,{'id':'event-b','revision':1,'text':'新增合成历史。'*600,'basis':'explicit','facts':{}}],'history',1000,namespace='same-main',provider=Compressor(),require_all=True)
+    assert two['cache_hit'] and two['covered_ids']==['event-a','event-b']
+    assert calls[-1]==['event-b'] and two['model_requests']==1
+    same=ctx.pack_incremental(items,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert same['cache_hit'] and same['model_requests']==0
+    revised=[{**items[0],'revision':2,'text':'更正后的合成资料。'*600}]
+    changed=ctx.pack_incremental(revised,'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert not changed['cache_hit'] and changed['model_requests']==1
+    empty=ctx.pack_incremental([],'history',500,namespace='same-main',provider=Compressor(),require_all=True)
+    assert empty['covered_ids']==[] and empty['text']==''
+
+def test_a_lean_draft_snapshot_is_handed_the_last_turns_without_platform_identity(setup):
+    """Feature 2: memory-context, asked for them, adds the last turns -- role, words, time and source id only."""
+    from kin_mind.host import dispatch
+    mind, _, _ = setup
+    MemoryContinuity(mind).configure({'records':True})
+    MemoryContinuity(mind).ingest({'id':'lean-turn','kind':'owner-message','at':mind.clock(),'text':'Synthetic last turn',
+        'conversation_key':'platform:app:chat','chat_id':'chat'})
+    cfg = {'root': str(mind.engine.db.root), 'scope': mind.scope.model_dump(), 'agent_version': 'synthetic-v1'}
+    built = dispatch(cfg, 'memory-context', {'query': 'last', 'purpose': 'proactive', 'recent_dialogue': True})
+    assert [turn['text'] for turn in built['recent_dialogue']] == ['Synthetic last turn']
+    assert set(built['recent_dialogue'][0]) <= {'role', 'text', 'occurred_at', 'source_id', 'speaker_person_id', 'recipient_person_id'}
+    assert 'recent_dialogue' not in dispatch(cfg, 'memory-context', {'query': 'last', 'purpose': 'proactive'})

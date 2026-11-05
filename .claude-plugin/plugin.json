@@ -1,8 +1,0 @@
-{
-  "name":"memorypalace",
-  "version":"1.0.0",
-  "description":"MemoryPalace memory capture, scoped recall and session continuity",
-  "author":{"name":"mycyg"},
-  "repository":"https://github.com/mycyg/memory-palace",
-  "license":"MIT"
-}

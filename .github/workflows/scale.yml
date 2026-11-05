@@ -3,7 +3,6 @@ on:
   workflow_dispatch:
     inputs:
       scale:
-        description: 'full: 100k memories + 1m 1024-dimensional vectors'
         type: choice
         options: [smoke, full]
         default: smoke
@@ -13,6 +12,9 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: core
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -24,4 +26,4 @@ jobs:
         if: always()
         with:
           name: scale-results
-          path: scale.json
+          path: core/scale.json

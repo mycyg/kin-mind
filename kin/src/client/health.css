@@ -1,0 +1,30 @@
+/* Her health on the settings page: a soft light for how she is, each problem with since when and what to do */
+.kin-health { --kin-health: #8ccfae; }
+.kin-health[data-level="warn"] { --kin-health: #efab6c; }
+.kin-health[data-level="error"] { --kin-health: #d4567e; }
+.kin-health-head { display: flex; align-items: center; gap: 12px; padding: 4px 0 10px; }
+.kin-health-head > div { flex: 1; min-width: 0; }
+.kin-health-head p { margin: 0 0 2px; font-size: 15px; font-weight: 600; }
+.kin-health-times { display: flex; flex-wrap: wrap; gap: 0 12px; }
+.kin-health-times span { white-space: nowrap; }
+.kin-health-dot, .kin-problems li::before {
+  flex: none; width: 10px; height: 10px; border-radius: 50%; corner-shape: round;
+  background: var(--kin-health); box-shadow: 0 0 0 4px color-mix(in srgb, var(--kin-health) 22%, transparent), 0 0 14px var(--kin-health);
+}
+.kin-health[data-level="error"] .kin-health-dot { animation: kin-health-breathe 2.6s var(--kin-ease) infinite alternate; }
+@keyframes kin-health-breathe { to { box-shadow: 0 0 0 7px color-mix(in srgb, var(--kin-health) 10%, transparent), 0 0 20px var(--kin-health); } }
+.kin-problems { margin: 2px 0 6px; }
+.kin-problems li { position: relative; padding-left: 20px; }
+.kin-problems li::before { content: ""; position: absolute; left: 2px; top: 15px; width: 7px; height: 7px; box-shadow: none; }
+.kin-problems li[data-level="warn"] { --kin-health: #efab6c; }
+.kin-problems li[data-level="error"] { --kin-health: #d4567e; }
+.kin-problem-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 2px 12px; }
+.kin-problem-head strong { font-size: 13.5px; font-weight: 600; }
+.kin-problem-detail { margin: 2px 0 0; font-size: 12.5px; line-height: 1.6; color: var(--kin-ink-2); overflow-wrap: anywhere; }
+.kin-problem-todo { margin: 4px 0 0; padding: 6px 11px; border-radius: 12px; font-size: 12.5px; line-height: 1.6; background: var(--kin-fill-2); }
+.kin-health .kin-switch-row { border-top: 1px solid var(--kin-hairline); }
+.kin-health-line { margin: 8px 0 0; font-size: 12.5px; line-height: 1.7; color: var(--kin-ink-2); }
+.kin-health-past { margin-top: 8px; font-size: 12.5px; color: var(--kin-ink-2); }
+.kin-health-past summary { cursor: pointer; width: fit-content; text-decoration: underline dotted; text-underline-offset: 3px; }
+.kin-health-past .kin-list li { padding: 5px 0; }
+.kin-health-note { color: color-mix(in srgb, var(--kin-rose) 70%, var(--kin-ink)); }

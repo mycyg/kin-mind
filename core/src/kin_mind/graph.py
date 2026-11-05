@@ -1,0 +1,845 @@
+"""Versioned event graph. Edges point to evidence, never replace it."""
+from __future__ import annotations
+
+import json
+import os
+from datetime import timedelta
+from typing import Literal
+
+from pydantic import Field
+
+from eventmem.core.db import Conflict, Missing, digest, dumps, tokenize
+from eventmem.core.models import Model
+from eventmem.core.read_policy import (
+    ISOLATED,
+    ReadPolicy,
+    SourceFacts,
+    enabled_for,
+    ref_classes,
+)
+
+from . import evidence_refs
+from .autonomy_schema import enabled
+from .state import timestamp
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS mind_graph_nodes(
+ id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,revision INTEGER NOT NULL,
+ occurred_at TEXT NOT NULL,updated_at TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mind_graph_owner ON mind_graph_nodes(scope,kind,json_extract(data,'$.owner_id'),state);
+CREATE INDEX IF NOT EXISTS mind_graph_node_scope ON mind_graph_nodes(scope,kind,occurred_at DESC,id);
+CREATE TABLE IF NOT EXISTS mind_graph_edges(
+ id TEXT PRIMARY KEY,scope TEXT NOT NULL,subject TEXT NOT NULL,object TEXT NOT NULL,
+ predicate TEXT NOT NULL,layer TEXT NOT NULL,revision INTEGER NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mind_graph_left ON mind_graph_edges(scope,subject,state);
+CREATE INDEX IF NOT EXISTS mind_graph_right ON mind_graph_edges(scope,object,state);
+CREATE TABLE IF NOT EXISTS mind_graph_revisions(
+ id TEXT NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(id,revision));
+CREATE TABLE IF NOT EXISTS mind_graph_commands(
+ id TEXT NOT NULL,scope TEXT NOT NULL,digest TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,id));
+CREATE TABLE IF NOT EXISTS mind_graph_identity(
+ scope TEXT NOT NULL,identity TEXT NOT NULL,node_id TEXT NOT NULL,PRIMARY KEY(scope,identity));
+CREATE VIRTUAL TABLE IF NOT EXISTS mind_graph_search USING fts5(id UNINDEXED,tokens);
+"""
+
+RELATIONS = {"participates", "part_of", "continues", "responds_to", "produces", "delivers",
+             "shares", "corrects", "resolves", "supports", "refutes", "causes", "association",
+             "follows", "about", "related"}
+
+GET_MANY_PAGE_SIZE = 400
+# Where an item keeps the references it may not stand on (see `_unmixed`); the isolation
+# migration's name for the same thing.
+CONFIGURATION_EVIDENCE = "configuration_evidence"
+# Set in `meta` once the node index shares its rowids with `mind_graph_nodes`. From then on an
+# update removes its old index row by rowid; before, the only way was a scan of the whole index.
+SEARCH_ALIGNED = "mind_graph_search_rowid"
+_ready = set()
+
+
+def _store_key(path):
+    """This store file, as opposed to whatever file is at its path later: a restore that puts
+    another database in its place gets its schema checked again."""
+    try:
+        return (str(path), os.stat(path).st_ino)
+    except OSError:
+        return (str(path), None)
+
+
+def search_tokens(value):
+    return tokenize(" ".join(str(value.get(k, "")) for k in ("title", "text", "aliases")))
+
+
+def _aligned(conn):
+    return bool(conn.execute("SELECT 1 FROM meta WHERE key=?", (SEARCH_ALIGNED,)).fetchone())
+
+
+def index_node(conn, value):
+    """The node's index row, rewritten after the node itself. An erased node has none."""
+    rowid = conn.execute("SELECT rowid FROM mind_graph_nodes WHERE id=?", (value["id"],)).fetchone()[0]
+    if _aligned(conn):
+        conn.execute("DELETE FROM mind_graph_search WHERE rowid=?", (rowid,))
+    else:
+        conn.execute("DELETE FROM mind_graph_search WHERE id=?", (value["id"],))
+    if value.get("state") != "deleted":
+        conn.execute("INSERT INTO mind_graph_search(rowid,id,tokens) VALUES(?,?,?)" if _aligned(conn)
+                     else "INSERT INTO mind_graph_search(id,tokens) VALUES(?,?)",
+                     ((rowid,) if _aligned(conn) else ()) + (value["id"], search_tokens(value)))
+
+
+def align_search(conn):
+    """Rebuild the node index with the nodes' own rowids, once. Returns the rows indexed."""
+    conn.execute("DELETE FROM mind_graph_search")
+    rows = conn.execute("SELECT rowid,id,data FROM mind_graph_nodes WHERE state!='deleted'").fetchall()
+    conn.executemany("INSERT INTO mind_graph_search(rowid,id,tokens) VALUES(?,?,?)",
+                     [(row[0], row[1], search_tokens(json.loads(row[2]))) for row in rows])
+    conn.execute("INSERT OR IGNORE INTO meta VALUES(?,1)", (SEARCH_ALIGNED,))
+    return len(rows)
+
+
+def query_terms(query, limit=40):
+    """Retain the user's language instead of taking ASCII-first tokenizer output."""
+    words = list(dict.fromkeys(tokenize(query).split()))
+    lower = query.casefold()
+    stop = {"的","了","是","我","你","在","和","也","有","这","个","一个","我们","他们","可以","进行","相关","已经"}
+    meaningful = [w for w in words if w not in stop and not w.isdecimal()]
+    selected = meaningful or words
+    selected.sort(key=lambda w: (lower.find(w) if w in lower else len(lower), -len(w)))
+    return selected[:limit]
+
+
+class GraphNode(Model):
+    key: str = Field(min_length=1, max_length=160)
+    id: str | None = None
+    kind: Literal["event", "thread", "entity", "finding", "association"]
+    title: str = Field(min_length=1, max_length=300)
+    text: str = Field(default="", max_length=4000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=16)
+    basis: Literal["explicit", "documented", "inferred", "internal_thought"] = "inferred"
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    occurred_at: str | None = None
+    entity_type: Literal["person", "agent", "project", "organization", "place", "other"] | None = None
+    aliases: list[str] = Field(default_factory=list, max_length=12)
+    owner_id: str | None = None
+    expected_revision: int | None = None
+
+
+class GraphEdge(Model):
+    subject: str
+    object: str
+    relation: Literal["participates", "part_of", "continues", "responds_to", "produces", "delivers", "shares", "corrects", "resolves", "supports", "refutes", "causes", "association", "follows", "about", "related"]
+    evidence_ids: list[str] = Field(min_length=1, max_length=16)
+    reason: str = Field(min_length=1, max_length=1200)
+    basis: Literal["explicit", "documented", "inferred", "internal_thought"] = "inferred"
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    role: str | None = Field(default=None, max_length=160)
+    valid_from: str | None = None
+    valid_until: str | None = None
+
+
+class GraphAssessment(Model):
+    nodes: list[GraphNode] = Field(default_factory=list, max_length=12)
+    edges: list[GraphEdge] = Field(default_factory=list, max_length=24)
+
+
+class EventGraph:
+    def __init__(self, mind):
+        self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
+        key = _store_key(self.engine.db.path)
+        if key in _ready:
+            # Once per process and store: the tables exist, and running the script again took
+            # the schema lock on every construction, which is every host action.
+            return
+        with self.engine.db.connect() as conn:
+            conn.executescript(SCHEMA)
+            from .lifecycle_schema import initialize_graph_refs
+            initialize_graph_refs(conn)
+        with self.engine.db.connect(write=True) as conn:
+            if not _aligned(conn) and not conn.execute("SELECT 1 FROM mind_graph_nodes LIMIT 1").fetchone():
+                # A new store starts aligned; an existing one is aligned by the deploy migration.
+                align_search(conn)
+        _ready.add(key)
+
+    def identifier(self, kind, key):
+        return "graph_" + kind + "_" + digest([self.scope.key(), key])[:28]
+
+    def get(self, conn, identifier, *, follow=False):
+        for table in ("mind_graph_nodes", "mind_graph_edges"):
+            row = conn.execute(f"SELECT data FROM {table} WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone()
+            if row:
+                value = json.loads(row[0])
+                if follow and value.get("merged_into"):
+                    return self.get(conn, value["merged_into"], follow=True)
+                return value
+        raise Missing(identifier)
+
+    def _get_many(self, conn, identifiers):
+        """Read a known id list in bounded IN-list pages across both graph tables.
+
+        An id in neither table is answered by `get`, which raises Missing exactly as
+        before. The final mapping follows the caller's order, independent of the
+        database's row order.
+        """
+        ordered = list(identifiers)
+        found = {}
+        for table in ("mind_graph_nodes", "mind_graph_edges"):
+            missing = list(dict.fromkeys(i for i in ordered if i not in found))
+            if not missing:
+                break
+            for start in range(0, len(missing), GET_MANY_PAGE_SIZE):
+                page = missing[start:start + GET_MANY_PAGE_SIZE]
+                marks = ",".join("?" for _ in page)
+                for row in conn.execute(f"SELECT id,data FROM {table} WHERE scope=? AND id IN ({marks})",
+                                        [self.scope.key(), *page]):
+                    found.setdefault(row["id"], json.loads(row["data"]))
+        return {i: found[i] if i in found else self.get(conn, i) for i in ordered}
+
+    def _unmixed(self, conn, value):
+        """What a graph item may stand on (K4-13). Experience is never mixed with configuration,
+        synthetic examples or the host's own bookkeeping: when both are cited, the others move to
+        `configuration_evidence` — kept, never evidence — exactly as the isolation migration moves
+        them, so no writer can mix a node again after the migration separated it. An item that
+        cites nothing but those keeps them, and the read policy classifies it as what they are."""
+        refs = value.get("evidence") or []
+        if len(refs) < 2 or not enabled_for(conn, self.scope.key()):
+            return value
+        # What a source is -- its class, its authority -- is read from the source's own row: a
+        # stored reference this item already had no longer carries it (evidence_refs).
+        sources = SourceFacts(conn)
+        classes = ref_classes(self.engine, conn, self.scope, refs, sources)
+        outside = [ref for ref, found in zip(refs, classes) if found.kind in ISOLATED]
+        if not outside or len(outside) == len(refs):
+            return value
+        kept = [ref for ref, found in zip(refs, classes) if found.kind not in ISOLATED]
+        dropped = {ref["source_id"] for ref in outside} - {ref["source_id"] for ref in kept}
+        held = list(value.get(CONFIGURATION_EVIDENCE) or [])
+        known = {(ref.get("record_id"), ref.get("revision")) for ref in held if isinstance(ref, dict)}
+        held.extend(ref for ref in outside if (ref.get("record_id"), ref.get("revision")) not in known)
+        out = {**value, "evidence": kept, CONFIGURATION_EVIDENCE: held,
+               "source_ids": sorted(set(value.get("source_ids") or ()) - dropped)
+               or sorted({ref["source_id"] for ref in kept})}
+        if out.get("basis") == "explicit" and not any(sources.of(ref).get("authority") == "explicit" for ref in kept):
+            # The rule `apply()` uses whenever explicit evidence is lost.
+            out["basis"] = "inferred"
+        return out
+
+    def _put(self, conn, value, *, edge=False, isolate=True):
+        # `isolate=False` is for the isolation migration's own undo, which puts back exactly
+        # the archived version it took apart.
+        value = dict(value)
+        self._guard_fact_proof(conn, value.get("evidence") or [], kind=value.get("kind"), basis=value.get("basis"))
+        value = self._unmixed(conn, value) if isolate else value
+        # Once the graph is marked, what it stores of a reference is what its readers read
+        # (evidence_refs): the node, its revision, and every later copy of either.
+        marked = evidence_refs.table_marked(conn, self.scope.key(), "mind_graph_nodes")
+        if marked:
+            value = dict(evidence_refs.lean(value))
+        try:
+            old = self.get(conn, value["id"])
+        except Missing:
+            old = None
+        strip = lambda v: {k: x for k, x in v.items() if k not in {"revision", "updated_at", "needs_review"}}
+        if old and (strip(old) == strip(value) or (marked or evidence_refs.has_slim(old))
+                    and strip(evidence_refs.lean(old)) == strip(evidence_refs.lean(value))):
+            # Nothing changed but the shape of a reference: a row the migration has not reached
+            # yet, or one it has, is not a new revision.
+            return old
+        value.update(revision=(old or {}).get("revision", 0) + 1, updated_at=self.mind.clock())
+        value.setdefault("state", "active")
+        value.setdefault("occurred_at", self.mind.clock())
+        if edge:
+            conn.execute("INSERT OR REPLACE INTO mind_graph_edges VALUES(?,?,?,?,?,?,?,?,?)", (
+                value["id"], self.scope.key(), value["subject"], value["object"], value["predicate"], value["layer"], value["revision"], value["state"], dumps(value)))
+        else:
+            # An upsert, not a replace: the row keeps its rowid, which is the index row's too.
+            conn.execute("INSERT INTO mind_graph_nodes VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                         "scope=excluded.scope,kind=excluded.kind,revision=excluded.revision,occurred_at=excluded.occurred_at,"
+                         "updated_at=excluded.updated_at,state=excluded.state,data=excluded.data", (
+                value["id"], self.scope.key(), value["kind"], value["revision"], value["occurred_at"], value["updated_at"], value["state"], dumps(value)))
+            index_node(conn, value)
+            conn.execute("DELETE FROM mind_graph_record_refs WHERE scope=? AND node_id=?", (self.scope.key(), value["id"]))
+            record_ids = set(value.get("record_ids", [])) | {r["record_id"] for r in value.get("evidence", [])}
+            conn.executemany("INSERT OR IGNORE INTO mind_graph_record_refs VALUES(?,?,?)",
+                             [(self.scope.key(), rid, value["id"]) for rid in record_ids])
+        conn.execute("INSERT INTO mind_graph_revisions VALUES(?,?,?,?)", (value["id"], value["revision"], "edge" if edge else "node", dumps(value)))
+        from .lifecycle import graph_changed
+        graph_changed(conn, self.scope.key(), value, old, self.mind.clock())
+        return value
+
+    def _guard_fact_proof(self, conn, refs, *, kind, basis):
+        """Imagination can inform an internal association; it cannot certify external facts."""
+        if kind == "finding" and basis == "internal_thought":
+            raise Conflict("Internal imagination cannot be stored as a factual finding", code="graph-imagination-not-evidence")
+        if kind not in {"finding", "event", "entity", "thread", "edge"} or basis == "internal_thought":
+            return
+        sources = SourceFacts(conn)
+        for ref in refs:
+            facts = sources.of(ref)
+            metadata = facts.get("metadata") or {}
+            if (facts.get("namespace") == "kin-dream" or metadata.get("basis") in ("imagined", "imagination")
+                    or metadata.get("content_class") == "dream_imagination"):
+                raise Conflict("Dream or imagined content cannot provide factual graph evidence", code="graph-imagination-not-evidence", target=ref.get("source_id"))
+
+    def _repoint(self, conn, edge, subject, object_id, before, changed):
+        """An edge moved to new ends is the edge of those ends (K4-09). Its identity is computed
+        again from them, as `link` computes it; its evidence joins an edge those ends already
+        have; the old edge is retracted and names where it went. A merged or split relationship
+        is then never shown twice, and a later `link` finds the one edge. `before` keeps what an
+        undo puts back: the old edge, the edge that absorbed it, or nothing for a new one."""
+        before.setdefault(edge["id"], edge)
+        if subject == object_id:
+            changed.append(self._put(conn, {**edge, "state": "retracted"}, edge=True))
+            return
+        moved_id = self.identifier("edge", [subject, edge["predicate"], object_id, edge.get("layer"), edge.get("role")])
+        try:
+            existing = self.get(conn, moved_id)
+        except Missing:
+            existing = None
+        before.setdefault(moved_id, existing)
+        if existing is None:
+            moved = {**edge, "id": moved_id, "subject": subject, "object": object_id, "state": "active"}
+            moved.pop("moved_to", None)
+        else:
+            evidence = {r["record_id"]: r for r in [*existing.get("evidence", []), *edge.get("evidence", [])]}
+            moved = {**existing, "evidence": list(evidence.values()), "state": "active",
+                     "source_ids": sorted(set(existing.get("source_ids", [])) | set(edge.get("source_ids", [])))}
+        changed.append(self._put(conn, moved, edge=True))
+        changed.append(self._put(conn, {**edge, "state": "retracted", "moved_to": moved_id}, edge=True))
+
+    def proof(self, conn, identifiers, allowed=None):
+        roots = []
+        for identifier in identifiers:
+            if identifier.startswith(("src_", "mem_")):
+                roots.append(identifier)
+            else:
+                roots.extend(self.ensure(conn, identifier).get("source_ids", []))
+        refs = self.mind._evidence(conn, list(dict.fromkeys(roots)))
+        if not refs or not self.mind._fresh(conn, refs):
+            raise Conflict("Graph evidence is missing or needs review")
+        if allowed is not None and any(r["source_id"] not in allowed and r["record_id"] not in allowed for r in refs):
+            raise Conflict("Graph evidence was not part of this evaluation")
+        return refs
+
+    def policy(self, conn, purpose="experience_recall", policy=None):
+        return policy if policy is not None else ReadPolicy.load(self.engine, self.scope, purpose, conn=conn)
+
+    def node_records(self, conn, nodes):
+        """The records a set of nodes projects or cites, keyed by id. A projected self-knowledge
+        claim carries no marker of its own: only its record says what it is."""
+        ids = list(dict.fromkeys(i for node in nodes for i in (*node.get("record_ids", []),
+                   *(r["record_id"] for r in node.get("evidence", [])),
+                   *([node["id"]] if str(node.get("id", "")).startswith("mem_") else []))))
+        found = {}
+        for start in range(0, len(ids), 400):
+            page = ids[start:start + 400]
+            marks = ",".join("?" for _ in page)
+            for row in conn.execute(f"SELECT id,data FROM records WHERE id IN ({marks}) AND deleted=0", page):
+                found[row["id"]] = json.loads(row["data"])
+        return found
+
+    def visible(self, conn, nodes, policy):
+        """Keep the nodes and edges this read may see. Their records are loaded once, and the rows
+        of the sources an item without records is classified by, once each."""
+        if not policy.enabled:
+            return list(nodes)
+        records, sources = self.node_records(conn, nodes), SourceFacts(conn)
+        return [n for n in nodes if policy.node_visible(n, records, sources)]
+
+    def fresh(self, conn, node):
+        return self._fresh_value(conn, node)
+
+    def _fresh_value(self, conn, node, node_cache=None, evidence_cache=None):
+        """Evaluate freshness, optionally reusing results in one caller-owned snapshot."""
+        identifier = node.get("id")
+        revision = node.get("revision")
+        cached = node_cache.get(identifier) if node_cache is not None and identifier is not None else None
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+
+        def remember(value):
+            if node_cache is not None and identifier is not None:
+                node_cache[identifier] = (revision, value)
+            return value
+
+        def evidence_fresh(refs):
+            if evidence_cache is None:
+                return self.mind._fresh(conn, refs)
+            for ref in refs:
+                # These are exactly the fields Mind._fresh reads. Metadata and display
+                # fields do not affect whether this evidence reference is current.
+                key = tuple(ref.get(field) for field in (
+                    "source_id", "record_id", "namespace", "source_key"))
+                if key not in evidence_cache:
+                    evidence_cache[key] = self.mind._fresh(conn, [ref])
+                if not evidence_cache[key]:
+                    return False
+            return True
+
+        try:
+            if node.get("reference_status") in {"unverified", "archived", "superseded", "deleted"}:
+                return remember(False)
+            if node["id"].startswith("mem_"):
+                record = self.engine._get(conn,node["id"])
+                if record["revision"] != node.get("reference_revision") or record["status"] != "active":
+                    return remember(False)
+            if node.get("kind") == "edge":
+                def endpoint_fresh(endpoint):
+                    # graph.read evaluates its returned nodes before its induced edges.
+                    # A cached endpoint is therefore the same row in this read snapshot,
+                    # and does not need another point lookup.
+                    known = node_cache.get(endpoint) if node_cache is not None else None
+                    return known[1] if known is not None else self._fresh_value(
+                        conn, self.get(conn, endpoint), node_cache=node_cache,
+                        evidence_cache=evidence_cache)
+
+                if any(not endpoint_fresh(nid) for nid in (node["subject"], node["object"])):
+                    return remember(False)
+            return remember(node.get("state") == "active" and bool(node.get("evidence"))
+                            and evidence_fresh(node["evidence"]))
+        except (Missing, Conflict):
+            return remember(False)
+
+    def ensure(self, conn, identifier):
+        """Project canonical domain objects without copying their full contents."""
+        try:
+            return self.get(conn, identifier, follow=True)
+        except Missing:
+            pass
+        if identifier.startswith("src_"):
+            return self.ensure(conn, self.proof(conn, [identifier])[0]["record_id"])
+        if identifier.startswith("mem_"):
+            record = self.engine._get(conn, identifier)
+            if record["scope"] != self.scope.model_dump():
+                raise Conflict("Graph reference crossed memory scopes")
+            refs = self.available_proof(conn,record["source_ids"])
+            # A new projection says what its record is. Stored nodes are never rewritten here:
+            # a node whose evidence is configuration keeps its basis and is hidden at read time.
+            return self._put(conn, {"id": identifier, "kind": record["kind"], "title": record["title"],
+                "text": "", "record_ids": [identifier], "source_ids": record["source_ids"], "evidence": refs,
+                "basis": self.policy(conn, "audit").basis(record), "occurred_at": record["valid_from"], "reference_revision": record["revision"], "reference_status": record["status"]})
+        row = conn.execute("SELECT data FROM mind_memory_nodes WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone()
+        if row:
+            value = json.loads(row[0])
+            refs = self.proof(conn, value.get("source_ids", []))
+            return self._put(conn, {"id": identifier, "kind": value["kind"], "title": value.get("title") or value.get("name") or value.get("topic") or value["kind"],
+                "text": value.get("summary", ""), "record_ids": value.get("record_ids", []), "source_ids": value["source_ids"], "evidence": refs,
+                "reference_revision": value["revision"], "created_by": value.get("created_by"), "basis": "observed",
+                "occurred_at": value.get("first_at") or value.get("last_at") or value["updated_at"]})
+        row = conn.execute("SELECT data FROM mind_explorations WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone() if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_explorations'").fetchone() else None
+        if row:
+            value = json.loads(row[0]); refs = self.proof(conn, [value["source_id"]])
+            return self._put(conn, {"id": identifier, "kind": "exploration", "title": value.get("topic") or "Exploration", "text": "",
+                "source_ids": [value["source_id"]], "evidence": refs, "basis": "documented", "occurred_at": value.get("completed_at") or self.mind.clock()})
+        raise Missing(identifier)
+
+    def available_proof(self, conn, identifiers):
+        refs = []
+        for identifier in identifiers:
+            try:
+                refs.extend(self.proof(conn, [identifier]))
+            except (Missing, Conflict):
+                pass
+        return refs
+
+    def project_memory(self, conn, value):
+        refs = self.available_proof(conn, value.get("source_ids", []))
+        try:
+            old = self.get(conn, value["id"])
+        except Missing:
+            old = {}
+        return self._put(conn, {**old, "id": value["id"], "kind": value["kind"],
+            "title": value.get("title") or value.get("name") or value.get("topic") or value["kind"],
+            "text": value.get("summary", ""), "source_ids": value["source_ids"], "record_ids": value.get("record_ids", []),
+            "evidence": refs, "basis": "observed", "reference_revision": value["revision"], "created_by": value.get("created_by"),
+            "occurred_at": value.get("first_at") or value.get("last_at") or value["updated_at"]})
+
+    def link(self, conn, subject, predicate, object_id, refs, *, basis="observed", reason="", role=None, confidence=1, valid_from=None, valid_until=None, event_id=None):
+        if predicate not in RELATIONS:
+            raise ValueError("Unknown graph relationship")
+        left, right = self.ensure(conn, subject), self.ensure(conn, object_id)
+        if left["id"] == right["id"]:
+            raise Conflict("An event cannot provide its own relationship evidence")
+        if predicate == "causes" and not reason:
+            raise Conflict("Causal claims need a stated evidence basis")
+        for value in (valid_from, valid_until):
+            if value:
+                timestamp(value)
+        layer = "association" if predicate == "association" or basis == "internal_thought" else "evidence"
+        identifier = self.identifier("edge", [left["id"], predicate, right["id"], layer, role])
+        try:
+            old = self.get(conn, identifier)
+        except Missing:
+            old = {}
+        evidence = {r["record_id"]: r for r in [*old.get("evidence", []), *refs]}
+        edge = self._put(conn, {**old, "id": identifier, "kind": "edge", "subject": left["id"], "object": right["id"], "predicate": predicate,
+            "layer": layer, "basis": basis, "confidence": confidence, "reason": reason, "role": role,
+            "source_ids": sorted({r["source_id"] for r in evidence.values()}), "evidence": list(evidence.values()),
+            "valid_from": valid_from, "valid_until": valid_until, "assessment_event": event_id, "state": "active"}, edge=True)
+        prior_proof = {(r["record_id"], r["revision"]) for r in old.get("evidence", [])}
+        new_proof = any((r["record_id"], r["revision"]) not in prior_proof for r in refs)
+        if predicate == "refutes" and layer == "evidence" and (not old or old.get("state") != "active" or new_proof):
+            from .procedures import invalidate_relation
+            invalidate_relation(self.engine, conn, self.scope.key(), (left["id"], right["id"]), edge["id"])
+        return edge
+
+    def runtime(self, conn, event, receipt, event_id):
+        refs = self.proof(conn, [receipt["source_id"]])
+        identifier = self.identifier("event", event_id)
+        kind = event["kind"]
+        node = self._put(conn, {"id": identifier, "kind": "event", "title": {"owner-message":"用户消息","assistant-message":"公开回复","delivery":"发送回执","task-result":"任务结果","artifact-created":"制作文件","artifact-observed":"读取文件","exploration-result":"探索结果"}.get(kind,kind), "text": "", "runtime_event_id": event_id,
+            "source_ids": [receipt["source_id"]], "record_ids": [receipt["record_id"]], "evidence": refs,
+            "basis": "explicit" if kind == "owner-message" else "inferred" if kind in {"assistant-message", "exploration-result"} else "observed",
+            "occurred_at": event["at"], "channel": event.get("channel"), "operation": kind, "historical": bool(event.get("historical"))})
+        routing = {k: event[k] for k in ("conversation_id", "platform_message_id", "reply_to_message_id", "root_message_id", "thread_id", "reply_context") if k in event}
+        resolution = event.get("reply_resolution") or {}
+        if kind == "owner-message" and resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:
+            candidate = resolution["candidates"][0]
+            self.link(conn, identifier, "responds_to", candidate["share_id"], refs,
+                      reason="Host-observed reply to an accepted platform message", role=candidate["bubble_id"])
+            routing.update(reply_share_id=candidate["share_id"], reply_bubble_id=candidate["bubble_id"],
+                           activity_refs=candidate.get("activity_refs", []), reply_basis=resolution.get("basis"))
+            for activity in candidate.get("activity_refs", []):
+                # This edge identifies the report the accepted message referred to. A dream stays
+                # an autobiographical pointer, never a graph finding or an observed event.
+                if activity.get("kind") == "exploration":
+                    self.link(conn, identifier, "about", activity["id"], refs,
+                              reason="Original exploration referenced by the accepted share")
+        if routing:
+            node = self._put(conn, {**node, **routing})
+        for key, relation in (("work_id", "produces" if kind == "artifact-created" else "about"), ("artifact_id", "about"), ("share_id", "delivers")):
+            if receipt.get(key):
+                self.link(conn, identifier, relation, receipt[key], refs, reason="Host operation record")
+        actor = event.get("actor") or ("owner" if kind == "owner-message" else "Kin" if kind in {"assistant-message", "artifact-created"} else None)
+        if actor:
+            actor_id = self.identifier("entity", ["host-actor", actor])
+            try:
+                self.get(conn, actor_id)
+            except Missing:
+                self._put(conn, {"id": actor_id, "kind": "entity", "entity_type": "person" if actor == "owner" or actor.startswith("person:") else "agent", "title": actor,
+                    "source_ids": [receipt["source_id"]], "evidence": refs, "basis": "observed", "identity_basis": "host-bound-actor"})
+            identity = "host-actor:" + actor
+            conn.execute("INSERT OR IGNORE INTO mind_graph_identity VALUES(?,?,?)", (self.scope.key(),identity,actor_id))
+            if actor == "owner" and event.get("channel"):
+                conn.execute("INSERT OR IGNORE INTO mind_graph_identity VALUES(?,?,?)",(self.scope.key(),"bound-owner:"+event["channel"],actor_id))
+            self.link(conn, actor_id, "participates", identifier, refs, role="requester" if kind == "owner-message" else "creator" if kind == "artifact-created" else "speaker", reason="Host-bound actor")
+        if event.get("task_id"):
+            tid = self.identifier("thread", ["host-task", event["task_id"]])
+            try:
+                self.get(conn, tid)
+            except Missing:
+                self._put(conn, {"id": tid, "kind": "thread", "title": event["task_id"], "source_ids": [receipt["source_id"]], "evidence": refs, "basis": "observed"})
+            self.link(conn, identifier, "part_of", tid, refs, reason="Same host task identifier")
+        return node
+
+    def apply(self, conn, proposal, refs, event_id, receipt, *, external_aliases=None, items=None, keys=None):
+        """`items` (memory_items.Items): the memory section applies each node and edge whole or not at all,
+        under the `keys` it has in that proposal. Without it every fault raises, as it always did."""
+        from .memory_items import Items, positions
+        items = items or Items(conn, False)
+        node_keys, edge_keys = keys or (positions("graph.nodes", proposal.nodes), positions("graph.edges", proposal.edges))
+        allowed = {v for r in refs for v in (r["source_id"], r["record_id"])}
+        node_aliases = {n.key: n.id or self.identifier(n.kind, [event_id, n.key]) for n in proposal.nodes}
+        if len(node_aliases) != len(proposal.nodes) or node_aliases.keys() & (external_aliases or {}).keys():
+            raise Conflict("Graph keys must be unique")
+        aliases = {**(external_aliases or {}), **node_aliases}
+        # A node this proposal creates introduces its key and the id that key stands for. One that updates a
+        # stored node introduces its key only: a reference by that id still names the stored node.
+        created = {n.key for n in proposal.nodes if items.enabled and not conn.execute(
+            "SELECT 1 FROM mind_graph_nodes WHERE scope=? AND id=?", (self.scope.key(), aliases[n.key])).fetchone()}
+        # `entity_name_check` (memory_formation): an entity is named in what it cites, or it is refused alone.
+        from . import memory_formation
+        names_checked = enabled(conn, self.scope.key(), memory_formation.ENTITY_CHECK)
+        for key, item in zip(node_keys, proposal.nodes):
+            with items.item("graph-node", key, names=(item.key, aliases[item.key] if item.key in created else None),
+                            needs=(item.owner_id,), evidence=item.evidence_ids) as live:
+                if not live:
+                    continue
+                evidence = self.proof(conn, item.evidence_ids, allowed)
+                identifier = aliases[item.key]
+                try:
+                    previous = self.get(conn, identifier)
+                except Missing:
+                    previous = None
+                if previous and item.expected_revision != previous["revision"]:
+                    raise Conflict("Graph node changed after evaluation", target=identifier,
+                                   expected=item.expected_revision, actual=previous["revision"])
+                if previous and previous["kind"] != item.kind:
+                    raise Conflict("Graph kind is immutable")
+                if item.occurred_at:
+                    timestamp(item.occurred_at)
+                basis = item.basis
+                if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
+                    basis = "inferred"
+                if item.kind == "association":
+                    basis = "internal_thought"
+                named = (memory_formation.check_entity(conn, self.engine, self.scope.key(), item, evidence, previous)
+                         if names_checked and item.kind == "entity" else None)
+                value = {**(previous or {}), **item.model_dump(exclude={"id", "key", "expected_revision", "evidence_ids"}), "id": identifier,
+                    "basis": basis, "source_ids": sorted({r["source_id"] for r in evidence}), "evidence": evidence,
+                    "occurred_at": item.occurred_at or (previous or {}).get("occurred_at") or self.mind.clock(),
+                    "occurred_at_basis": "assessment" if item.occurred_at else (previous or {}).get("occurred_at_basis", "unspecified"),
+                    "assessment_event": event_id, "configuration_version": receipt.get("configuration_version"),
+                    "model": receipt.get("model"), "state": "active"}
+                if named is not None:
+                    value["aliases"] = named
+                if item.kind == "finding":
+                    value["content_version"] = (previous or {}).get("content_version", 1) + int(bool(previous and previous.get("text") != item.text))
+                if value.get("owner_id"):
+                    value["owner_id"] = aliases.get(value["owner_id"],value["owner_id"])
+                self._put(conn, value)
+                items.carry(key, {r["source_id"] for r in evidence})
+        for key, item in zip(node_keys, proposal.nodes):
+            if item.owner_id:
+                # The second part of the same item: refused here, the node written above goes too.
+                with items.item("graph-node", key) as live:
+                    if not live:
+                        continue
+                    node = self.get(conn, aliases[item.key])
+                    owner = self.ensure(conn, node["owner_id"])
+                    if owner["id"] == node["id"]:
+                        raise Conflict("A graph node cannot own itself")
+                    self.link(conn,node["id"],"part_of",owner["id"],node["evidence"],basis=node["basis"],reason="Content belongs to the referenced result",event_id=event_id)
+        for key, edge in zip(edge_keys, proposal.edges):
+            with items.item("graph-edge", key, needs=(edge.subject, edge.object)) as live:
+                if not live:
+                    continue
+                evidence = self.proof(conn, edge.evidence_ids, allowed)
+                basis = edge.basis
+                if basis == "explicit" and not any(r.get("authority") == "explicit" for r in evidence):
+                    basis = "inferred"
+                self.link(conn, aliases.get(edge.subject, edge.subject), edge.relation, aliases.get(edge.object, edge.object), evidence,
+                    basis=basis, reason=edge.reason, role=edge.role, confidence=edge.confidence, valid_from=edge.valid_from, valid_until=edge.valid_until, event_id=event_id)
+        return {"node_ids": [aliases[n.key] for key, n in zip(node_keys, proposal.nodes) if items.kept(key)],
+                "edge_count": sum(items.kept(key) for key in edge_keys)}
+
+    def candidates(self, conn, query="", limit=40, policy=None):
+        limit = min(40, max(1, limit))
+        policy = self.policy(conn, policy=policy)
+        words = query_terms(query)
+        found = []
+        if words:
+            match = " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
+            rows = conn.execute("SELECT n.data FROM mind_graph_nodes n JOIN mind_graph_search f ON f.id=n.id WHERE n.scope=? AND n.state='active' AND mind_graph_search MATCH ? ORDER BY bm25(mind_graph_search),n.occurred_at DESC LIMIT ?", (self.scope.key(), match, limit)).fetchall()
+            found = [json.loads(r[0]) for r in rows]
+            # Thousands of short legacy summaries otherwise outrank every
+            # longer finding. Reserve candidates for the operational objects
+            # carrying authorship and delivery coverage, then keep lexical rank.
+            units = conn.execute("SELECT n.data FROM mind_graph_nodes n JOIN mind_graph_search f ON f.id=n.id WHERE n.scope=? AND n.state='active' AND n.kind IN ('finding','exploration','work','artifact','entity','thread') AND mind_graph_search MATCH ? ORDER BY bm25(mind_graph_search),n.occurred_at DESC LIMIT ?", (self.scope.key(), match, min(16, max(1, limit//2)))).fetchall()
+            found = list({n["id"]:n for n in [*[json.loads(r[0]) for r in units], *found]}.values())
+        since = (timestamp(self.mind.clock()) - timedelta(hours=72)).isoformat()
+        rows = conn.execute("SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND (occurred_at>=? OR kind='thread') ORDER BY occurred_at DESC LIMIT ?", (self.scope.key(), since, limit)).fetchall()
+        # Filtered before the limit: a hidden projection must not take a candidate's place.
+        return self.visible(conn, list({n["id"]: n for n in [*found, *[json.loads(r[0]) for r in rows]]}.values()), policy)[:limit]
+
+    def neighbors(self, conn, identifier, layer=None, limit=40):
+        # SQLite otherwise picks a scope-only index for the OR predicate and
+        # scans every edge for each anchor. Preserve its stable object/row order.
+        return conn.execute("SELECT subject,object FROM ("
+            "SELECT rowid AS edge_row,subject,object FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND subject=? AND state='active' AND (? IS NULL OR layer=?) "
+            "UNION SELECT rowid AS edge_row,subject,object FROM mind_graph_edges INDEXED BY mind_graph_right WHERE scope=? AND object=? AND state='active' AND (? IS NULL OR layer=?)) "
+            "ORDER BY object,edge_row LIMIT ?", (self.scope.key(), identifier, layer, layer, self.scope.key(), identifier, layer, layer, limit))
+
+    def read(self, *, focus=None, query="", since=None, until=None, layer=None, kind=None, cursor=0, limit=150, hops=1, policy=None):
+        limit, cursor, hops = min(300, max(1, int(limit))), max(0, int(cursor)), min(3, max(0, int(hops)))
+        if layer not in {None, "evidence", "association"}:
+            raise ValueError("Unknown graph layer")
+        with self.engine.db.connect() as conn:
+            # One read uses one SQLite transaction/snapshot. These dictionaries are
+            # deliberately local: a nested or later read starts with empty caches.
+            node_freshness, evidence_freshness = {}, {}
+
+            def fresh(node):
+                return self._fresh_value(conn, node, node_cache=node_freshness,
+                                         evidence_cache=evidence_freshness)
+
+            policy, paged = self.policy(conn, policy=policy), False
+            # Hidden nodes are also removed from the frontier: a configuration projection is not
+            # a bridge this read may cross, so its neighbours are not reached through it.
+            if focus:
+                anchor = self.ensure(conn, focus)
+                known, ids = {anchor["id"]: anchor}, set()
+                frontier = {n["id"] for n in self.visible(conn, [anchor], policy)}
+                ids.update(frontier)
+                for _ in range(hops):
+                    next_ids = set()
+                    for identifier in sorted(frontier):
+                        for row in self.neighbors(conn, identifier, layer, 300):
+                            next_ids.update(row)
+                    batch = self._get_many(conn, sorted(next_ids - ids - known.keys()))
+                    reached = [known.setdefault(i, batch[i]) for i in sorted(next_ids - ids - known.keys())]
+                    frontier = {n["id"] for n in self.visible(conn, reached, policy)}
+                    ids.update(frontier)
+                    if len(ids) >= 1200:
+                        break
+                values = [known[i] for i in sorted(ids)]
+            elif query:
+                values = self.candidates(conn, query, policy=policy)
+                known = {n["id"] for n in values}
+                frontier, seen = set(known), set(known)
+                for _ in range(hops):
+                    additions = set()
+                    for identifier in sorted(frontier):
+                        for row in self.neighbors(conn, identifier, layer, 40):
+                            additions.update(row)
+                    wanted = sorted(additions - seen)[:40]
+                    batch = self._get_many(conn, wanted)
+                    reached = [batch[i] for i in wanted]
+                    seen.update(n["id"] for n in reached)
+                    frontier = {n["id"] for n in self.visible(conn, reached, policy)}
+                    known.update(frontier)
+                    values.extend(n for n in reached if n["id"] in frontier)
+            else:
+                rows = conn.execute("SELECT data FROM mind_graph_nodes WHERE scope=? AND state='active' AND (? IS NULL OR occurred_at>=?) AND (? IS NULL OR occurred_at<=?) AND (? IS NULL OR kind=?) ORDER BY occurred_at DESC,id LIMIT ? OFFSET ?", (self.scope.key(), since, since, until, until, kind, kind, limit+1, cursor)).fetchall()
+                # The page is filtered after SQL applied it, so the cursor follows the rows read
+                # and a page thinned by the policy still leads to the next one.
+                paged, values = len(rows) > limit, self.visible(conn, [json.loads(r[0]) for r in rows], policy)
+            values = [n for n in values if (not since or n["occurred_at"] >= since) and (not until or n["occurred_at"] <= until) and (not kind or n["kind"] == kind)]
+            # Query order comes from lexical relevance, followed by graph
+            # neighbors. Sorting by time here hid old, exact matches.
+            if not query:
+                values.sort(key=lambda n: (n["occurred_at"], n["id"]), reverse=True)
+            more = paged or len(values) > (cursor + limit if focus or query else limit)
+            nodes = values[cursor:cursor+limit] if focus or query else values[:limit]
+            allowed, edges = {n["id"] for n in nodes}, {}
+            for node in nodes:
+                node["needs_review"] = not fresh(node)
+                node["instruction_authority"] = "data"
+            if allowed:
+                marks = ",".join("?" for _ in allowed)
+                ordered_ids = sorted(allowed)
+                # Read the induced subgraph once. The previous per-node OR
+                # scan repeatedly walked unrelated edges before discarding them.
+                for row in conn.execute(f"SELECT data FROM mind_graph_edges INDEXED BY mind_graph_left WHERE scope=? AND state='active' AND subject IN ({marks}) AND object IN ({marks}) AND (? IS NULL OR layer=?)", (self.scope.key(), *ordered_ids, *ordered_ids, layer, layer)):
+                    edge = json.loads(row[0])
+                    edge["needs_review"] = not fresh(edge)
+                    edges[edge["id"]] = edge
+                edges = {e["id"]: e for e in self.visible(conn, list(edges.values()), policy)}
+            return {"nodes": nodes, "edges": list(edges.values()), "cursor": cursor+limit if more else None, "limit": limit,
+                "focus": focus, "layout": "deterministic", "instruction_authority": "data"}
+
+    def detail(self, identifier):
+        with self.engine.db.connect() as conn:
+            value = self.get(conn, identifier)
+            value["needs_review"] = not self.fresh(conn, value)
+            # A read by id is an audit read: everything is there, and what is not experience says so.
+            policy = self.policy(conn, "audit")
+            label = policy.node_label(value, self.node_records(conn, [value]), SourceFacts(conn)) if policy.enabled else None
+            if label:
+                value["evidence_class"] = label
+            value["history"] = [json.loads(r[0]) for r in conn.execute("SELECT data FROM mind_graph_revisions WHERE id=? ORDER BY revision", (identifier,))]
+            if value["kind"] in {"share", "work", "artifact"}:
+                original = conn.execute("SELECT data FROM mind_memory_nodes WHERE scope=? AND id=?", (self.scope.key(), identifier)).fetchone()
+                if original:
+                    value["record"] = json.loads(original[0])
+            return value
+
+    def revise(self, request):
+        """Commands and inverse patches are durable; evidence stays immutable."""
+        if not request.get("command_id") or not request.get("reason"):
+            raise ValueError("Graph revisions need command_id and reason")
+        with self.engine.db.connect(write=True) as conn:
+            prior = conn.execute("SELECT data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["command_id"])).fetchone()
+            if prior:
+                return json.loads(prior[0])
+            proof = self.proof(conn, request.get("evidence_ids", []))
+            identifier = request["id"]; current = self.get(conn, identifier)
+            if current["revision"] != request.get("expected_revision"):
+                raise Conflict("Graph revision changed", target=identifier,
+                               expected=request.get("expected_revision"), actual=current["revision"])
+            before, changed = {identifier: current}, []
+            action = request["action"]
+            if action == "merge":
+                target = self.get(conn, request["target_id"])
+                if target["kind"] != current["kind"] or target.get("merged_into") or current.get("merged_into") or target["id"] == identifier:
+                    raise Conflict("Invalid graph merge")
+                if target["revision"] != request.get("target_revision"):
+                    raise Conflict("Merge target changed", target=target["id"],
+                                   expected=request.get("target_revision"), actual=target["revision"])
+                before[target["id"]] = target
+                current = {**current, "state": "merged", "merged_into": target["id"]}
+                target = self._put(conn, {**target, "aliases": list(dict.fromkeys([*target.get("aliases", []), current["title"], *current.get("aliases", [])])), "merge_sources": list(dict.fromkeys([*target.get("merge_sources", []), identifier]))})
+                changed.append(target)
+                for row in conn.execute("SELECT data FROM mind_graph_edges WHERE scope=? AND (subject=? OR object=?) AND state='active'", (self.scope.key(), identifier, identifier)).fetchall():
+                    edge = json.loads(row[0])
+                    self._repoint(conn, edge, target["id"] if edge["subject"] == identifier else edge["subject"],
+                                  target["id"] if edge["object"] == identifier else edge["object"], before, changed)
+            elif action == "split_event":
+                if current["kind"] != "event" or current["state"] != "active":
+                    raise Conflict("Only event membership can be split")
+                selected = request.get("member_ids", [])
+                if not selected or len(selected) != len(set(selected)) or not request.get("title"):
+                    raise ValueError("Event split requires unique members and a title")
+                all_edges = [json.loads(r[0]) for r in conn.execute(
+                    "SELECT data FROM mind_graph_edges WHERE scope=? AND object=? AND predicate='part_of' AND state='active'",
+                    (self.scope.key(), identifier))]
+                if not set(selected) < {e["subject"] for e in all_edges}:
+                    raise Conflict("Split members must be a proper subset")
+                split_id = self.identifier("event", ["split", request["command_id"]])
+                try:
+                    self.get(conn, split_id)
+                    raise Conflict("Split identity already exists")
+                except Missing:
+                    pass
+                before[split_id] = None
+                split = self._put(conn, {"id": split_id, "kind": "event", "title": request["title"],
+                    "basis": current.get("basis", "inferred"), "lifecycle": current.get("lifecycle", "open"),
+                    "occurred_at": min(self.get(conn, i)["occurred_at"] for i in selected),
+                    "text": "", "split_from": identifier, "membership_authority": "graph", "record_ids": [],
+                    "merge_sources": [], "aliases": [], "source_ids": sorted({r["source_id"] for r in proof}), "evidence": proof})
+                changed.append(split)
+                for edge in all_edges:
+                    if edge["subject"] in selected:
+                        self._repoint(conn, edge, edge["subject"], split_id, before, changed)
+                current = {**current, "membership_command": request["command_id"]}
+            elif action == "split":
+                # `split` used to be a second name for `undo`, which a model reading "split" took
+                # for the division of an event (K4-08).
+                raise ValueError("To divide an event use split_event; to reverse a command use undo")
+            elif action == "undo":
+                prior = conn.execute("SELECT data FROM mind_graph_commands WHERE scope=? AND id=?", (self.scope.key(), request["previous_command_id"])).fetchone()
+                if not prior:
+                    raise Missing(request["previous_command_id"])
+                old = json.loads(prior[0])
+                for nid, revision in old["after_revisions"].items():
+                    if self.get(conn, nid)["revision"] != revision:
+                        raise Conflict("Affected graph objects changed since the command", target=nid,
+                                       expected=revision, actual=self.get(conn, nid)["revision"])
+                for nid, value in old["before"].items():
+                    before[nid] = self.get(conn, nid)
+                    restored = value if value is not None else {**before[nid], "state": "retracted"}
+                    changed.append(self._put(conn, {**restored, "revision_reason": request["reason"]}, edge=restored.get("kind") == "edge"))
+                current = None
+            elif action in {"correct", "retract", "restore"}:
+                allowed = {"title", "text", "reason", "role", "basis", "confidence", "valid_from", "valid_until", "occurred_at", "aliases"}
+                changes = request.get("changes", {})
+                if set(changes) - allowed:
+                    raise ValueError("Unsupported graph correction field")
+                for key in ("title","text","reason","role"):
+                    if key in changes and (not isinstance(changes[key],str) or len(changes[key])>8000):
+                        raise ValueError("Graph correction requires complete bounded text")
+                if "basis" in changes:
+                    if changes["basis"] not in {"observed","explicit","documented","inferred","internal_thought"}:
+                        raise ValueError("Unknown evidence basis")
+                    if changes["basis"]=="explicit" and not any(r["authority"]=="explicit" for r in proof):
+                        raise Conflict("Explicit claims need owner evidence")
+                if "confidence" in changes and (type(changes["confidence"]) not in {int,float} or not 0<=changes["confidence"]<=1):
+                    raise ValueError("Confidence must be within 0..1")
+                for key in ("valid_from","valid_until","occurred_at"):
+                    if changes.get(key):
+                        timestamp(changes[key])
+                if "aliases" in changes and (not isinstance(changes["aliases"],list) or len(changes["aliases"])>100 or any(not isinstance(a,str) for a in changes["aliases"])):
+                    raise ValueError("Aliases must be complete names")
+                version = current.get("content_version", 1)
+                if current["kind"] == "finding" and "text" in changes and changes["text"] != current.get("text"):
+                    version += 1
+                current = {**current, **changes, "state": "retracted" if action == "retract" else "active"}
+                if current["kind"] == "finding":
+                    current["content_version"] = version
+            else:
+                raise ValueError("Unknown graph revision action")
+            if current:
+                changed.append(self._put(conn, {**current, "revision_reason": request["reason"], "evidence": proof, "source_ids": sorted({r["source_id"] for r in proof})}, edge=current.get("kind") == "edge"))
+            result = {"state": "applied", "action": action, "command_id": request["command_id"], "before": before, "after_revisions": {v["id"]: v["revision"] for v in changed}}
+            # What a replay of this command reads back is what it answers now.
+            result = evidence_refs.as_stored(conn, self.scope.key(), "mind_graph_commands", result)
+            conn.execute("INSERT INTO mind_graph_commands VALUES(?,?,?,?)", (request["command_id"], self.scope.key(), "", dumps(result)))
+            return result

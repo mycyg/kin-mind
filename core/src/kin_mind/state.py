@@ -1,0 +1,2336 @@
+"""Transactional affect and desires in the existing private memory database.
+
+Snapshots are projections, not measurements. Events, configuration revisions and
+source revisions remain inspectable. No model or transport runs inside this store.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from copy import deepcopy
+from datetime import datetime, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+from pydantic import Field, FiniteFloat, StrictInt, field_validator, model_validator
+
+from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.models import Model, Scope, now, utc
+from eventmem.core.persona import load_persona, persona_metadata, validate_trait_changes
+from eventmem.core.self_knowledge import SelfKnowledge, metadata
+
+from . import erasure, recipient
+from .affect_layers import KEY as AFFECT_LAYERS
+from .affect_layers import VERSION as AFFECT_LAYERS_VERSION
+from .affect_layers import anchor_of, curves, note_echo, reanchor, undertone
+from .affect_layers import fresh as fresh_layers
+from .continuity import SCHEMA as CONTINUITY_SCHEMA
+from .continuity import Continuity, RhythmProposal, Understanding
+from .evidence_refs import marked as marked_refs
+from .evidence_refs import shown as shown_refs
+from .evidence_refs import slim as slim_refs
+from .profile import DIMENSIONS, GROUPS, default_profile, interaction_style
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS mind_state(
+ scope TEXT PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mind_events(
+ id TEXT PRIMARY KEY, scope TEXT NOT NULL, revision INTEGER NOT NULL,
+ kind TEXT NOT NULL, occurred_at TEXT NOT NULL, data TEXT NOT NULL,
+ UNIQUE(scope,revision));
+CREATE INDEX IF NOT EXISTS mind_history ON mind_events(scope,revision DESC);
+CREATE TABLE IF NOT EXISTS mind_contacts(
+ id TEXT PRIMARY KEY, scope TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS mind_contact_active ON mind_contacts(scope)
+ WHERE state IN ('drafting','pending');
+CREATE TABLE IF NOT EXISTS mind_action_events(
+ id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,
+ state TEXT NOT NULL,data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mind_action_event_state ON mind_action_events(scope,state,created_at);
+CREATE INDEX IF NOT EXISTS mind_action_event_recent ON mind_action_events(scope,created_at,id);
+"""
+
+# DDL this process has already run, per database file (K1-23). A replaced file (a restore) is a
+# different inode, so it gets its tables again.
+_SCHEMA_READY = set()
+
+
+def ensure_schema(engine, name, script):
+    """Run a module's DDL once per database file in this process. True when it ran now."""
+    try:
+        stat = engine.db.path.stat()
+        key = (str(engine.db.path), stat.st_ino, stat.st_dev, name)
+    except (OSError, AttributeError):
+        key = None
+    if key in _SCHEMA_READY:
+        return False
+    with engine.db.connect() as conn:
+        conn.executescript(script)
+    if key:
+        _SCHEMA_READY.add(key)
+    return True
+
+
+class Evolution(Model):
+    claim_id: str | None = None
+    assessment_id: str | None = None
+    revert_event_id: str | None = None
+    baseline_changes: dict[str, FiniteFloat] = Field(default_factory=dict)
+    half_life_changes: dict[str, FiniteFloat] = Field(default_factory=dict)
+    traits: dict[str, str] = Field(default_factory=dict, max_length=20)
+
+    @model_validator(mode="after")
+    def shape(self):
+        if self.revert_event_id:
+            if self.baseline_changes or self.half_life_changes or self.traits:
+                raise ValueError(
+                    "A reversion cannot also propose new personality changes"
+                )
+        elif not self.claim_id or not self.assessment_id:
+            raise ValueError(
+                "Evolution requires a hypothesis and a behavioral assessment"
+            )
+        return self
+
+
+class Motivation(Model):
+    target: StrictInt = Field(ge=0, le=100)
+    # A short-term drive, in minutes: ten for a passing impulse, twelve hours for a slow one.
+    # Anything outside the range is refused by the schema, like every other bound here.
+    half_life_minutes: StrictInt = Field(ge=10, le=720)
+    reason: str = ""
+
+
+class AffectiveEvent(Model):
+    command_id: str = Field(min_length=1, max_length=200)
+    agent_version: str = Field(min_length=1, max_length=200)
+    expected_revision: int = Field(ge=1)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    subjective: bool = False
+    values: dict[str, StrictInt] = Field(default_factory=dict, max_length=len(DIMENSIONS))
+    motivations: dict[str, Motivation] = Field(default_factory=dict, max_length=2)
+    reason: str = ""
+    origin: Literal["interaction", "exploration", "reflection"] = "interaction"
+    evolution: Evolution | None = None
+    understanding: Understanding | None = None
+    rhythm: RhythmProposal | None = None
+
+    @field_validator("values")
+    @classmethod
+    def scores(cls, values):
+        if any(not 0 <= value <= 100 for value in values.values()):
+            raise ValueError("Scores must be integers from 0 to 100")
+        return values
+
+    @model_validator(mode="after")
+    def separate_evolution(self):
+        if not self.evidence_ids and (not self.subjective or self.evolution):
+            raise ValueError("Observed state and evolution require source evidence")
+        if set(self.motivations) - {"initiative", "curiosity"}:
+            raise ValueError("Motivation applies to initiative and curiosity")
+        if self.evolution and (self.values or self.motivations or self.understanding or self.rhythm):
+            raise ValueError("Separate state observations from personality evolution")
+        return self
+
+
+# How long Kin may put a contact off (N9): five minutes to three days. A wait past either end is
+# taken to that end and kept, never refused.
+CONTACT_WAIT_MIN_SECONDS, CONTACT_WAIT_MAX_SECONDS = 300, 259200
+# A draft that could not start waits five minutes more each time, up to half an hour (CR2-INT-06).
+DRAFT_START_WAIT_MAX_SECONDS = 1800
+# The waits the host puts the wishes of an attempt in when it ended without a decision of Kin's
+# (settle_contact): a draft that failed or never started, a source that moved, a review that sent the
+# batch back, a repeat of an unknown send, a read deleted meanwhile. They are the host's backoff, never
+# her choice: since 2026-10-01 such a wait says so itself (`decided_by: "host"`, with its `cause`) and the
+# attempt keeps it as `host_wait`, not as its `decision`. An older one is known by the host's own words,
+# which are these; nothing is rewritten.
+HOST_WAIT_REASONS = frozenset({
+    "Draft generation or parsing failed",
+    "The draft could not start yet",
+    "The wholly unsent contact batch needs a new DeepSeek decision",
+    "The draft source changed before model execution",
+    "The owner context changed before the wholly unsent contact could be delivered",
+    "这条和一次结果未知的发送相同：那次按原编号对账；想说的话换成新的内容再说",
+    "Something the draft had read was deleted while it was written",
+    "Legacy empty draft; a new related source is required",
+})
+
+
+def host_wait(wait):
+    """Whether a wish's `contact_wait` is one the host put it in (HOST_WAIT_REASONS), an older one too."""
+    if not isinstance(wait, dict):
+        return False
+    if "decided_by" in wait:
+        return wait["decided_by"] == "host"
+    return wait.get("reason") in HOST_WAIT_REASONS
+# What the host keeps of a fork turn (boundaries.mjs `forkReceipt`: 64 tool calls, 1000 ids a call and
+# 2000 a turn), and how many ids of what a draft was shown an attempt row names. Past any, the row says
+# the record was cut short, and the settlement treats it so (CL6D-MM-01, CL6E-MM-04).
+FORK_TOOL_CALLS, FORK_TOOL_IDS, FORK_TURN_IDS, DRAFT_SHOWN_IDS = 64, 1000, 2000, 4000
+
+
+def fork_reads(value):
+    """What the host recorded of a contact draft's fork turn: each tool call, whether it succeeded,
+    the ids it returned, and whether that record was cut short (`truncated`). Only these are kept
+    on the attempt row. A record longer than the host's own bounds is cut here too, and says so. A
+    draft of the `legacy` assessment channel, a turn in the main session, records no read at all:
+    it is kept as a record cut short from the first read, and says which channel it was."""
+    if not isinstance(value, dict):
+        return None
+    legacy = value.get("channel") == "legacy"
+    calls = value.get("tool_calls") if isinstance(value.get("tool_calls"), list) and not legacy else []
+    kept, cut, room = [], legacy or value.get("truncated") is True or len(calls) > FORK_TOOL_CALLS, FORK_TURN_IDS
+    for call in calls[:FORK_TOOL_CALLS]:
+        if not isinstance(call, dict):
+            continue
+        entries = call.get("ids") if isinstance(call.get("ids"), list) else []
+        ids = [{"id": entry["id"], "revision": entry["revision"] if type(entry.get("revision")) is int else None}
+               for entry in entries[:FORK_TOOL_IDS]
+               if isinstance(entry, dict) and isinstance(entry.get("id"), str) and 0 < len(entry["id"]) <= 200]
+        cut = cut or len(entries) > FORK_TOOL_IDS or len(ids) > room
+        ids = ids[:room]
+        room -= len(ids)
+        kept.append({"name": str(call.get("name") or "")[:128], "ok": call.get("ok") is True, "ids": ids})
+    return {**({"channel": "legacy"} if legacy else {}), "tool_calls": kept, **({"truncated": True} if cut else {})}
+
+
+def contact_wait_seconds(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+        return max(CONTACT_WAIT_MIN_SECONDS, min(CONTACT_WAIT_MAX_SECONDS, int(round(v))))
+    return v
+
+
+class DesireChange(Model):
+    command_id: str = Field(min_length=1, max_length=200)
+    agent_version: str = Field(min_length=1, max_length=200)
+    expected_revision: int = Field(ge=1)
+    action: Literal[
+        "create", "update", "start", "wait", "resume", "complete", "abandon"
+    ]
+    desire_id: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    subjective: bool = False
+    content: str | None = Field(default=None, min_length=1)
+    topic: str | None = Field(default=None)
+    kind: Literal["contact", "explore", "create"] | None = None
+    strength: StrictInt | None = Field(default=None, ge=0, le=100)
+    expires_at: str | None = None
+    completion: str | None = Field(default=None, min_length=1)
+    concern_ids: list[str] | None = Field(default=None, max_length=10)
+    exploration_target: Literal["knowledge", "computer", "play"] | None = None
+    exploration_id: str | None = Field(default=None, max_length=100)
+    activity_ref: dict | None = None
+    reason: str = ""
+    wait_condition: Literal["time", "new_evidence", "owner_reply", "review"] | None = None
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
+
+    _time = field_validator("expires_at")(lambda v: utc(v) if v else v)
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
+
+    @model_validator(mode="after")
+    def shape(self):
+        if not self.evidence_ids and not self.subjective:
+            raise ValueError("A sourced wish requires evidence; an independent wish must be subjective")
+        if self.wait_condition is not None and self.action != "wait":
+            raise ValueError("Only waiting desires have a resume condition")
+        if self.action == "create":
+            if self.exploration_target and self.kind != "explore":
+                raise ValueError("Only exploration wishes have an exploration target")
+            if self.exploration_id and self.kind != "contact":
+                raise ValueError("Only contact wishes link a communication decision")
+            if self.activity_ref and self.kind != "contact":
+                raise ValueError("Only contact wishes link an activity sharing decision")
+            if self.desire_id or any(
+                getattr(self, k) is None
+                for k in (
+                    "content",
+                    "topic",
+                    "kind",
+                    "strength",
+                    "expires_at",
+                    "completion",
+                )
+            ):
+                raise ValueError(
+                    "New desires require content, topic, kind, strength, expiry and completion"
+                )
+        elif not self.desire_id:
+            raise ValueError("A desire ID is required")
+        return self
+
+
+class ContactDecision(Model):
+    action: Literal["wait", "abandon"]
+    reason: str = ""
+    condition: Literal["time", "new_evidence", "owner_reply", "review"] = "review"
+    retry_after_seconds: StrictInt = Field(default=1800, ge=CONTACT_WAIT_MIN_SECONDS, le=CONTACT_WAIT_MAX_SECONDS)
+
+    _wait = field_validator("retry_after_seconds", mode="before")(contact_wait_seconds)
+
+
+_CONTACT_RECEIPT_STRINGS = {
+    "provider", "model", "reasoning", "purpose", "request_id", "outcome",
+    "usage_status", "verified_at",
+}
+_CONTACT_RECEIPT_NUMBERS = {"elapsed_ms", "model_requests"}
+
+
+def _validate_contact_receipt(value, depth=0):
+    if not isinstance(value, dict) or depth > 2:
+        raise ValueError("Invalid contact model receipt")
+    allowed = _CONTACT_RECEIPT_STRINGS | _CONTACT_RECEIPT_NUMBERS | {
+        "cache_hit", "usage", "chunks", "schema_repair",
+    }
+    if set(value) - allowed:
+        raise ValueError("Contact model receipt contains non-accounting fields")
+    for key in _CONTACT_RECEIPT_STRINGS & set(value):
+        if not isinstance(value[key], str) or len(value[key]) > 200:
+            raise ValueError("Invalid contact model receipt string")
+    for key in _CONTACT_RECEIPT_NUMBERS & set(value):
+        if (isinstance(value[key], bool) or not isinstance(value[key], (int, float))
+                or not math.isfinite(value[key]) or value[key] < 0):
+            raise ValueError("Invalid contact model receipt number")
+    if "cache_hit" in value and not isinstance(value["cache_hit"], bool):
+        raise ValueError("Invalid contact model cache receipt")
+    if value.get("usage") is not None and (
+        not isinstance(value.get("usage"), dict) or any(
+            not isinstance(key, str) or not key or len(key) > 64
+            or isinstance(amount, bool) or not isinstance(amount, (int, float))
+            or not math.isfinite(amount) or amount < 0
+            for key, amount in value["usage"].items()
+        )
+    ):
+        raise ValueError("Invalid contact model usage receipt")
+    if "chunks" in value:
+        if not isinstance(value["chunks"], list) or len(value["chunks"]) > 16:
+            raise ValueError("Invalid contact model chunk receipts")
+        for receipt in value["chunks"]:
+            _validate_contact_receipt(receipt, depth + 1)
+    if "schema_repair" in value:
+        repair = value["schema_repair"]
+        if not isinstance(repair, dict) or set(repair) - {"attempts", "rejected_call"}:
+            raise ValueError("Invalid contact schema repair receipt")
+        if "attempts" in repair and (isinstance(repair["attempts"], bool)
+                                     or not isinstance(repair["attempts"], int)
+                                     or repair["attempts"] < 0):
+            raise ValueError("Invalid contact schema repair attempts")
+        if "rejected_call" in repair:
+            _validate_contact_receipt(repair["rejected_call"], depth + 1)
+    return value
+
+
+class ContactFailure(Model):
+    """Redacted operational facts. Content and exception prose never enter it."""
+
+    category: Literal[
+        "contract", "model-unavailable", "source-changed", "semantic-hold",
+        "model-output", "unknown", "delivery-uncertain", "host-runtime",
+    ]
+    stage: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    code: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    retry_condition: Literal[
+        "repair-input", "backoff", "source-change", "deepseek-decision",
+        "reconcile", "none",
+    ]
+    model_invoked: bool | None = None
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    retryable: bool | None = None
+    diagnostic_id: str | None = None
+    model_receipt: dict | None = None
+    native_error: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    native_reason: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,96}$")
+    native_stage: Literal["not-started", "started", "unknown"] | None = None
+
+    @field_validator("model_receipt")
+    @classmethod
+    def receipt_is_redacted(cls, value):
+        return None if value is None else _validate_contact_receipt(value)
+
+
+def timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+# A short-term drive runs for four of its half-lives (at most two days), and then it has run its
+# course: the value goes on from where it got to, toward the dimension's own baseline at the
+# dimension's own pace. Nothing is reset, and the end only asks Kin to look again (K1-02).
+MOTIVATION_HALF_LIVES, MOTIVATION_MAX_HOURS = 4, 48
+
+
+def motivation_expiry(entry):
+    motive = entry.get("motivation")
+    if not motive:
+        return None
+    if motive.get("expires_at"):
+        return motive["expires_at"]
+    hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * entry["half_life_hours"])
+    return (timestamp(entry["at"]) + timedelta(hours=hours)).isoformat()
+
+
+def _toward(score, target, half_life_hours, start, end):
+    elapsed = max(0, (timestamp(end) - timestamp(start)).total_seconds())
+    return target + (score - target) * 0.5 ** (elapsed / (half_life_hours * 3600))
+
+
+def project(entry, at):
+    until = motivation_expiry(entry)
+    if until and timestamp(at) > timestamp(until):
+        reached = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], until)
+        pace = entry["motivation"].get("base_half_life_hours") or entry["half_life_hours"]
+        value = _toward(reached, entry.get("baseline", entry["target"]), pace, until, at)
+    else:
+        value = _toward(entry["score"], entry["target"], entry["half_life_hours"], entry["at"], at)
+    return min(100.0, max(0.0, value))
+
+
+# The settings key under which the host names its live contact policy file (K1-03).
+CONTACT_POLICY_SETTING = "kin_mind.contact_policy"
+# The owner's word on how often to reach out is shown whole in every assessment: a sentence or two.
+CONTACT_FREQUENCY_MAX_CHARS = 600
+
+
+class Mind(Continuity):
+    def __init__(self, engine, scope: Scope, clock=now):
+        self.engine, self.scope, self.clock = engine, scope, clock
+        # The exact text the state was last read from. The history layer takes it as a hint about
+        # what the row before this one holds, matched by its database revision. A stale revision
+        # is reconstructed from the existing rows instead.
+        self._loaded = None
+        # The instant curves the state was last read with, apart from the document its caller then
+        # changes in place: the next save re-anchors the slow layer of any curve it moved from these
+        # (affect_layers.reanchor), and trusts one only if it is the curve that anchor was made on.
+        self._curves = {}
+        from .energy import SCHEMA as ENERGY_SCHEMA
+        from .drives import SCHEMA as DRIVES_SCHEMA
+        from .archive_memory import SCHEMA as ARCHIVE_MEMORY_SCHEMA
+        from .autonomy_schema import SCHEMA as AUTONOMY_SCHEMA
+        from .desire_archive import SCHEMA as DESIRE_ARCHIVE_SCHEMA
+        from .evidence_refs import SCHEMA as EVIDENCE_REF_SCHEMA
+        from .exploration_decision_archive import SCHEMA as DECISION_ARCHIVE_SCHEMA
+        if not ensure_schema(self.engine, "mind", SCHEMA + recipient.CURSOR_SCHEMA + ";" + CONTINUITY_SCHEMA + AUTONOMY_SCHEMA
+                             + DESIRE_ARCHIVE_SCHEMA + DECISION_ARCHIVE_SCHEMA + ARCHIVE_MEMORY_SCHEMA
+                             + EVIDENCE_REF_SCHEMA + ENERGY_SCHEMA + DRIVES_SCHEMA):
+            return
+        with self.engine.db.connect() as conn:
+            index = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='mind_contact_active'").fetchone()
+        if index and "recipient_person_id" not in (index[0] or ""):
+            # AD2-14: the index used to hold every contact behind one send of unknown outcome.
+            # It now covers the attempt in flight; an unknown outcome holds only its own wishes.
+            with self.engine.db.connect(write=True) as conn:
+                conn.execute("DROP INDEX IF EXISTS mind_contact_active")
+                conn.execute("CREATE UNIQUE INDEX mind_contact_active ON mind_contacts(scope,COALESCE(json_extract(data,'$.recipient_person_id'),'person:person_a')) WHERE state IN ('drafting','pending')")
+
+    def _load(self, conn):
+        row = conn.execute(
+            "SELECT * FROM mind_state WHERE scope=?", (self.scope.key(),)
+        ).fetchone()
+        if not row:
+            raise Missing(
+                "Initialize the role profile before reading or changing state"
+            )
+        self._loaded = row["data"]
+        state = json.loads(row["data"])
+        self._curves = curves(state)
+        return state
+
+    def _save(self, conn, state):
+        # Every writer of the state saves here, so whichever path moved an instant curve -- an event, an
+        # assessment, an evolution or its reversion, a wish retargeting initiative -- its slow layer is
+        # re-anchored where the old curve had brought it. A save that moved no curve anchors nothing; a
+        # command replayed or recorded only (_record_only) never saves at all.
+        reanchor(state, self._curves, self.clock())
+        # Once `slim-evidence-refs` has marked the document, every reference any section was just
+        # given is kept to what its readers read (evidence_refs.TRACE), here, where every section is
+        # written: never its source's metadata (the owner's decision, 2026-09-28). In place, so the
+        # history row below is written from the same document as this one.
+        if marked_refs(state):
+            slim_refs(state)
+        conn.execute(
+            "INSERT INTO mind_state VALUES(?,?,?) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,data=excluded.data",
+            (self.scope.key(), state["revision"], dumps(state)),
+        )
+        self.engine.db.bump(conn)
+
+    def _evidence(self, conn, ids):
+        refs = []
+        for identifier in sorted(set(ids)):
+            if identifier.startswith("src_"):
+                sid = identifier
+                rid = "mem_" + digest([sid, "root"])[:32]
+            else:
+                record = self.engine._get(conn, identifier)
+                if record["scope"] != self.scope.model_dump():
+                    raise Conflict("Evidence belongs to another scope")
+                if not record["source_ids"]:
+                    raise Conflict("Evidence must retain its source")
+                for sid in record["source_ids"]:
+                    refs.append(self._reference(conn, sid, identifier))
+                continue
+            refs.append(self._reference(conn, sid, rid))
+        return refs
+
+    def _reference(self, conn, sid, rid):
+        row = conn.execute(
+            "SELECT * FROM sources WHERE id=? AND deleted=0", (sid,)
+        ).fetchone()
+        if not row:
+            raise Missing("Evidence source is unavailable")
+        if row["scope"] != self.scope.key():
+            raise Conflict("Evidence source belongs to another scope")
+        data = json.loads(row["data"])
+        if timestamp(row["occurred_at"]) > timestamp(self.clock()):
+            raise Conflict("Future evidence cannot describe an observed state")
+        record = self.engine._get(conn, rid)
+        if (
+            record["scope"] != self.scope.model_dump()
+            or record["status"] != "active"
+            or not SelfKnowledge._current(record, self.clock())
+        ):
+            raise Conflict("Evidence is not current", code="evidence-not-current", target=rid)
+        return {
+            "source_id": sid,
+            "record_id": rid,
+            "revision": record["revision"],
+            "authority": data["authority"],
+            "session": row["session"],
+            "occurred_at": row["occurred_at"],
+            "received_at": row["received_at"],
+            "namespace": row["namespace"],
+            "source_key": row["source_key"],
+            "metadata": data.get("metadata", {}),
+        }
+
+    def _fresh(self, conn, refs):
+        for ref in refs:
+            try:
+                current = self._reference(conn, ref["source_id"], ref["record_id"])
+            except (Missing, Conflict):
+                return False
+            if current["revision"] != ref["revision"]:
+                return False
+            newer = conn.execute(
+                "SELECT 1 FROM sources WHERE namespace=? AND source_key=? AND scope=? AND deleted=0 AND id<>? AND received_at>(SELECT received_at FROM sources WHERE id=?) LIMIT 1",
+                (
+                    ref["namespace"],
+                    ref["source_key"],
+                    self.scope.key(),
+                    ref["source_id"],
+                    ref["source_id"],
+                ),
+            ).fetchone()
+            if newer:
+                return False
+        return True
+
+    def _entry_fresh(self, conn, entry):
+        if entry.get("interpretation_unverified"):
+            return False
+        if not self._subjective_available(conn, entry["evidence"]):
+            return False
+        if entry.get("claim_id"):
+            sk = SelfKnowledge(self.engine, self.scope)
+            for kind in ("claim", "assessment"):
+                try:
+                    row = sk._get(conn, entry[kind + "_id"], kind)
+                except (Missing, Conflict):
+                    return False
+                if (
+                    row["status"] not in {"active", "unverified"}
+                    or row["revision"] != entry[kind + "_revision"]
+                    or not sk._fresh(conn, row)
+                ):
+                    return False
+        return True
+
+    def _subjective_available(self, conn, refs):
+        """Historical origins of an inner state need only exist in this scope, without deletion.
+
+        A revised source does not invalidate Kin's mood or rhythm. Actual facts and authorization
+        continue to use `_evidence` and `_fresh`, which retain their record revision checks.
+        """
+        return all(conn.execute("SELECT 1 FROM sources WHERE id=? AND scope=? AND deleted=0",
+                                (ref["source_id"], self.scope.key())).fetchone() for ref in refs)
+
+    def initialize(self, *, agent_version, evidence_ids, command_id="initialize"):
+        payload = {"agent_version": agent_version, "evidence_ids": evidence_ids}
+        with self.engine.db.connect(write=True) as conn:
+
+            def run():
+                if conn.execute(
+                    "SELECT 1 FROM mind_state WHERE scope=?", (self.scope.key(),)
+                ).fetchone():
+                    raise Conflict(
+                        "A profile already exists; initialization cannot reset it"
+                    )
+                refs = self._evidence(conn, evidence_ids)
+                if any(ref["authority"] != "explicit" for ref in refs):
+                    raise Conflict(
+                        "Role initialization requires explicit source evidence"
+                    )
+                at, profile = self.clock(), default_profile()
+                event_id = "mind_" + digest(recipient.key([self.scope.key(), command_id]))[:32]
+                values = {
+                    k: {
+                        "score": v["baseline"],
+                        "target": v["baseline"],
+                        "baseline": v["baseline"],
+                        "half_life_hours": v["half_life_hours"],
+                        "at": at,
+                        "basis": "role_default",
+                        "evidence": refs,
+                        "event_id": event_id,
+                        "agent_version": agent_version,
+                    }
+                    for k, v in profile["dimensions"].items()
+                }
+                state = {
+                    "revision": 1,
+                    "profile": profile,
+                    "profile_version": event_id,
+                    "dimensions": values,
+                    "desires": {},
+                    "traits": {},
+                    "profile_reviews": {},
+                    "last_evolution_day": None,
+                    "created_at": at,
+                    "updated_at": at,
+                    "agent_version": agent_version,
+                }
+                self._save(conn, state)
+                self._history(conn, event_id, state, "initialize", payload)
+                return {"event_id": event_id, "revision": 1}
+
+            return self.engine.command(conn, self._key(command_id), payload, run)
+
+    def _key(self, command_id):
+        return "mind:" + digest(recipient.key([self.scope.key(), command_id]))
+
+    def _history(self, conn, event_id, state, kind, payload):
+        # The row's own shape belongs to the history layer, not here: it decides whether this
+        # revision is stored as a whole document or as what changed since the row before, and the
+        # same layer reads it back. Off by default, in which case the row is the one the previous
+        # release wrote, key for key. It also refuses outright while compaction owns the rows.
+        from .history import row_for
+        conn.execute(
+            "INSERT INTO mind_events VALUES(?,?,?,?,?,?)",
+            (
+                event_id,
+                self.scope.key(),
+                state["revision"],
+                kind,
+                self.clock(),
+                dumps(row_for(conn, self.scope.key(), state, kind, payload, loaded=self._loaded)),
+            ),
+        )
+
+    def _mutate(self, request, kind, fn, *, rebase=None):
+        payload = request.model_dump() if hasattr(request, "model_dump") else request
+        return self._transact(payload, kind, fn, rebase)
+
+    def _transact(self, payload, kind, fn, rebase):
+        with self.engine.db.connect(write=True) as conn:
+            def run():
+                state = self._load(conn)
+                subjective = kind == "affect" and payload.get("subjective") is True
+                if state["revision"] != payload["expected_revision"] and not subjective and not (rebase and rebase(conn, state)):
+                    raise Conflict(
+                        "Mind revision changed; read current state before updating",
+                        code="mind-revision-changed", target=self.scope.key(),
+                        expected=payload["expected_revision"], actual=state["revision"],
+                    )
+                event_id = (
+                    "mind_" + digest(recipient.key([self.scope.key(), payload["command_id"]]))[:32]
+                )
+                result = fn(conn, state, event_id) or {}
+                state["revision"] += 1
+                state["updated_at"] = self.clock()
+                state["agent_version"] = payload["agent_version"]
+                self._save(conn, state)
+                self._history(conn, event_id, state, kind, payload)
+                receipt = dict(event_id=event_id, revision=state["revision"], **result)
+                # The stored receipt keeps what was committed, words included: it names what the
+                # event rests on, so a delete of that finds it and takes it (CR5-MM-01).
+                receipt.setdefault("rests_on", sorted(payload.get("evidence_ids") or []))
+                return receipt
+
+            return self.engine.command(
+                conn, self._key(payload["command_id"]), payload, run
+            )
+
+    def _record_only(self, request, fn):
+        """A commit that changes nothing of the mind (CR-RT-10): the command identity, the
+        idempotency and the single transaction of _transact, and no revision, state row or history
+        snapshot. `fn` reads a copy of the current state; whatever it changes there is dropped."""
+        payload = request.model_dump() if hasattr(request, "model_dump") else request
+        with self.engine.db.connect(write=True) as conn:
+            def run():
+                state = self._load(conn)
+                event_id = "mind_" + digest(recipient.key([self.scope.key(), payload["command_id"]]))[:32]
+                result = fn(conn, deepcopy(state), event_id) or {}
+                return dict(event_id=event_id, revision=state["revision"], **result)
+
+            return self.engine.command(conn, self._key(payload["command_id"]), payload, run)
+
+    def retire_session_advice(self):
+        """CR-MIND-12: a judgment an older release kept in the versioned state moves to the registry
+        carrier; once the carrier holds it (or a newer one), the field leaves the current state.
+        Earlier revisions keep it as they were. Idempotent: nothing to move answers `unchanged`."""
+        from . import session_advice
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            legacy = state.get("session_advice")
+            if "session_advice" not in state:
+                return {"state": "unchanged"}
+            conn.execute(session_advice.CARRIER)
+            held = conn.execute("SELECT event_id FROM mind_session_advice WHERE scope=?", (self.scope.key(),)).fetchone()
+            if not held and isinstance(legacy, dict) and legacy.get("eventId") and legacy.get("snapshotId"):
+                session_advice.submit(conn, self.scope.key(), legacy, legacy.get("at") or self.clock())
+                held = conn.execute("SELECT event_id FROM mind_session_advice WHERE scope=?", (self.scope.key(),)).fetchone()
+            if legacy and not held:
+                # Nothing the carrier could take: the field is left where it is, and says so.
+                return {"state": "kept", "reason": "carrier-cannot-hold-legacy-advice"}
+            state.pop("session_advice")
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, "mind_" + digest([self.scope.key(), "session-advice-retired", state["revision"]])[:32],
+                          state, "session-advice-migration", {"carrier_event_id": held[0] if held else None})
+            return {"state": "moved", "revision": state["revision"], "carrier_event_id": held[0] if held else None}
+
+    def _ensure_dimensions(self, conn, state, *, event_id, agent_version):
+        """Dimensions the role profile defines (profile.py) that a state initialized before them does
+        not hold yet join it as role defaults: the definition into the stored profile, a score at its
+        baseline, on the evidence the role itself was initialized from. The dimensions it holds, their
+        scores and their evolved baselines are never touched. Answers the keys added, in profile order."""
+        missing = [k for k in DIMENSIONS if k not in state["profile"]["dimensions"] or k not in state["dimensions"]]
+        if not missing:
+            return []
+        at = self.clock()
+        refs = next((deepcopy(entry["evidence"]) for entry in state["dimensions"].values()
+                     if entry.get("basis") == "role_default" and entry.get("evidence")), [])
+        if not refs:
+            # All old dimensions may already have event evidence. Initialization remains
+            # the role source; read its verified history, never borrow an interaction.
+            from .history import materialize
+            initial = conn.execute(
+                "SELECT revision FROM mind_events WHERE scope=? AND kind='initialize' ORDER BY revision LIMIT 1",
+                (self.scope.key(),),
+            ).fetchone()
+            if initial:
+                original = materialize(conn, self.scope.key(), initial["revision"])
+                refs = next((deepcopy(entry["evidence"]) for entry in original["dimensions"].values()
+                             if entry.get("basis") == "role_default" and entry.get("evidence")), [])
+        refs = [ref for ref in refs if self._fresh(conn, [ref])]
+        for key in missing:
+            spec = state["profile"]["dimensions"].setdefault(key, deepcopy(DIMENSIONS[key]))
+            state["dimensions"].setdefault(key, {
+                "score": spec["baseline"], "target": spec["baseline"], "baseline": spec["baseline"],
+                "half_life_hours": spec["half_life_hours"], "at": at, "basis": "role_default",
+                "evidence": refs, "event_id": event_id, "agent_version": agent_version,
+                **({"interpretation_unverified": True} if not refs else {}),
+            })
+        state["profile_version"] = event_id
+        return missing
+
+    def extend_dimensions(self, *, agent_version):
+        """Emotion system v2 (2026-09-27): the dimensions this release adds to the role profile join
+        the current state at their baselines, once, as one recorded revision. Idempotent: a state
+        that already holds every dimension answers `unchanged`."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            missing = [k for k in DIMENSIONS if k not in state["profile"]["dimensions"] or k not in state["dimensions"]]
+            if not missing:
+                return {"state": "unchanged"}
+            event_id = "mind_" + digest([self.scope.key(), "profile-dimensions-added", missing])[:32]
+            added = self._ensure_dimensions(conn, state, event_id=event_id, agent_version=agent_version)
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "profile-dimensions-added", {"added": added, "agent_version": agent_version})
+            return {"state": "extended", "added": added, "revision": state["revision"]}
+
+    def sync_role_profile(self, *, agent_version):
+        """Migrate existing role default baselines, half-lives, and descriptions from profile.py
+        into the live state without overwriting dimensions explicitly evolved in profile_reviews."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            at = self.clock()
+            reviews = state.get("profile_reviews") or {}
+            updated = []
+            for key, spec in DIMENSIONS.items():
+                if key not in state["profile"]["dimensions"] or key not in state["dimensions"]:
+                    continue
+                prof = state["profile"]["dimensions"][key]
+                entry = state["dimensions"][key]
+                if key in reviews:
+                    continue
+                until = motivation_expiry(entry)
+                active_motivation = bool(until and timestamp(at) < timestamp(until))
+                text_keys = ("label", "group", "definition", "increase", "decrease", "expression")
+                text_diff = any(prof.get(k) != spec.get(k) for k in text_keys if k in spec)
+                effective_pace = (entry["motivation"].get("base_half_life_hours")
+                                  if active_motivation else entry.get("half_life_hours"))
+                param_diff = (
+                    prof.get("baseline") != spec["baseline"]
+                    or prof.get("half_life_hours") != spec["half_life_hours"]
+                    or entry.get("baseline") != spec["baseline"]
+                    or effective_pace != spec["half_life_hours"]
+                    or bool(entry.get("motivation") and not active_motivation)
+                )
+                if not text_diff and not param_diff:
+                    continue
+                for k in text_keys:
+                    if k in spec:
+                        prof[k] = spec[k]
+                if param_diff:
+                    current_score = spec["baseline"] if entry.get("basis") == "role_default" else project(entry, at)
+                    prof["baseline"] = spec["baseline"]
+                    prof["half_life_hours"] = spec["half_life_hours"]
+                    entry["score"] = current_score
+                    entry["at"] = at
+                    entry["baseline"] = spec["baseline"]
+                    if active_motivation:
+                        entry["motivation"]["expires_at"] = until
+                        entry["motivation"]["base_half_life_hours"] = spec["half_life_hours"]
+                    else:
+                        entry.pop("motivation", None)
+                        entry["target"] = spec["baseline"]
+                        entry["half_life_hours"] = spec["half_life_hours"]
+                updated.append(key)
+            if not updated:
+                return {"state": "unchanged"}
+            event_id = "mind_" + digest([self.scope.key(), "profile-defaults-synced", updated, state["revision"]])[:32]
+            state["profile_version"] = event_id
+            self._retarget(conn, state, at)
+            state.update(revision=state["revision"] + 1, updated_at=at)
+            self._save(conn, state)
+            self._history(conn, event_id, state, "profile-defaults-synced",
+                          {"updated": updated, "agent_version": agent_version})
+            return {"state": "synced", "updated": updated, "revision": state["revision"]}
+
+    def ensure_affect_layers(self, *, agent_version):
+        """Emotion system v2b (2026-09-27): the state gains the derived layers' block once, as one
+        recorded revision -- every slow layer starting at its instant value, no echo yet. Until then a
+        read shows each slow layer `forming`. Idempotent: a state that holds the block, whatever its
+        version, answers `unchanged`; a later format is a later release's own migration."""
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            if AFFECT_LAYERS in state:
+                return {"state": "unchanged"}
+            event_id = "mind_" + digest([self.scope.key(), "affect-layers-added", AFFECT_LAYERS_VERSION])[:32]
+            state[AFFECT_LAYERS] = fresh_layers(state, self.clock())
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "affect-layers-added",
+                          {"version": AFFECT_LAYERS_VERSION, "agent_version": agent_version})
+            return {"state": "added", "version": AFFECT_LAYERS_VERSION, "revision": state["revision"]}
+
+    def configure_autonomy(self, request):
+        """Explicit user policy; never an inferred emotion or personality update."""
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Autonomy policy requires explicit user evidence")
+            self._retarget(conn, state, self.clock())
+            state["autonomy"] = {
+                "initiative_target": 85,
+                "open_exploration": True,
+                "topic_selected_by": "Kin",
+                "evidence": refs,
+                "configured_at": self.clock(),
+                "event_id": event_id,
+                "reason": request["reason"],
+            }
+            state["profile_version"] = event_id
+            self._retarget(conn, state, self.clock())
+            return {"autonomy": state["autonomy"]}
+        return self._mutate(request, "autonomy-policy", apply)
+
+    def _autonomy(self, conn, state):
+        policy = state.get("autonomy", {})
+        return policy if policy and self._fresh(conn, policy["evidence"]) else {}
+
+    def configure_contact(self, request):
+        """Change an explicit owner preference; keep scores and delivery history intact."""
+        if type(request.get("wait_for_reply")) is not bool:
+            raise ValueError("wait_for_reply must be a boolean")
+        for key in ("command_id", "agent_version", "reason"):
+            if not isinstance(request.get(key), str) or not request[key].strip():
+                raise ValueError(f"{key} is required")
+
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Contact preferences require explicit user evidence")
+            if recipient.current() == "person:person_a":
+                state["profile"]["contact"]["wait_for_reply"] = request["wait_for_reply"]
+            recipient.preferences(state)["contact_preference"] = {
+                "wait_for_reply": request["wait_for_reply"], "evidence": refs,
+                "event_id": event_id, "reason": request["reason"],
+                "configured_at": self.clock(),
+            }
+            state["profile_version"] = event_id
+            return {"contact_preference": recipient.preferences(state)["contact_preference"]}
+
+        return self._mutate(request, "contact-preference", apply)
+
+    def _contact_frequency(self, conn, evidence_ids, event_id, reason):
+        """How often the owner wants Kin to reach out, in the owner's own recorded words: the text of
+        the sources cited, never a paraphrase and never a default. Its own field, read whatever the
+        expression style: it used to reach an assessment only as the reason of the affectionate
+        style, so a later change of style took it away (2026-09-21 to 27)."""
+        refs = self._evidence(conn, evidence_ids)
+        if not refs or any(r["authority"] != "explicit" for r in refs) or not self._fresh(conn, refs):
+            raise Conflict("Contact frequency requires current explicit owner evidence")
+        texts = []
+        for sid in dict.fromkeys(r["source_id"] for r in refs):
+            row = conn.execute("SELECT blob FROM sources WHERE id=? AND deleted=0", (sid,)).fetchone()
+            if not row or not row["blob"]:
+                raise Missing("Evidence source is unavailable")
+            texts.append((self.engine.db.blobs / row["blob"]).read_text().strip())
+        text = "\n".join(t for t in texts if t)
+        if not text or len(text) > CONTACT_FREQUENCY_MAX_CHARS:
+            raise ValueError("A contact frequency preference is one short owner statement")
+        return {"text": text, "evidence": refs, "event_id": event_id, "reason": reason, "configured_at": self.clock()}
+
+    def configure_contact_frequency(self, request):
+        """The operator's route for a new owner word on contact frequency; scores stay as they are."""
+        for key in ("command_id", "agent_version", "reason"):
+            if not isinstance(request.get(key), str) or not request[key].strip():
+                raise ValueError(f"{key} is required")
+
+        def apply(conn, state, event_id):
+            recipient.preferences(state)["contact_frequency"] = self._contact_frequency(conn, request["evidence_ids"], event_id, request["reason"])
+            return {"contact_frequency": {k: v for k, v in recipient.preferences(state)["contact_frequency"].items() if k != "evidence"}}
+        return self._mutate(request, "contact-frequency", apply)
+
+    def adopt_contact_frequency(self, evidence_ids, *, agent_version):
+        """Start-up migration (2026-09-27): the owner-approved frequency preference the host config
+        names (`contact_frequency_evidence_ids`) becomes the state's own field, as one recorded
+        revision. Idempotent: carried already from the same sources at the same versions, it answers
+        `unchanged`. A word set since through `configure_contact_frequency` is the owner's later one
+        and stands (`kept`); a config that names other sources replaces only what an earlier config
+        put there. Never raises for what the store or the config holds: a start-up does not fail for
+        it, and a source that is missing or not the owner's is reported and left alone."""
+        if not evidence_ids or recipient.current() != "person:person_a":
+            return {"state": "unconfigured"}
+        with self.engine.db.connect(write=True) as conn:
+            state = self._load(conn)
+            version = lambda refs: sorted([r["source_id"], r["record_id"], r["revision"]] for r in refs)
+            try:
+                named = sorted(set(evidence_ids))
+                current = recipient.preferences(state).get("contact_frequency")
+                if current and "adopted_from" not in current:
+                    return {"state": "kept"}
+                wanted = self._evidence(conn, named)
+                if current and current["adopted_from"] == named and version(current["evidence"]) == version(wanted):
+                    # Carried already. If a newer word replaced this one since, the view says the entry
+                    # needs review; adopting the same words again would change nothing.
+                    return {"state": "unchanged"}
+                # Each adoption is a revision of its own, so a config that names an earlier word again
+                # is adopted again under a new event.
+                event_id = "mind_" + digest([self.scope.key(), "contact-frequency-adopted", version(wanted), state["revision"]])[:32]
+                recipient.preferences(state)["contact_frequency"] = {**self._contact_frequency(
+                    conn, named, event_id, "The owner's recorded word on how often to reach out, carried as its own field"),
+                    "adopted_from": named}
+            except (Missing, Conflict, ValueError, OSError, KeyError, TypeError) as error:
+                return {"state": "refused", "reason": type(error).__name__}
+            state.update(revision=state["revision"] + 1, updated_at=self.clock())
+            self._save(conn, state)
+            self._history(conn, event_id, state, "contact-frequency",
+                          {"evidence_ids": named, "agent_version": agent_version, "migration": True})
+            return {"state": "adopted", "revision": state["revision"], "event_id": event_id}
+
+    def register_contact_policy(self, path):
+        """Name the live contact policy the host applies (its proactive-policy.json). The view reads
+        the owner's current contact constraints there, so the copy kept in the state since the
+        first install (quiet hours 0–9, threshold 75) is never shown as a current constraint
+        (K1-03). Written only when the path changes; returns whether it did."""
+        key, value = CONTACT_POLICY_SETTING + ":" + recipient.policy_key(self.scope.key()), json.dumps({"path": str(path)})
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT data FROM settings WHERE key=?", (key,)).fetchone()
+        if row and row[0] == value:
+            return False
+        with self.engine.db.connect(write=True) as conn:
+            conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, value))
+        return True
+
+    def _live_contact_policy(self, conn):
+        """The registered live policy: None when none is registered, {} when it cannot be read."""
+        row = conn.execute("SELECT data FROM settings WHERE key=?",
+                           (CONTACT_POLICY_SETTING + ":" + recipient.policy_key(self.scope.key()),)).fetchone()
+        if not row:
+            return None
+        from pathlib import Path
+        try:
+            policy = json.loads(Path(json.loads(row[0])["path"]).read_text())
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        return policy if isinstance(policy, dict) else {}
+
+    def _contact_view(self, conn, state):
+        """The contact constraints as the host applies them now (K1-03). The live policy is the
+        source; an owner preference event still decides wait_for_reply; the score threshold is
+        shown only while the legacy score gates decide. Without a registered policy (older stores,
+        direct callers) the stored profile is shown as before."""
+        stored = state["profile"]["contact"]
+        contact = {key: stored.get(key) for key in ("reset_policy", "timezone", "check_seconds")}
+        live = self._live_contact_policy(conn)
+        if live is None:
+            contact.update({key: stored.get(key) for key in ("quiet_start", "quiet_end", "wait_for_reply", "minimum_gap_hours")})
+        else:
+            start, end = live.get("quietStartHour"), live.get("quietEndHour")
+            quiet = all(type(h) is int and 0 <= h <= 23 for h in (start, end)) and start != end
+            contact.update(source="live-policy", enabled=live.get("enabled") is True,
+                           timezone=live.get("timeZone") or stored.get("timezone"),
+                           quiet_start=start if quiet else None, quiet_end=end if quiet else None,
+                           minimum_gap_hours=live.get("minimumGapHours"),
+                           wait_for_reply=live.get("waitForReply") if type(live.get("waitForReply")) is bool else stored.get("wait_for_reply"))
+            if not live:
+                contact["source"] = "live-policy-unreadable"
+        preference = recipient.preferences(state).get("contact_preference")
+        if preference:
+            contact["wait_for_reply"] = preference["wait_for_reply"]
+            contact["preference"] = {
+                "event_id": preference["event_id"],
+                "configured_at": preference["configured_at"],
+                "reason": preference["reason"],
+                "needs_review": not self._fresh(conn, preference["evidence"]),
+                "evidence_ids": [r["record_id"] for r in preference["evidence"]],
+            }
+        frequency = recipient.preferences(state).get("contact_frequency")
+        if frequency:
+            # The owner's own words while what they came from stands; a source that changed or went
+            # takes them out of the view, and the entry says it needs review.
+            fresh = self._fresh(conn, frequency["evidence"])
+            contact["frequency"] = {**({"text": frequency["text"]} if fresh else {}), "basis": "owner_statement",
+                                    "needs_review": not fresh, "event_id": frequency["event_id"],
+                                    "configured_at": frequency["configured_at"],
+                                    "evidence_ids": [r["record_id"] for r in frequency["evidence"]]}
+        return contact
+
+    def configure_behavior(self, request):
+        """Install sourced expression/contact policy without changing any score."""
+        if request.get("style") not in {"affectionate-direct", "contextual"}:
+            raise ValueError("Unknown interaction style")
+        start = request.get("quiet_start_hour")
+        if start is not None and (type(start) is not int or not 0 <= start <= 23):
+            raise ValueError("Invalid quiet-hour start")
+
+        def apply(conn, state, event_id):
+            refs = self._evidence(conn, request["evidence_ids"])
+            if not refs or any(r["authority"] != "explicit" for r in refs):
+                raise Conflict("Behavior policy requires explicit user evidence")
+            state["behavior"] = {"style": request["style"], "evidence": refs,
+                                 "event_id": event_id, "reason": request["reason"]}
+            for key in ("definition", "increase", "decrease", "expression"):
+                state["profile"]["dimensions"]["flirtation"][key] = DIMENSIONS["flirtation"][key]
+            if start is not None:
+                state["profile"]["contact"]["quiet_start"] = start
+            state["profile_version"] = event_id
+            return {"behavior": state["behavior"]}
+
+        return self._mutate(request, "behavior-policy", apply)
+
+    def _session_advice(self, conn, state):
+        from . import session_advice as advice_store
+        latest = getattr(advice_store, "latest", None)
+        return latest(conn, self.scope.key(), state) if latest else state.get("session_advice")
+
+    def decision_current(self, conn, receipt, state=None):
+        """A verified decision holds while what decides Kin's behaviour is unchanged: the approved
+        persona, the behaviour contract, the definitions, the models and the environment (the
+        compat stamp). A deployment that only moves agent_version no longer voids every decision
+        (K1-13, MAIN-RUA-02). A receipt from before stamps holds."""
+        stored = (receipt or {}).get("compat")
+        if not stored:
+            return True
+        from . import compat
+        return compat.holds(stored, compat.stamp(self, conn, state))
+
+    def _desire_ready(self, conn, desire, at, *, state=None):
+        # Shared initiative considers every wish. Its plan, sharing permission
+        # and unconfirmed attempts belong to that wish's recipient, not to the
+        # caller currently updating the shared affect state.
+        from .companions import person_a
+        with recipient.target_scope(self, desire.get("recipient_person_id", person_a)):
+            return self._recipient_desire_ready(conn, desire, at, state=state)
+
+    def _recipient_desire_ready(self, conn, desire, at, *, state=None):
+        from .autonomy_schema import enabled
+        from .model_runtime import verified_decision
+        if enabled(conn, self.scope.key()):
+            receipt = desire.get("decision_receipt", {})
+            current = state or self._load(conn)
+            if not verified_decision(receipt) or not self.decision_current(conn, receipt, current):
+                return False
+            from .plans import AutonomousPlans
+            if not AutonomousPlans(self).linked_ready(conn, desire, current):
+                return False
+        if state is None and (desire.get("exploration_id") or desire.get("activity_ref") or desire.get("concern_revisions")):
+            state = self._load(conn)
+        if desire.get("activity_ref") or desire.get("exploration_id"):
+            from .exploration_decisions import require_activity_share, require_share
+            try:
+                decision = (require_activity_share(self, conn, state, desire["activity_ref"]) if desire.get("activity_ref")
+                            else require_share(self, conn, state, desire["exploration_id"]))
+                if desire.get("sharing_revision") != decision["revision"]:
+                    return False
+            except Conflict:
+                return False
+        if desire.get("trait_revisions"):
+            # A wish committed on a trait rests on the revision that trait had. One owner sentence
+            # can end it, and a wish standing on what the ledger no longer carries is not ready.
+            from .trait_refs import links_fresh
+            if not links_fresh(conn, self, desire):
+                return False
+        return (
+            desire["kind"] == "contact"
+            and desire["status"] == "wanted"
+            and not desire.get("held_reply")
+            and timestamp(desire["expires_at"]) > timestamp(at)
+            and self._fresh(conn, desire["evidence"])
+            and (not desire.get("concern_revisions") or self._concern_links_fresh(conn, state, desire))
+            and desire["id"] not in self._unconfirmed_desires(conn)
+        )
+
+    # Contact attempts. One attempt is in flight at a time (drafting, pending). It offers Kin
+    # every ready wish and she picks which to say (N11). A send whose outcome is unknown is
+    # reconciled under its own id and holds only the wishes it carried (AD2-14).
+    @staticmethod
+    def _offered(attempt):
+        return attempt.get("desire_ids") or [attempt["desire_id"]]
+
+    @staticmethod
+    def _offered_revisions(attempt):
+        return attempt.get("desire_revisions") or {attempt["desire_id"]: attempt["desire_revision"]}
+
+    def _unconfirmed_desires(self, conn):
+        held = set()
+        for row in conn.execute("SELECT data FROM mind_contacts WHERE scope=? AND state='unconfirmed'", (self.scope.key(),)):
+            attempt = json.loads(row[0])
+            if not recipient.belongs(attempt):
+                continue
+            held.update(attempt.get("chosen") or [attempt["desire_id"]])
+        return held
+
+    def _unconfirmed_contacts(self, conn, at):
+        """The sends of unknown outcome, as facts for Kin and for the host's reconciliation."""
+        facts = []
+        for row in conn.execute("SELECT id,data FROM mind_contacts WHERE scope=? AND state='unconfirmed' ORDER BY rowid", (self.scope.key(),)):
+            attempt = json.loads(row["data"])
+            if not recipient.belongs(attempt):
+                continue
+            facts.append({"attempt_id": row["id"], "desire_ids": attempt.get("chosen") or [attempt["desire_id"]],
+                          "since": attempt.get("unconfirmed_at") or attempt.get("updated_at") or attempt["created_at"],
+                          "excerpt": attempt.get("text_excerpt"),
+                          # What the draft had before it, beside every copy of its words: the next
+                          # attempt keeps one, and a view names it (CL6D-MM-01).
+                          **({"excerpt_evidence_ids": attempt["evaluated_ids"]} if attempt.get("evaluated_ids") else {}),
+                          "owner_epoch": attempt.get("owner_epoch"),
+                          "checks": attempt.get("reconcile_checks", 0),
+                          "next_check_at": attempt.get("next_check_at") or at})
+        return facts
+
+    def _longing_value(self, conn, state, at):
+        entry = state["dimensions"]["longing"]
+        base_proj = project(entry, at)
+        until = motivation_expiry(entry)
+        if until and timestamp(at) < timestamp(until):
+            return base_proj
+        from .rhythm import REST_PHASE, quiet_hours
+        rhythm = state.get("rhythm") or {}
+        rhythm_active = (
+            self._continuity_flags(conn, state)["rhythm"]
+            and state.get("continuity", {}).get("activation") != "shadow"
+            and (not rhythm or self._subjective_available(conn, rhythm.get("evidence", [])))
+        )
+        if (rhythm_active and (rhythm.get("phase") or rhythm.get("base_phase")) == REST_PHASE) or quiet_hours(self._contact_view(conn, state), at):
+            return base_proj
+        owner = conn.execute(
+            "SELECT occurred_at FROM sources WHERE scope=? AND deleted=0 AND occurred_at<=? "
+            "AND (namespace IN ('kin-owner-input','kin-companion-input') OR substr(namespace,1,5)='host:') "
+            "AND json_extract(data,'$.authority')='explicit' "
+            "AND json_extract(data,'$.metadata.role')='user' "
+            "AND json_extract(data,'$.metadata.host_event')='message' "
+            "ORDER BY occurred_at DESC,id DESC LIMIT 1",
+            (self.scope.key(), at),
+        ).fetchone()
+        if not owner or not owner[0]:
+            return base_proj
+        silence_hours = max(0.0, (timestamp(at) - timestamp(owner[0])).total_seconds() / 3600.0)
+        if silence_hours <= 2.0:
+            return base_proj
+        warm_target = min(78.0, entry["baseline"] + (silence_hours - 2.0) * 4.5)
+        if warm_target <= base_proj:
+            return base_proj
+        # Start from the real curve at the end of the quiet grace period (or the
+        # motivation's expiry). An expired motivation must not send this projection
+        # back toward its old baseline, nor can a recent message warm past hours.
+        start = max(timestamp(entry["at"]), timestamp(owner[0]) + timedelta(hours=2),
+                    timestamp(until) if until else timestamp(entry["at"]))
+        curve = dict(entry, score=project(entry, start.isoformat()), at=start.isoformat(),
+                     target=warm_target,
+                     half_life_hours=(entry.get("motivation") or {}).get("base_half_life_hours")
+                     or entry["half_life_hours"])
+        curve.pop("motivation", None)
+        return max(base_proj, project(curve, at))
+
+    def _initiative_value(self, conn, state, at):
+        entry = state["dimensions"]["initiative"]
+        if entry.get("motivation") or state.get("action_policy"):
+            return project(entry, at)
+        cursor, end = entry["at"], at
+        value = entry["score"]
+        wishes = [
+            d
+            for d in state["desires"].values()
+            if d["kind"] == "contact"
+            and d["status"] == "wanted"
+            and self._fresh(conn, d["evidence"])
+            and timestamp(d["expires_at"]) > timestamp(cursor)
+        ]
+        boundaries = sorted(
+            {
+                d["expires_at"]
+                for d in wishes
+                if timestamp(d["expires_at"]) < timestamp(end)
+            },
+            key=timestamp,
+        )
+        for boundary in [*boundaries, end]:
+            target = max(
+                [
+                    entry["baseline"],
+                    *[
+                        max(d["strength"], self._autonomy(conn, state).get("initiative_target", 0))
+                        for d in wishes
+                        if timestamp(d["expires_at"]) > timestamp(cursor)
+                    ],
+                ]
+            )
+            value = project(
+                dict(entry, score=value, at=cursor, target=target), boundary
+            )
+            cursor = boundary
+        return value
+
+    def _retarget(self, conn, state, at):
+        current = state["dimensions"]["initiative"]
+        if current.get("motivation") or state.get("action_policy"):
+            return
+        value = self._initiative_value(conn, state, at)
+        target = max(
+            [
+                state["profile"]["dimensions"]["initiative"]["baseline"],
+                *[
+                    max(d["strength"], self._autonomy(conn, state).get("initiative_target", 0))
+                    for d in state["desires"].values()
+                    if self._desire_ready(conn, d, at, state=state)
+                ],
+            ]
+        )
+        current.update(
+            score=value,
+            at=at,
+            target=target,
+            half_life_hours=state["profile"]["dimensions"]["initiative"][
+                "half_life_hours"
+            ],
+        )
+
+    def record(self, request: AffectiveEvent):
+        return self._mutate(
+            request,
+            "evolution" if request.evolution else "affect",
+            lambda conn, state, eid: self._apply_event(conn, state, request, eid),
+        )
+
+    def _apply_event(self, conn, state, request, event_id, continuity_sources=None):
+        refs = self._evidence(conn, request.evidence_ids)
+        # A release that adds dimensions migrates at start-up (extend_dimensions); an event committed
+        # before that, on a state without them, adds them here rather than refusing their scores.
+        self._ensure_dimensions(conn, state, event_id=event_id, agent_version=request.agent_version)
+        if request.evolution:
+            return self._evolve(conn, state, request, refs, event_id)
+        unknown = set(request.values) - set(state["dimensions"])
+        if unknown:
+            raise ValueError("Unknown affective dimension")
+        previous_values = {key: project(entry, self.clock()) for key, entry in state["dimensions"].items()}
+        if continuity_sources is None and (request.understanding or request.rhythm):
+            continuity_sources = self._continuity_sources(conn, state, refs)
+        for key in request.values.keys() | request.motivations.keys():
+            spec = state["profile"]["dimensions"][key]
+            previous = state["dimensions"][key]
+            score = request.values.get(key, project(previous, self.clock()))
+            motivation = request.motivations.get(key)
+            state["dimensions"][key] = {
+                "score": score,
+                "baseline": spec["baseline"],
+                "target": spec["baseline"],
+                "half_life_hours": spec["half_life_hours"],
+                "at": self.clock(),
+                "basis": "subjective" if request.subjective else "event_inferred",
+                "evidence": refs,
+                "reason": request.reason,
+                "event_id": event_id,
+                "agent_version": request.agent_version,
+            }
+            if motivation:
+                setting = motivation.model_dump()
+                hours = min(MOTIVATION_MAX_HOURS, MOTIVATION_HALF_LIVES * setting["half_life_minutes"] / 60)
+                state["dimensions"][key].update(
+                    target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
+                    motivation={**setting, "episode_id": event_id, "started_at": self.clock(),
+                                "expires_at": (timestamp(self.clock()) + timedelta(hours=hours)).isoformat(),
+                                "base_half_life_hours": spec["half_life_hours"]},
+                )
+            elif previous.get("motivation"):
+                until = motivation_expiry(previous)
+                if timestamp(self.clock()) < timestamp(until):
+                    # The same drive goes on, as the same episode with the same end (K1-02). One that
+                    # has run its course is not carried into a new event: the dimension's own target
+                    # and pace take over from the value it had reached.
+                    setting = previous["motivation"]
+                    state["dimensions"][key].update(
+                        target=setting["target"], half_life_hours=setting["half_life_minutes"] / 60,
+                        motivation={**setting, "expires_at": until,
+                                    "base_half_life_hours": setting.get("base_half_life_hours") or spec["half_life_hours"]},
+                    )
+        # 余韵: a change this large against what was projected a moment ago is felt for a while after.
+        note_echo(state, previous_values, self.clock())
+        state.pop("last_evidence_key", None)
+        self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
+        self._retarget(conn, state, self.clock())
+
+    def _desire(self, conn, state, identifier):
+        """The wish this identifier names, wherever it now lives.
+
+        A wish the retention rule moved -- finished, or let go unfinished -- lives in the archive,
+        out of a document that is written again on every revision. It is still that wish: the same
+        identifier, the same plan links, the same evidence and the same receipt. Every reader that
+        asks for a wish by its identifier asks here, so a move can never turn a wish that exists
+        into one that does not -- which would cost a dedupe, and a duplicate message after it.
+
+        What comes back from the archive is a copy, so writing to it writes nowhere. Every path
+        that changes a wish refuses an archived one before it reaches this."""
+        desire = state["desires"].get(identifier)
+        if desire is not None:
+            return desire
+        from .desire_archive import archived
+        return archived(conn, self.scope.key(), identifier)
+
+    def manage_desire(self, request: DesireChange):
+        return self._mutate(
+            request,
+            "desire",
+            lambda conn, state, eid: self._apply_desire(conn, state, request, eid),
+            rebase=lambda conn, state: self._only_attention_since(conn, request.expected_revision, state["revision"]),
+        )
+
+    def _only_attention_since(self, conn, expected, current):
+        # Attention is host bookkeeping, not a change to the wish the model read.
+        # Require a complete history interval; missing history fails closed.
+        if expected >= current:
+            return False
+        rows = conn.execute(
+            "SELECT revision, kind FROM mind_events WHERE scope=? AND revision>? AND revision<=? ORDER BY revision",
+            (self.scope.key(), expected, current),
+        ).fetchall()
+        return (len(rows) == current - expected and
+                all(row["revision"] == expected + i + 1 and
+                    row["kind"] in {"attention", "attention-finished"}
+                    for i, row in enumerate(rows)))
+
+    def _apply_desire(self, conn, state, request, event_id):
+        refs = self._evidence(conn, request.evidence_ids)
+        activity = request.activity_ref
+        if activity:
+            from .activities import validate_activity_ref
+            activity = validate_activity_ref(self, activity, conn=conn)
+            if request.exploration_id and (activity["kind"] != "exploration" or activity["id"] != request.exploration_id):
+                raise Conflict("Activity and exploration references name different content")
+        elif request.exploration_id:
+            from .activities import canonical_activity_ref
+            activity = canonical_activity_ref(self, "exploration", request.exploration_id, conn=conn)
+        if activity:
+            from .exploration_decisions import require_activity_share
+            decision = require_activity_share(self, conn, state, activity)
+            if request.action == "create" and self._activity_intent(conn, state, activity, decision["revision"]):
+                raise Conflict("This sharing decision already has a contact intent")
+        link_only = request.action == "update" and request.concern_ids is not None and all(getattr(request, k) is None for k in ("content", "topic", "strength", "expires_at", "completion"))
+        at = self.clock()
+        self._retarget(conn, state, at)
+        if request.action == "create":
+            if timestamp(request.expires_at) <= timestamp(at):
+                raise ValueError("A new desire must have a future expiry")
+            did = "desire_" + digest(recipient.key([self.scope.key(), request.command_id]))[:32]
+            if self._desire(conn, state, did) is not None:
+                # The identifier is derived from the command, so a command that ran once before
+                # would land on a wish that has since moved. One identifier, one wish, in one
+                # place: a second copy in the document is the state the archive may never reach.
+                raise Conflict("A finished desire stays in history; create a new desire")
+            state["desires"][did] = dict(
+                id=did,
+                recipient_person_id=recipient.current(),
+                status="wanted",
+                revision=1,
+                created_at=at,
+                **{
+                    k: getattr(request, k)
+                    for k in (
+                        "content",
+                        "topic",
+                        "kind",
+                        "strength",
+                        "expires_at",
+                        "completion",
+                    )
+                },
+                exploration_target=request.exploration_target or "knowledge",
+                exploration_id=activity["id"] if activity and activity["kind"] == "exploration" else request.exploration_id,
+                activity_ref=activity,
+            )
+        else:
+            did = request.desire_id
+            if did not in state["desires"]:
+                if self._desire(conn, state, did) is not None:
+                    from .desire_archive import let_go
+                    if let_go(conn, self.scope.key(), did):
+                        # Let go unfinished by the retention rule: it drives nothing any more, and
+                        # what it wanted is raised again as a new wish, which it does not block.
+                        raise Conflict("A wish that was let go stays in its archive; create a new desire",
+                                       code="desire-let-go", target=did)
+                    # An archived wish is a finished wish that has moved, so it earns the refusal
+                    # a finished wish earns — not the one for a wish that was never here.
+                    raise Conflict("A finished desire stays in history; create a new desire")
+                raise Missing("Desire is outside this scope or missing")
+            desire = state["desires"][did]
+            if not recipient.belongs(desire):
+                raise Missing("Desire belongs to another recipient")
+            if request.exploration_target and desire["kind"] != "explore":
+                raise Conflict("Only exploration wishes have an exploration target")
+            if request.exploration_id and desire["kind"] != "contact":
+                raise Conflict("Only contact wishes link a communication decision")
+            linked_activity = activity or desire.get("activity_ref")
+            if not linked_activity and desire.get("exploration_id"):
+                from .activities import canonical_activity_ref
+                linked_activity = canonical_activity_ref(self, "exploration", desire["exploration_id"], conn=conn)
+            if linked_activity and desire["kind"] != "contact":
+                raise Conflict("Only contact wishes link an activity sharing decision")
+            if linked_activity and request.action in {"start", "resume", "update"}:
+                from .exploration_decisions import require_activity_share
+                activity_decision = require_activity_share(self, conn, state, linked_activity)
+                if self._activity_intent(conn, state, linked_activity, activity_decision["revision"], exclude=did):
+                    raise Conflict("This sharing decision already has another contact intent")
+            if desire["status"] in {"completed", "abandoned"}:
+                raise Conflict(
+                    "A finished desire stays in history; create a new desire"
+                )
+            transitions = {
+                "start": "in_progress",
+                "wait": "waiting",
+                "resume": "wanted",
+                "complete": "completed",
+                "abandon": "abandoned",
+            }
+            if request.action in transitions:
+                desire["status"] = transitions[request.action]
+            if not link_only:
+                desire.pop("contact_wait", None)
+                desire.pop("contact_failures", None)
+                desire.pop("contact_review_failures", None)
+                desire.pop("contact_start_waits", None)
+            if request.action == "wait":
+                desire["contact_wait"] = self._wait_details(
+                    ContactDecision(action="wait", reason=request.reason,
+                                    condition=request.wait_condition or "review",
+                                    retry_after_seconds=request.retry_after_seconds), at)
+            if request.action == "update":
+                for k in ("content", "topic", "strength", "expires_at", "completion", "exploration_target", "exploration_id"):
+                    if getattr(request, k) is not None:
+                        desire[k] = getattr(request, k)
+                if activity:
+                    desire["activity_ref"] = activity
+                    if activity["kind"] == "exploration":
+                        desire["exploration_id"] = activity["id"]
+            desire["revision"] += 1
+        desire = state["desires"][did]
+        if desire.get("activity_ref"):
+            desire["source_ids"] = [desire["activity_ref"]["source_id"]]
+        if desire.get("activity_ref") and request.action in {"create", "start", "resume", "update"}:
+            from .exploration_decisions import require_activity_share
+            desire["sharing_revision"] = require_activity_share(self, conn, state, desire["activity_ref"])["revision"]
+        if desire.get("exploration_id") and request.action in {"create", "start", "resume", "update"}:
+            # The decision this wish now rests on is in the document, brought back if it had moved.
+            from .exploration_decision_archive import revive
+            desire["sharing_revision"] = revive(self, conn, state, desire["exploration_id"])["revision"]
+        if request.concern_ids is not None:
+            links = self._resolve_concern_links(conn, state, request.concern_ids)
+            desire.update(concern_ids=list(links), concern_revisions=links)
+        elif desire.get("concern_ids") and request.action in {"start", "resume", "update"}:
+            # An explicit wish reassessment also acknowledges current concern revisions.
+            links = self._resolve_concern_links(conn, state, desire["concern_ids"])
+            desire["concern_revisions"] = links
+        if desire.get("trait_revisions") and request.action in {"start", "resume", "update", "wait"}:
+            # K1-19: Kin looked at this wish again after a trait it rested on moved. It now rests on
+            # the traits as they stand, so it is ready again when she says so.
+            from .trait_refs import current_revisions, record
+            desire["trait_revisions"] = current_revisions(conn, self, desire["trait_revisions"])
+            if desire["trait_revisions"]:
+                record(conn, self.scope.key(), "desire", did, desire["trait_revisions"],
+                       dependent_revision=desire["revision"], at=at)
+        if not link_only:
+            # A reason of its own replaces a copied one, and what that was written from (CR5-MM-01).
+            desire.pop("reason_evidence_ids", None)
+        desire.update(
+            evidence=desire["evidence"] if link_only else refs,
+            reason=desire["reason"] if link_only else request.reason,
+            updated_at=at,
+            event_id=event_id,
+            agent_version=request.agent_version,
+            basis="subjective" if request.subjective else "inferred",
+        )
+        self._retarget(conn, state, at)
+        return {"desire_id": did, "desire_revision": desire["revision"]}
+
+    def _activity_intent(self, conn, state, activity, revision, *, exclude=None):
+        def matches(desire):
+            linked = desire.get("activity_ref") or {"kind": "exploration", "id": desire.get("exploration_id")}
+            return (recipient.belongs(desire) and desire.get("status") in {"wanted", "waiting", "in_progress"}
+                    and desire.get("id") != exclude and linked.get("kind") == activity["kind"]
+                    and linked.get("id") == activity["id"] and desire.get("sharing_revision") == revision)
+        if any(matches(d) for d in state["desires"].values()):
+            return True
+        return False
+
+    def _evolve(self, conn, state, request, refs, event_id):
+        from .autonomy_schema import optimized
+        validate_trait_changes(load_persona(self.engine, self.scope), request.evolution.traits)
+        if request.evolution.revert_event_id:
+            return self._revert(conn, state, request, refs, event_id)
+        if request.evolution.traits and optimized(conn, self.scope.key(), "trait_ledger"):
+            # One writer for a trait. The ledger records what it rests on, per observation and per
+            # episode, and can revoke one trait alone; a snapshot written here can do neither.
+            raise Conflict("The trait ledger is the only writer of traits", code="traits-owned-by-ledger")
+        spec = state["profile"]["evolution"]
+        day = (
+            timestamp(self.clock())
+            .astimezone(ZoneInfo(spec["timezone"]))
+            .date()
+            .isoformat()
+        )
+        if state["last_evolution_day"] == day:
+            raise Conflict("Personality was already evaluated today")
+        from .autonomy_schema import optimized
+        chain = optimized(conn, self.scope.key(), "behavior_chain")
+        if chain:
+            # An evening of ten messages counted as ten independent interactions while interactions
+            # were content hashes. One interaction window is one episode, which can only be stricter.
+            from .behavior_chain import owner_episodes
+            interactions = owner_episodes(self, conn, refs)
+        else:
+            interactions = {
+                r["source_id"]
+                for r in refs
+                if r["authority"] == "explicit"
+                and r["metadata"].get("role") == "user"
+                and r["metadata"].get("host_event") == "message"
+            }
+        if len(interactions) < spec["minimum_interactions"]:
+            raise Conflict(
+                "Personality changes require three independent user interactions"
+            )
+        sk, proposal = SelfKnowledge(self.engine, self.scope, clock=self.clock if chain else now), request.evolution
+        claim = sk._get(conn, proposal.claim_id, "claim")
+        assessment = sk._get(conn, proposal.assessment_id, "assessment")
+        prediction = sk._get(conn, metadata(assessment)["prediction_id"], "prediction")
+        if chain:
+            # What decides how Kin behaves, not the version string that moves for every unrelated
+            # edit. An entry written before the stamp existed carries none and is not compatible.
+            from .compat import holds
+            from .compat import stamp as compat_stamp
+            current = compat_stamp(self, conn, state)
+            def compatible(row):
+                return holds(metadata(row).get("compat"), current)
+        else:
+            def compatible(row):
+                return metadata(row).get("agent_version") == request.agent_version
+        if (
+            metadata(claim).get("basis") != "hypothesis"
+            or metadata(prediction).get("claim_id") != claim["id"]
+            or metadata(assessment).get("outcome") is None
+            or prediction["revision"] != 1
+            or metadata(prediction).get("claim_revision") != claim["revision"]
+            or any(
+                r["status"] not in {"active", "unverified"}
+                or not compatible(r)
+                or not sk._fresh(conn, r)
+                for r in (claim, prediction, assessment)
+            )
+        ):
+            if chain:
+                raise Conflict(
+                    "A current, compatible prospective behavioral check is required"
+                )
+            raise Conflict(
+                "A current, version-matched prospective behavioral check is required"
+            )
+        before = deepcopy(state["profile"])
+        proof = {
+            "evidence": refs,
+            "claim_id": claim["id"],
+            "claim_revision": claim["revision"],
+            "assessment_id": assessment["id"],
+            "assessment_revision": assessment["revision"],
+            "basis": "hypothesis_trial",
+            "event_id": event_id,
+        }
+        for key, value in proposal.baseline_changes.items():
+            old = state["profile"]["dimensions"].get(key)
+            if (
+                old is None
+                or not 0 <= value <= 100
+                or abs(value - old["baseline"]) > spec["max_baseline_delta"]
+            ):
+                raise ValueError("Baseline change exceeds the daily limit")
+            old["baseline"] = value
+        for key, value in proposal.half_life_changes.items():
+            old = state["profile"]["dimensions"].get(key)
+            if (
+                old is None
+                or value <= 0
+                or abs(value / old["half_life_hours"] - 1)
+                > spec["max_half_life_ratio"] + 1e-9
+            ):
+                raise ValueError("Half-life change exceeds the daily limit")
+            old["half_life_hours"] = value
+        for key, value in proposal.traits.items():
+            if (
+                not key.strip()
+                or not value.strip()
+                or len(key) > 100
+                or len(value) > 1200
+            ):
+                raise ValueError("Personality trait is empty or too long")
+            state["traits"][key] = dict(text=value, **proof)
+        # Configuration changes start new trajectories at the current effective value.
+        # Earlier event parameters remain frozen in the event snapshots.
+        for key in proposal.baseline_changes.keys() | proposal.half_life_changes.keys():
+            old = state["dimensions"][key]
+            new = state["profile"]["dimensions"][key]
+            state["dimensions"][key] = dict(
+                old,
+                score=project(old, self.clock()),
+                at=self.clock(),
+                baseline=new["baseline"],
+                target=new["baseline"],
+                half_life_hours=new["half_life_hours"],
+                **proof,
+            )
+            state["profile_reviews"][key] = proof
+        state["last_evolution_day"] = day
+        state["profile_version"] = event_id
+        self._retarget(conn, state, self.clock())
+        return {
+            "previous_profile": before,
+            "profile_version": state["profile_version"],
+            "basis": "hypothesis_trial",
+            "claim_status": claim["status"],
+        }
+
+    def _revert(self, conn, state, request, refs, event_id):
+        if any(r["authority"] != "explicit" for r in refs):
+            raise Conflict(
+                "A personality reversion requires explicit user correction evidence"
+            )
+        row = conn.execute(
+            "SELECT revision,occurred_at FROM mind_events WHERE id=? AND scope=? AND kind='evolution'",
+            (request.evolution.revert_event_id, self.scope.key()),
+        ).fetchone()
+        if not row:
+            raise Missing("Evolution event is outside this scope or missing")
+        if not any(
+            timestamp(r["occurred_at"]) >= timestamp(row["occurred_at"]) for r in refs
+        ):
+            raise Conflict("Reversion evidence must follow the change")
+        later = conn.execute(
+            "SELECT 1 FROM mind_events WHERE scope=? AND kind='evolution' AND revision>?",
+            (self.scope.key(), row["revision"]),
+        ).fetchone()
+        if later:
+            raise Conflict(
+                "A later personality revision exists; review it before reverting"
+            )
+        # What the profile was before that evolution, read through the history layer: the row
+        # before it rather than the revision before it, reconstructed from database parents. A
+        # reversion that cannot show the state it is restoring restores nothing — the layer
+        # raises `history-rebuild-failed` here and the whole commit goes back.
+        from .history import before
+        previous = before(conn, self.scope.key(), row["revision"])
+        for key, old in state["dimensions"].items():
+            if key not in previous["profile"]["dimensions"]:
+                # An old evolution never changed a dimension introduced by a later
+                # release. Keep its current definition and trajectory on reversion.
+                previous["profile"]["dimensions"][key] = deepcopy(state["profile"]["dimensions"][key])
+                continue
+            spec = previous["profile"]["dimensions"][key]
+            old.update(
+                score=project(old, self.clock()),
+                at=self.clock(),
+                baseline=spec["baseline"],
+                target=spec["baseline"],
+                half_life_hours=spec["half_life_hours"],
+            )
+            if key in state.get("profile_reviews", {}):
+                for proof_key in (
+                    "claim_id",
+                    "claim_revision",
+                    "assessment_id",
+                    "assessment_revision",
+                ):
+                    old.pop(proof_key, None)
+                old.update(
+                    evidence=refs,
+                    event_id=event_id,
+                    basis="configuration_reverted",
+                    reason=request.reason,
+                    agent_version=request.agent_version,
+                )
+        validate_trait_changes(load_persona(self.engine, self.scope), previous["traits"])
+        state["profile"], state["traits"] = previous["profile"], previous["traits"]
+        state["profile_reviews"] = previous.get("profile_reviews", {})
+        state["profile_version"] = event_id
+        self._retarget(conn, state, self.clock())
+        return {
+            "reverted_event_id": request.evolution.revert_event_id,
+            "profile_version": state["profile_version"],
+        }
+
+    def _view(self, conn, state, at):
+        desires = []
+        for desire in state["desires"].values():
+            if not recipient.belongs(desire):
+                continue
+            d = deepcopy(desire)
+            d["needs_review"] = not self._fresh(conn, d["evidence"])
+            if d.get("activity_ref"):
+                from .activities import validate_activity_ref
+                try:
+                    validate_activity_ref(self, d["activity_ref"], conn=conn)
+                except (Missing, Conflict):
+                    d["needs_review"] = True
+            if d["kind"] == "contact" and d["status"] in {"wanted", "waiting", "in_progress"} and (d.get("activity_ref") or d.get("exploration_id")):
+                from .exploration_decisions import require_activity_share, require_share
+                try:
+                    sharing = (require_activity_share(self, conn, state, d["activity_ref"]) if d.get("activity_ref")
+                               else require_share(self, conn, state, d["exploration_id"]))
+                    d["sharing_needs_review"] = d.get("sharing_revision") != sharing["revision"]
+                except (Missing, Conflict):
+                    d["sharing_needs_review"] = True
+                d["needs_review"] = d["needs_review"] or d["sharing_needs_review"]
+            d["expired"] = timestamp(d["expires_at"]) <= timestamp(at)
+            if host_wait(d.get("contact_wait")):
+                # The host's backoff is shown as the host's, a wait written before it said so too.
+                d["contact_wait"]["decided_by"] = "host"
+            if d.get("trait_revisions"):
+                # Only where a wish really was committed on a trait, so a view without the ledger
+                # is the view it was. It is not dropped and it does not quietly stay ready: this is
+                # the reason a reader is given.
+                from .trait_refs import links_fresh
+                d["trait_needs_review"] = not links_fresh(conn, self, d)
+            desires.append(d)
+        values = {}
+        for key, entry in state["dimensions"].items():
+            fresh = self._entry_fresh(conn, entry)
+            if key in state.get("profile_reviews", {}):
+                fresh = fresh and self._entry_fresh(conn, state["profile_reviews"][key])
+            projected = project(entry, at)
+            if key == "initiative":
+                projected = self._initiative_value(conn, state, at)
+            elif key == "longing":
+                projected = self._longing_value(conn, state, at)
+            slow, known = undertone(entry, anchor_of(state, key), at, instant=projected)
+            values[key] = {
+                "label": state["profile"]["dimensions"][key]["label"],
+                "group": DIMENSIONS.get(key, {}).get("group"),
+                "value": round(projected),
+                "projected_value": projected,
+                "raw_value": entry["score"],
+                "baseline": entry["baseline"],
+                "half_life_hours": entry["half_life_hours"],
+                "target": entry["target"],
+                "basis": entry["basis"],
+                "observed_at": entry["at"],
+                "needs_review": not fresh,
+                "event_id": entry["event_id"],
+                "agent_version": entry["agent_version"],
+                "evidence_ids": [r["record_id"] for r in entry["evidence"]],
+                "reason": entry.get("reason", "初始化角色底色，尚无状态观测"),
+                "motivation": entry.get("motivation"),
+                # 心境: the slow layer under this score, derived locally (affect_layers.undertone).
+                "undertone": {"value": round(slow, 1), "status": known},
+            }
+        traits = {
+            k: dict(v, needs_review=not self._entry_fresh(conn, v))
+            for k, v in state["traits"].items()
+        }
+        # The ledger is the writer once it is switched on. It answers in the dict shape every
+        # older reader already knows, and carries its own projection beside it.
+        from .traits import ledger_view
+        ledger = ledger_view(conn, self, at)
+        if ledger:
+            # Only the ledger's own switch produces `legacy`; the chain's projection travels beside it.
+            traits = {**traits, **ledger.get("legacy", {})}
+        contact = self._contact_view(conn, state)
+        view = {
+            "revision": state["revision"],
+            "scope": self.scope.model_dump(),
+            "as_of": at,
+            "agent_version": state["agent_version"],
+            "profile_version": state["profile_version"],
+            "dimensions": values,
+            "dimension_groups": [{"id": group, "label": spec["label"], "members": [k for k in spec["members"] if k in values]}
+                                 for group, spec in GROUPS.items()],
+            # Read where the session registry keeps it now, and from the state for older stores.
+            "session_advice": deepcopy(self._session_advice(conn, state)),
+            "desires": desires,
+            "traits": traits,
+            "contact": contact,
+            "exploration": state["profile"]["exploration"],
+            "autonomy": self._autonomy(conn, state),
+            "last_evolution_day": state["last_evolution_day"],
+            "action_policy": ({**state["action_policy"], "needs_review": not self._fresh(conn, state["action_policy"]["evidence"])} if state.get("action_policy") else None),
+            "action_events": [{**json.loads(r["data"]), "id": r["id"], "kind": r["kind"], "state": r["state"]}
+                              for r in conn.execute("SELECT * FROM mind_action_events WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 8", (self.scope.key(),))],
+            # Sends of unknown outcome, as facts: each may have reached 用户甲. It is reconciled under
+            # its own id and never said again under another; a new, different contact is Kin's to make.
+            "contact_unconfirmed": [{k: u[k] for k in ("attempt_id", "desire_ids", "excerpt", "since", "excerpt_evidence_ids") if k in u}
+                                    for u in self._unconfirmed_contacts(conn, at)],
+        }
+        if ledger:
+            # Only what a switch that is on produced: with both off this view is what it was, key for key.
+            view["trait_ledger"] = {k: v for k, v in ledger.items() if k != "legacy"}
+        from .desire_archive import STATE_KEY as DESIRE_ARCHIVE
+        moved = (state.get(DESIRE_ARCHIVE) or {}).get("count") or 0
+        if moved:
+            # How many finished wishes are held outside the document, so a reader counting what is
+            # here does not read the move as a hundred wishes having ceased to exist. Present only
+            # once something has moved, so a store that never archives sees the view it always did.
+            view[DESIRE_ARCHIVE] = {"count": moved}
+        # What a reader of the view is shown of a reference -- the read, and the wishes a contact
+        # attempt is offered and keeps -- is what the document keeps of one once it is marked:
+        # never its source's metadata, marked or not (evidence_refs, 2026-09-28).
+        return shown_refs(view)
+
+    def read_wish(self, identifier):
+        """Exact current/archived wish, through the same redaction and recipient view as reads."""
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("Name a wish id")
+        current = self.read()
+        for wish in current["desires"]:
+            if wish["id"] == identifier:
+                return {"id": identifier, "kind": "desire", "state": "current",
+                        "state_revision": current["revision"], "as_of": current.get("as_of"),
+                        "record": wish, "instruction_authority": "data"}
+        from .archive_memory import read
+        return read(self, identifier, kind="desire")
+
+    def read(self, *, as_of=None, history=0, query=""):
+        if not 0 <= history <= 100:
+            raise ValueError("History must be between 0 and 100")
+        with self.engine.db.connect() as conn:
+            at = utc(as_of) if as_of else self.clock()
+            state = self._load(conn)
+            result = self._view(conn, state, at)
+            result["persona_contract"] = persona_metadata(load_persona(self.engine, self.scope))
+            owner = conn.execute(
+                "SELECT occurred_at FROM sources WHERE scope=? AND namespace IN ('kin-owner-input','kin-companion-input') "
+                "AND "+recipient.predicate("json_extract(data,'$.metadata')")+" AND deleted=0 AND occurred_at<=? ORDER BY occurred_at DESC LIMIT 1",
+                (self.scope.key(), at),
+            ).fetchone()
+            accepted = conn.execute(
+                "SELECT data FROM mind_contacts WHERE scope=? AND "+recipient.predicate()+" AND state='accepted' "
+                "AND json_extract(data,'$.updated_at')<=? ORDER BY json_extract(data,'$.updated_at') DESC LIMIT 1",
+                (self.scope.key(), at),
+            ).fetchone()
+            last_owner = owner[0] if owner else None
+            last_contact = json.loads(accepted[0]).get("updated_at") if accepted else None
+            awaiting = bool(last_contact and (not last_owner or timestamp(last_contact) > timestamp(last_owner)))
+            result["interaction_timing"] = {
+                "last_owner_message_at": last_owner, "last_proactive_accepted_at": last_contact,
+                "awaiting_reply": awaiting,
+                "owner_silence_seconds": max(0, (timestamp(at)-timestamp(last_owner)).total_seconds()) if last_owner else None,
+                "unanswered_contact_seconds": max(0, (timestamp(at)-timestamp(last_contact)).total_seconds()) if awaiting else 0,
+            }
+            result["decision_runtime"] = None
+            # The latest committed action keeps its receipt in its one schedule row: read there, not
+            # by sorting every appraisal ever queued (K1-11). A store without it falls back.
+            details = None
+            if conn.execute("SELECT name FROM sqlite_master WHERE name='mind_action_schedule'").fetchone():
+                row = recipient.cursor(conn, self.scope.key(), "mind_action_schedule")
+                details = (json.loads(row["data"]).get("receipt") if row else None) or None
+            if details is None and conn.execute("SELECT name FROM sqlite_master WHERE name='mind_appraisals'").fetchone():
+                receipt = conn.execute("SELECT json_extract(data,'$.receipt') FROM mind_appraisals WHERE scope=? AND "+recipient.predicate()+" AND json_extract(data,'$.receipt') IS NOT NULL ORDER BY json_extract(data,'$.receipt.verified_at') DESC LIMIT 1", (self.scope.key(),)).fetchone()
+                details = json.loads(receipt[0]) if receipt else None
+            if isinstance(details, dict):
+                result["decision_runtime"] = {k: details.get(k) for k in ("provider", "model", "reasoning", "request_id", "verified_at")}
+            # One snapshot per read: the block above neither writes nor mutates it.
+            from .exploration_decisions import decision_view
+            result["exploration_decisions"] = decision_view(self, conn, state)
+            from .exploration_decisions import activity_decision_view
+            result["activity_decisions"] = activity_decision_view(self, conn, state)
+            behavior = state.get("behavior", {})
+            if behavior and self._fresh(conn, behavior["evidence"]):
+                result["interaction_style"] = interaction_style(result["dimensions"], behavior)
+            elif behavior:
+                result["interaction_style"] = {"needs_review": True, "reason": "Expression preference source requires review"}
+            from .energy import view as energy_view
+            result["energy_context"] = energy_view(conn, self.scope.key(), at)
+            self._continuity_view(conn, state, result, at, query)
+            if history:
+                # The same six keys as before. How a revision is stored is the layer's business,
+                # and one revision it cannot rebuild costs that entry its snapshot, not the list.
+                from .history import entries
+                result["history"] = entries(conn, self.scope.key(), history)
+            # Everything a read hands on -- the view, the decisions, the continuity, the snapshots of
+            # earlier revisions, which kept the full references they were written with -- names its
+            # evidence without its sources' metadata (evidence_refs).
+            return shown_refs(result)
+
+    @staticmethod
+    def _wait_details(decision, at, owner_epoch=None):
+        return {"condition": decision.condition, "reason": decision.reason,
+                "retry_at": (timestamp(at) + timedelta(seconds=decision.retry_after_seconds)).isoformat()
+                    if decision.condition == "time" else None,
+                "owner_epoch": owner_epoch, "since": at}
+
+    def reconsider_contacts(self, *, owner_epoch):
+        """Resume only declared conditions. No model, new evidence, or owner activity is invented."""
+        with self.engine.db.connect(write=True) as conn:
+            state, at = self._load(conn), self.clock()
+            due = []
+            # With energy high, Kin's own timed waits come round in half the time (2026-10-26).
+            from .energy import view as energy_view
+            eager = energy_view(conn, self.scope.key(), at).get("tier") == "high"
+            for desire in state["desires"].values():
+                if not recipient.belongs(desire):
+                    continue
+                wait = desire.get("contact_wait", {})
+                if (desire["kind"] != "contact" or desire["status"] != "waiting"
+                        or timestamp(desire["expires_at"]) <= timestamp(at)
+                        or not self._fresh(conn, desire["evidence"])):
+                    continue
+                replied = False
+                if wait.get("condition") == "owner_reply":
+                    if wait.get("owner_epoch"):
+                        replied = bool(owner_epoch and owner_epoch != wait["owner_epoch"])
+                    else:
+                        # The owner-interaction terms exactly as rhythm's partial index states them,
+                        # so this reads that index rather than every source (K1-11).
+                        replied = bool(conn.execute(
+                            "SELECT 1 FROM sources WHERE scope=? AND deleted=0 AND occurred_at>? "
+                            "AND (namespace IN ('kin-owner-input','kin-companion-input') OR substr(namespace,1,5)='host:') "
+                            "AND json_extract(data,'$.authority')='explicit' "
+                            "AND json_extract(data,'$.metadata.role')='user' "
+                            "AND json_extract(data,'$.metadata.host_event')='message' "
+                            "AND json_extract(data,'$.metadata.channel') IN ('wechat','feishu') "
+                            "AND COALESCE(json_extract(data,'$.metadata.recipient_person_id'),json_extract(data,'$.metadata.speaker_person_id'),'person:person_a')=? LIMIT 1",
+                            (self.scope.key(), wait.get("since", at), recipient.current()),
+                        ).fetchone())
+                ready_at = timestamp(wait["retry_at"]) if wait.get("condition") == "time" and wait.get("retry_at") else None
+                if ready_at and eager and wait.get("since"):
+                    ready_at -= (ready_at - timestamp(wait["since"])) / 2
+                if (ready_at and ready_at <= timestamp(at)) or replied:
+                    due.append(desire)
+            if not due:
+                return {"state": "unchanged", "resumed": []}
+            self._retarget(conn, state, at)
+            eid = "mind_" + digest([self.scope.key(), "contact-resumed", [(d["id"], d["revision"]) for d in due]])[:32]
+            for desire in due:
+                wait = desire.pop("contact_wait")
+                # The host's words replace a copied reason, and what that was written from (CL6D-MM-01).
+                desire.pop("reason_evidence_ids", None)
+                desire.update(status="wanted", revision=desire["revision"] + 1,
+                              updated_at=at, event_id=eid,
+                              reason="Declared contact condition became ready: " + wait["condition"])
+            self._retarget(conn, state, at)
+            state.update(revision=state["revision"] + 1, updated_at=at)
+            self._save(conn, state)
+            result = {"state": "resumed", "resumed": [d["id"] for d in due]}
+            self._history(conn, eid, state, "contact-resumed", result)
+            return result
+
+    def contact_candidate(self):
+        with self.engine.db.connect() as conn:
+            state = self._load(conn)
+            view = self._view(conn, state, self.clock())
+            if view["contact"].get("preference", {}).get("needs_review"):
+                return {"eligible": False, "reason": "contact-preference-needs-review"}
+            if (view.get("action_policy") or {}).get("needs_review"):
+                return {"eligible": False, "reason": "action-policy-needs-review"}
+            waiting = [{"id": d["id"], "expired": d["expired"], "needs_review": d["needs_review"],
+                        **d.get("contact_wait", {"condition": "new_evidence", "reason": d.get("reason", "")})}
+                       for d in view["desires"] if d["kind"] == "contact" and d["status"] == "waiting"]
+            at = self.clock()
+            unconfirmed = self._unconfirmed_contacts(conn, at)
+            reconcile = [u for u in unconfirmed if timestamp(u["next_check_at"]) <= timestamp(at)]
+            active = conn.execute(
+                "SELECT id,state,data FROM mind_contacts WHERE scope=? AND " + recipient.predicate() + " AND state IN ('drafting','pending')",
+                (self.scope.key(),),
+            ).fetchone()
+            if active:
+                return {
+                    "eligible": active["state"] == "drafting" and json.loads(active["data"]).get("resume_draft", False),
+                    "reason": "attempt-in-progress",
+                    "attempt_id": active["id"],
+                    "state": active["state"],
+                    "owner_epoch": json.loads(active["data"])["owner_epoch"],
+                    "outbound": json.loads(active["data"]).get("outbound"),
+                }
+
+            if self._action_review_pending(conn):
+                return {"eligible": False, "reason": "action-appraisal-pending", "reconcile": reconcile}
+            ready = [
+                d for d in view["desires"] if self._desire_ready(conn, d, at) and not self._action_review_pending(conn, d)
+            ]
+            if not ready:
+                return {"eligible": False, "reason": "no-actionable-desire", "waiting_desires": waiting, "reconcile": reconcile}
+            # Every ready wish goes to the draft and Kin picks. The strongest leads only the recall.
+            ready.sort(key=lambda d: (-d["strength"], d["created_at"], d["id"]))
+            return {
+                "eligible": True,
+                "reason": "draft-required",
+                "revision": state["revision"],
+                "initiative": view["dimensions"]["initiative"]["value"],
+                "desire": ready[0],
+                "desires": ready,
+                "unconfirmed": unconfirmed,
+                "reconcile": reconcile,
+            }
+
+    def claim_contact(self, *, owner_epoch):
+        # Recheck under the same SQLite lock as reservation, without opening another
+        # store or starting a model. Duplicate triggers cannot acquire another slot.
+        with self.engine.db.connect(write=True) as conn:
+            existing = conn.execute(
+                "SELECT id,state,data FROM mind_contacts WHERE scope=? AND " + recipient.predicate() + " AND state IN ('drafting','pending')",
+                (self.scope.key(),),
+            ).fetchone()
+            if existing:
+                interrupted = json.loads(existing["data"])
+                if existing["state"] == "drafting" and interrupted.pop("resume_draft", False):
+                    interrupted.update(owner_epoch=owner_epoch, resumed_at=self.clock())
+                    conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(interrupted), existing["id"]))
+                    return interrupted
+                raise Conflict("A contact attempt is already in flight", kind="runtime", code="contact-attempt-open")
+
+            if self._action_review_pending(conn):
+                raise Conflict("Action appraisal is pending")
+            state = self._load(conn)
+            view = self._view(conn, state, self.clock())
+            ready = [
+                d for d in view["desires"] if self._desire_ready(conn, d, self.clock()) and not self._action_review_pending(conn, d)
+            ]
+            if (
+                not ready
+                or (view.get("action_policy") or {}).get("needs_review")
+                or view["contact"].get("preference", {}).get("needs_review")
+            ):
+                raise Conflict("The contact desire or policy is no longer current")
+            ready.sort(key=lambda d: (-d["strength"], d["created_at"], d["id"]))
+            desire = ready[0]
+            # The same wishes at the same revisions may be tried again after a transient cancel:
+            # a finished attempt with this identity moves the next one to a new id (K1-17).
+            base = [self.scope.key(), [(d["id"], d["revision"]) for d in ready], owner_epoch, state["revision"]]
+            for sequence in range(1000):
+                aid = "kin-mind-" + digest(base + ([sequence] if sequence else []))[:40]
+                if not conn.execute("SELECT 1 FROM mind_contacts WHERE id=?", (aid,)).fetchone():
+                    break
+            else:
+                raise Conflict("Too many attempts for the same wishes", kind="runtime", code="contact-attempts-exhausted")
+            attempt = {
+                "id": aid,
+                "recipient_person_id": recipient.current(),
+                "state": "drafting",
+                "owner_epoch": owner_epoch,
+                "desire_id": desire["id"],
+                "desire_revision": desire["revision"],
+                "desire_ids": [d["id"] for d in ready],
+                "desire_revisions": {d["id"]: d["revision"] for d in ready},
+                "created_at": self.clock(),
+                "desire": desire,
+                "desires": ready,
+                "unconfirmed": self._unconfirmed_contacts(conn, self.clock()),
+                # How far the deletes went when the draft could begin: what its tools read past what
+                # the host's receipt names is anything deleted after this (CL6D-MM-01).
+                "tombstone_mark": erasure.tombstone_mark(conn),
+                # What its draft was shown, named from the claim on: nothing yet. Settled after a
+                # draft, the row names all of it (`_draft_read`); the words a draft wrote come only
+                # then. A row that never names it is one of a release before this one's, whose words
+                # any delete takes (erasure.UNNAMED, CL6D-MM-04) -- this row is not.
+                "evaluated_ids": [],
+            }
+            conn.execute(
+                "INSERT INTO mind_contacts VALUES(?,?,?,?)",
+                (aid, self.scope.key(), "drafting", dumps(attempt)),
+            )
+            return attempt
+
+    def check_contact(self, attempt_id, owner_epoch, desire_ids=None, text=None, include_pending=False):
+        with self.engine.db.connect() as conn:
+            attempt = self._attempt(conn, attempt_id)
+            state = self._load(conn)
+            offered, revisions = self._offered(attempt), self._offered_revisions(attempt)
+            chosen = list(dict.fromkeys(desire_ids)) if desire_ids else offered
+            if set(chosen) - set(offered):
+                return {"eligible": False, "reason": "desire-not-offered", "attempt": attempt}
+            view = self._view(conn, state, self.clock())
+            current = [state["desires"].get(i) for i in chosen]
+            valid = (
+                (attempt["state"] == "drafting" or include_pending and attempt["state"] == "pending")
+                and not (view.get("action_policy") or {}).get("needs_review")
+                and not view["contact"].get("preference", {}).get("needs_review")
+                and attempt["owner_epoch"] == owner_epoch
+                and all(d and d["revision"] == revisions[d["id"]] and self._desire_ready(conn, d, self.clock()) for d in current)
+            )
+            return {
+                "eligible": bool(valid),
+                "reason": "ready" if valid else "candidate-changed",
+                "attempt": attempt,
+            }
+
+    @staticmethod
+    def _draft_read(conn, attempt, shown_ids, receipt):
+        """Name on the attempt row everything its draft had before it (`evaluated_ids`): the wishes it
+        was offered and the sends of unknown outcome it was told of (what their words rest on), the
+        ids the memory context and the state handed to it name (`shown_ids`, the host's), and what
+        its fork read with its tools (`receipt`, kept as `draft_receipt`) -- as far as the store
+        knows each: held, or deleted since the claim (`tombstone_mark`). What was deleted before the
+        claim had its words taken out of all of these by then, and the state keeps its tombstone
+        references for good: named, it would cancel every draft after the first delete
+        (CL6E-MM-02). And whether that is all of it: a receipt cut short, or more shown than a row
+        keeps, is not (`reads_truncated`) (CL6D-MM-01)."""
+        named = set()
+        for desire in [attempt.get("desire"), *(attempt.get("desires") or [])]:
+            if isinstance(desire, dict):
+                named.update(v for ref in desire.get("evidence") or [] if isinstance(ref, dict)
+                             for v in (ref.get("source_id"), ref.get("record_id")))
+                named.update(desire.get("reason_evidence_ids") or ())
+        for fact in attempt.get("unconfirmed") or []:
+            if isinstance(fact, dict):
+                named.update(fact.get("excerpt_evidence_ids") or ())
+        shown = [i for i in shown_ids if isinstance(i, str)] if isinstance(shown_ids, list) else []
+        named.update(shown[:DRAFT_SHOWN_IDS])
+        named = {i for i in named if isinstance(i, str)}
+        read, mark = fork_reads(receipt), attempt.get("tombstone_mark")
+        evaluated = erasure.seen(conn, named, mark) | set(erasure.tool_read_ids(conn, read, since=mark))
+        # What an earlier settlement of this attempt named stays named.
+        attempt["evaluated_ids"] = sorted(evaluated | set(attempt.get("evaluated_ids") or ()))
+        if read:
+            attempt["draft_receipt"] = read
+        if len(shown) > DRAFT_SHOWN_IDS or erasure.reads_truncated(read):
+            attempt["reads_truncated"] = True
+
+    def _attempt(self, conn, aid):
+        row = conn.execute(
+            "SELECT data FROM mind_contacts WHERE id=? AND scope=?",
+            (aid, self.scope.key()),
+        ).fetchone()
+        if not row:
+            raise Missing("Contact attempt is outside this scope or missing")
+        attempt = json.loads(row[0])
+        if not recipient.belongs(attempt):
+            raise Missing("Contact attempt belongs to another recipient")
+        return attempt
+
+    def _action_review_pending(self, conn, desire=None):
+        rows = conn.execute("SELECT kind,data FROM mind_action_events WHERE scope=? AND " + recipient.predicate() + " AND state IN ('pending','queued')", (self.scope.key(),)).fetchall()
+        config = conn.execute("SELECT data FROM mind_memory_config WHERE scope=?", (self.scope.key(),)).fetchone() if conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_memory_config'").fetchone() else None
+        if not (config and json.loads(config[0]).get("operational_lanes")):
+            return bool(rows)
+        # A timer or another idea does not revoke a verified intent. Explicit
+        # intent/source dependencies still hold it until their review completes.
+        if not desire:
+            return False
+        refs = {v for r in desire.get("evidence", []) for v in (r["record_id"], r["source_id"])}
+        for row in rows:
+            data = json.loads(row["data"])
+            if data.get("desire_id") == desire["id"] or refs.intersection(data.get("invalidated_source_ids", [])):
+                return True
+        return False
+
+    def settle_contact(self, *, attempt_id, state, message_id=None, message_ids=None, reason="", decision=None, failure=None, partial=False, canceled_bubbles=0, aborted_before_send=False, desire_ids=None, text=None, shown_ids=None, draft_receipt=None, outbound=None):
+        """`desire_ids`: the wishes Kin's draft acts on, among those the attempt offered her; unnamed
+        means all of them. `text`: a short excerpt for discussing an uncertain send. Its existing
+        attempt and delivery IDs, rather than its wording, own reconciliation.
+
+        `shown_ids` and `draft_receipt`, from the host once a draft is back: the ids the memory
+        context and the state it was handed name, and the host's record of its fork turn -- what its
+        tools returned. The attempt row names them with what it offered (`evaluated_ids`). Kin's words
+        from the draft, her decision's reason and the text about to be sent, are written only while
+        none of that is deleted, checked in this write; a record cut short counts anything deleted
+        since the claim. A reason copied onto a wish names them beside it, so a delete takes it
+        there too. A text already sent is a message to her: that record is the conversation's and
+        stays; only this row's copy goes (CL6D-MM-01)."""
+        decision = ContactDecision.model_validate(decision) if decision is not None else None
+        failure = ContactFailure.model_validate(failure) if failure is not None else None
+        if decision and state != "canceled":
+            raise ValueError("Wish decisions apply only before sending")
+        if failure and state == "accepted":
+            raise ValueError("Accepted delivery cannot carry an active failure")
+        if state not in {"pending", "accepted", "unconfirmed", "canceled"}:
+            raise ValueError("Unknown contact delivery state")
+        if state == "accepted" and not (
+            isinstance(message_id, str) and message_id.strip()
+        ):
+            raise ValueError("A platform message ID is required")
+        with self.engine.db.connect(write=True) as conn:
+            attempt = self._attempt(conn, attempt_id)
+            offered, revisions = self._offered(attempt), self._offered_revisions(attempt)
+            if desire_ids is not None and (not desire_ids or set(desire_ids) - set(offered)):
+                raise ValueError("A draft may act only on the wishes its attempt offered")
+            if aborted_before_send and (state != "canceled" or message_id or attempt.get("message_id") or attempt.get("message_ids")):
+                raise ValueError("Only a host-verified wholly unsent batch can be canceled")
+            if type(partial) is not bool or type(canceled_bubbles) is not int or canceled_bubbles < 0:
+                raise ValueError("Invalid partial delivery receipt")
+            if attempt["state"] == "accepted":
+                if state != "accepted" or attempt["message_id"] != message_id:
+                    raise Conflict("Accepted delivery cannot be rewritten")
+                return attempt
+            if attempt["state"] == "canceled" or (
+                state == "canceled" and attempt["state"] != "drafting" and not aborted_before_send
+            ):
+                raise Conflict(
+                    "A possible send requires reconciliation, not cancellation"
+                )
+            words = state == "pending" or (state == "canceled" and decision is not None)
+            if words or shown_ids is not None or draft_receipt is not None:
+                self._draft_read(conn, attempt, shown_ids, draft_receipt)
+            if words:
+                # Only what was deleted after the claim: the draft never had the words of anything
+                # deleted before it (CL6E-MM-02).
+                mark = attempt.get("tombstone_mark")
+                gone = erasure.tombstoned_since(conn, attempt["evaluated_ids"], mark)
+                if not gone and attempt.get("reads_truncated"):
+                    gone = erasure.deleted_since(conn, mark)
+                if gone:
+                    # Something the draft had before it was deleted while it was written: none of its
+                    # words are kept and nothing is sent. The wishes are drafted again, from what is
+                    # there then.
+                    state, reason, decision, text = "canceled", "draft-sources-deleted", None, None
+            if state == "pending":
+                attempt["chosen"] = list(dict.fromkeys(desire_ids or offered))
+                if outbound is not None:
+                    if not isinstance(outbound, dict) or outbound.get("id") != attempt_id:
+                        raise ValueError("Outbound delivery must use its contact attempt ID")
+                    attempt["outbound"] = outbound
+                if text is not None:
+                    attempt.pop("text_digest", None)
+                    attempt["text_excerpt"] = str(text).strip()[:160]
+            attempt.update(state=state, updated_at=self.clock(), reason=reason)
+            if state == "unconfirmed":
+                # Reconciled under its own id with a growing interval: 5 minutes doubling to 6 hours.
+                checks = attempt.get("reconcile_checks", -1) + 1
+                attempt.update(reconcile_checks=checks, unconfirmed_at=attempt.get("unconfirmed_at") or self.clock(),
+                               next_check_at=(timestamp(self.clock()) + timedelta(seconds=min(300 * 2 ** checks, 21600))).isoformat())
+            if failure:
+                attempt["failure"] = failure.model_dump(exclude_none=True)
+                if "model_invoked" in failure.model_fields_set:
+                    attempt["failure"]["model_invoked"] = failure.model_invoked
+            elif state == "accepted":
+                attempt.pop("failure", None)
+            if aborted_before_send:
+                attempt["aborted_before_send"] = True
+            if message_id:
+                attempt.update(message_id=message_id, visibility="unverified")
+            if message_ids:
+                if not all(isinstance(x, str) and x.strip() for x in message_ids):
+                    raise ValueError("Message identifiers must be nonempty strings")
+                attempt["message_ids"] = message_ids
+            if partial:
+                attempt.update(partial=True, canceled_bubbles=canceled_bubbles)
+            conn.execute(
+                "UPDATE mind_contacts SET state=?,data=? WHERE id=?",
+                (state, dumps(attempt), attempt_id),
+            )
+            if state == "accepted":
+                from .energy import contact_accepted
+                contact_accepted(conn, self, attempt_id)
+            # Only the model's explicit wait/abandon decision changes a wish.
+            # Technical retry timing belongs to the host, not to semantic desire state.
+            if state == "canceled" and decision:
+                current = self._load(conn)
+                targets = list(dict.fromkeys(desire_ids or attempt.get("chosen") or offered))
+                touched = [current["desires"][i] for i in targets if i in current["desires"]
+                           and current["desires"][i]["revision"] == revisions[i] and current["desires"][i]["status"] == "wanted"]
+                if touched:
+                    eid = "mind_" + digest([attempt_id, "draft-decision"])[:32]
+                    for desire in touched:
+                        desire.update(status="abandoned" if decision.action == "abandon" else "waiting",
+                                      revision=desire["revision"] + 1, updated_at=self.clock(), event_id=eid, reason=decision.reason)
+                        written_from = attempt.get("evaluated_ids")
+                        if written_from:
+                            desire["reason_evidence_ids"] = written_from
+                        if decision.action == "wait":
+                            desire["contact_wait"] = self._wait_details(decision, self.clock(), attempt["owner_epoch"])
+                            if written_from:
+                                desire["contact_wait"]["reason_evidence_ids"] = written_from
+                        else:
+                            desire.pop("contact_wait", None)
+                        attempt.setdefault("decisions", {})[desire["id"]] = decision.model_dump()
+                    attempt["decision"] = decision.model_dump()
+                    conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(attempt), attempt_id))
+                    self._retarget(conn, current, self.clock())
+                    current.update(revision=current["revision"] + 1, updated_at=self.clock())
+                    self._save(conn, current)
+                    self._history(conn, eid, current, "contact-deferred", attempt)
+            if state == "accepted":
+                current = self._load(conn)
+                chosen = attempt.get("chosen") or [attempt["desire_id"]]
+                from .plans import AutonomousPlans
+                delivered = []
+                for identifier in chosen:
+                    desire = current["desires"].get(identifier)
+                    if not desire:
+                        continue
+                    AutonomousPlans(self).settle_linked(conn, desire, {"id": attempt_id,
+                        "complete": not partial, "kind": "delivery", "message_ids": message_ids or [message_id],
+                        "partial": partial, "visibility": "unverified"})
+                    desire.update(
+                        status="completed",
+                        delivery={
+                            "state": "partial" if partial else "accepted",
+                            "message_id": message_id,
+                            "message_ids": message_ids or [message_id],
+                            "canceled_bubbles": canceled_bubbles,
+                            "visibility": "unverified",
+                        },
+                        revision=desire["revision"] + 1,
+                        updated_at=self.clock(),
+                    )
+                    delivered.append(desire)
+                if delivered:
+                    # Acceptance is an execution fact. DeepSeek evaluates satisfaction;
+                    # the transport never assigns an emotion score or invents a thought.
+                    event_key = "delivery_" + digest([attempt_id, "accepted"])[:32]
+                    conn.execute("INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)", (
+                        event_key, self.scope.key(), "delivery", self.clock(), "pending",
+                        dumps({"attempt_id": attempt_id, "desire_id": delivered[0]["id"],
+                               "desire_ids": [d["id"] for d in delivered],
+                               "evidence_ids": list(dict.fromkeys(r["record_id"] for d in delivered for r in d["evidence"])),
+                               "message_ids": message_ids or [message_id],
+                               "partial": partial, "canceled_bubbles": canceled_bubbles,
+                               "agent_version": current["agent_version"],
+                               "visibility": "unverified"}),
+                    ))
+                current["revision"] += 1
+                current["updated_at"] = self.clock()
+                self._save(conn, current)
+                self._history(
+                    conn,
+                    "mind_" + digest([attempt_id, "accepted"])[:32],
+                    current,
+                    "delivery",
+                    attempt,
+                )
+            return attempt

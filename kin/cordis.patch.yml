@@ -1,0 +1,69 @@
+# dsh-kin bundle layer.
+#  - `kin`: the resident host plugin (mind process, persona, home page routes, browser half).
+#  - `preset-kin`: the KIN agent preset. Everything per-session lives in its plugin list, so
+#    ordinary coding sessions on other presets are untouched.
+- insert:
+    - id: kin
+      name: dsh-kin
+    - id: preset-kin
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: kin
+        name: KIN
+        description: 常驻的陪伴者，也是大家的大总管
+        order: 0
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: '{{kin_persona}}'
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: kin-preset
+            name: dsh-kin/preset
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          # Reminders. No job tools: KIN has no shell. No todo: what she has going is kin_work's (and her
+          # plans are Core's), and her workers and subagents keep their own lists in the standard preset.
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # KIN is the team's chief steward, with two kinds of help. DSH's subagent: a quick helper inside a
+          # conversation, on her task lane and the owner's standard coding preset (not hers), whose answer
+          # comes back into her turn. Her own kin_delegate / kin_work (src/steward/): the owner's real work,
+          # a DSH session in the owner's folder that the owner can open. How far either may go is the owner's
+          # 帮手的权限 on her page (src/steward/permission.ts); a subagent inherits it from her conversation.
+          - id: delegation
+            name: cordis:group
+            group: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  agentPreset: standard
+                  agentOptions:
+                    provider: kin
+                    model: task

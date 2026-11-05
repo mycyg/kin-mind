@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-05 — Kin on DSH 0.2.2-rc.1
+
+- Move the active product to `core/` and the `kin/` DSH bundle; retire the prior standalone host/UI layout from the working tree (history remains in Git).
+- Restore original persona and migration settings, source-aware recall, direct persona edits, ordered model fallback, and active-only plan context.
+- Fix diary/dream text layout, pause unfocused animations and polling, retain worker result scope, and stop only the originating conversation’s workers.
+- Adapt model selection and subagent composition to DSH 0.2.2-rc.1; refresh dependency lock and illustrated README.
+- Verification: 106 integration checks, 1385 Core tests (1 skipped), and 10 Node checks passed.
+
+
 ## 0.1.106
 
 - Share one operational notification receipt across inputs in the same failed native turn, including restored inputs and emoji messages. Keep actual reply settlement tied to explicit coverage or handoff evidence.

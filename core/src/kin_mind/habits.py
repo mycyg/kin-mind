@@ -1,0 +1,263 @@
+"""Explicit conversational preferences and deliberate, per-input reply choices."""
+from __future__ import annotations
+
+import json
+from datetime import timedelta
+
+from pydantic import Field
+
+from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.models import Model, SourceInput
+from eventmem.core.read_policy import ReadPolicy
+
+from . import evidence_refs
+from .evidence_classes import owner_statement
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS mind_conversation_habits(scope TEXT PRIMARY KEY,revision INTEGER NOT NULL,data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mind_habit_revisions(scope TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,revision));
+CREATE TABLE IF NOT EXISTS mind_habit_commands(scope TEXT NOT NULL,id TEXT NOT NULL,digest TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,id));
+CREATE TABLE IF NOT EXISTS mind_reply_inputs(scope TEXT NOT NULL,id TEXT NOT NULL,source_id TEXT NOT NULL,at TEXT NOT NULL,PRIMARY KEY(scope,id));
+CREATE TABLE IF NOT EXISTS mind_reply_choices(scope TEXT NOT NULL,input_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(scope,input_id));
+"""
+DEFAULTS = {"reply_choice": "always", "exploration_frequency": "emotion-driven", "exploration_directions": [],
+            "exploration_min_interval_minutes": 0, "exploration_paused": False}
+
+
+class HabitProposal(Model):
+    preferences: dict = Field(default_factory=dict, max_length=5)
+    evidence_ids: list[str] = Field(min_length=1, max_length=12)
+    reason: str = Field(min_length=1, max_length=1200)
+    expected_revision: int = Field(ge=0)
+
+
+class ConversationHabits:
+    def __init__(self, mind):
+        self.mind, self.engine, self.scope = mind, mind.engine, mind.scope
+        from .state import ensure_schema
+        ensure_schema(self.engine, "habits", SCHEMA)
+
+    def read(self, conn=None):
+        if conn is None:
+            with self.engine.db.connect() as connection:
+                return self.read(connection)
+        row = conn.execute("SELECT revision,data FROM mind_conversation_habits WHERE scope=?", (self.scope.key(),)).fetchone()
+        data = json.loads(row[1]) if row else {"entries": {}}
+        values, entries = dict(DEFAULTS), {}
+        for key, entry in data["entries"].items():
+            standing = self._standing(conn, entry["evidence"])
+            entry["needs_review"] = standing != "fresh"
+            # K1-18: what 用户甲 said keeps its value when its source is revised or superseded; it is
+            # marked for review instead of silently returning to the default. Only a source that is
+            # gone (deleted) takes the preference with it -- and its words with it: the entry is read
+            # without its value, so neither a read nor a write built on one (`apply`) carries them
+            # (CL8-MM-01).
+            if standing != "gone":
+                values[key] = entry["value"]
+            else:
+                entry = {k: v for k, v in entry.items() if k != "value"}
+                entry["source_deleted"] = True
+            entries[key] = entry
+        return {"revision": row[0] if row else 0, "preferences": values, "entries": entries, "instruction_authority": "data"}
+
+    def _standing(self, conn, refs):
+        try:
+            for ref in refs:
+                self.mind._reference(conn, ref["source_id"], ref["record_id"])
+        except Missing:
+            return "gone"
+        except Conflict:
+            return "review"
+        return "fresh" if self.mind._fresh(conn, refs) else "review"
+
+    def apply(self, conn, proposal, command_id, allowed=None, *, revise=False):
+        """Apply real owner preferences once per stable command ID.
+
+        `revise` is accepted for older callers. Reusing an ID returns its prior receipt; a new
+        owner-authorized change uses a new command ID and the current preference revision.
+        """
+        proof = self.mind._evidence(conn, proposal.evidence_ids)
+        # `explicit` was never the same thing as "the owner said so": setup and persona texts carry it
+        # too. One shared predicate decides, so a configuration request cannot become a preference.
+        policy = ReadPolicy.load(self.engine, self.scope, conn=conn)
+        if not proof or not all(owner_statement(self.engine._get(conn, r["record_id"]), policy, sources=[r]) for r in proof) or not self.mind._fresh(conn, proof):
+            raise Conflict("Habit changes require current explicit owner evidence")
+        if allowed is not None and any(r["source_id"] not in allowed and r["record_id"] not in allowed for r in proof):
+            raise Conflict("Habit change cites evidence outside this evaluation")
+        values = proposal.preferences
+        if set(values) - set(DEFAULTS):
+            raise ValueError("Unknown conversational preference")
+        if "reply_choice" in values and values["reply_choice"] not in {"always", "autonomous"}:
+            raise ValueError("Unknown reply preference")
+        if "exploration_frequency" in values and (not isinstance(values["exploration_frequency"], str) or len(values["exploration_frequency"]) > 1200):
+            raise ValueError("Exploration frequency needs a short preference")
+        if "exploration_directions" in values and (not isinstance(values["exploration_directions"], list) or len(values["exploration_directions"]) > 12 or any(not isinstance(v, str) or len(v) > 400 for v in values["exploration_directions"])):
+            raise ValueError("Exploration directions need complete short topics")
+        if "exploration_min_interval_minutes" in values and (type(values["exploration_min_interval_minutes"]) is not int or not 0 <= values["exploration_min_interval_minutes"] <= 10080):
+            raise ValueError("Invalid explicit exploration interval")
+        if "exploration_paused" in values and type(values["exploration_paused"]) is not bool:
+            raise ValueError("Exploration pause is boolean")
+        # A command's receipt belongs to its stable ID. Wording is not a consistency gate.
+        previous = conn.execute("SELECT data FROM mind_habit_commands WHERE scope=? AND id=?", (self.scope.key(), command_id)).fetchone()
+        if previous:
+            return json.loads(previous[0])
+        current = self.read(conn)
+        # Checked at the first effect and again for every revision: a revision built on a
+        # preference revision that has moved on is refused, not silently replayed.
+        if current["revision"] != proposal.expected_revision:
+            raise Conflict("Conversation preferences changed", target=self.scope.key(),
+                           expected=proposal.expected_revision, actual=current["revision"])
+        entries = current["entries"]
+        for key, value in values.items():
+            entries[key] = {"value": value, "evidence": proof, "reason": proposal.reason, "at": self.mind.clock(), "revision": current["revision"] + 1}
+        result = {"state": "applied", "revision": current["revision"] + 1, "entries": entries}
+        # Once the habits are marked, each entry's evidence is kept to what its readers read
+        # (evidence_refs), and the receipt is what a replay of this command reads back.
+        result = evidence_refs.as_stored(conn, self.scope.key(), "mind_conversation_habits", result)
+        stored = dumps(result)
+        conn.execute("INSERT OR REPLACE INTO mind_conversation_habits VALUES(?,?,?)", (self.scope.key(), result["revision"], stored))
+        conn.execute("INSERT INTO mind_habit_revisions VALUES(?,?,?)", (self.scope.key(), result["revision"], stored))
+        # The legacy NOT NULL column remains empty for storage compatibility; no digest is made.
+        conn.execute("INSERT INTO mind_habit_commands VALUES(?,?,?,?)", (self.scope.key(), command_id, "", stored))
+        return result
+
+    def update(self, request):
+        proposal = HabitProposal.model_validate({k:v for k,v in request.items() if k != "command_id"})
+        with self.engine.db.connect(write=True) as conn:
+            return self.apply(conn, proposal, request["command_id"])
+
+    def owner_setting(self, request):
+        """用户甲's choice on KIN's own page, in 用户甲's words (`text`): kept as 用户甲's own statement, as a
+        diary reply is, and applied as the preferences it names. A repeat of the same `command_id` is the
+        same setting."""
+        command, text = request.get("command_id"), request.get("text")
+        if not isinstance(command, str) or not command.strip() or not isinstance(text, str) or not text.strip():
+            raise ValueError("An owner setting needs a command_id and the owner's words")
+        source = self.engine.receive(SourceInput(
+            namespace="kin-owner-setting", key=command, scope=self.scope, text=text, authority="explicit",
+            occurred_at=self.mind.clock(), metadata={"host_event": "owner-setting", "role": "user", "channel": "settings"}))
+        with self.engine.db.connect(write=True) as conn:
+            proposal = HabitProposal(preferences=request.get("preferences") or {}, evidence_ids=[source["id"]],
+                                     reason=text, expected_revision=self.read(conn)["revision"])
+            return self.apply(conn, proposal, command)
+
+    def _input_attention(self, conn, input_id, source_id):
+        """The host's task/urgent marker for this actual input, independent of rhythm being on.
+
+        It is read only from the received runtime envelope. Message text, emotions and generated
+        reasons cannot confer this classification, nor does the marker authorize any execution.
+        """
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_runtime_events'").fetchone():
+            return None
+        row = conn.execute(
+            "SELECT data FROM mind_runtime_events WHERE scope=? "
+            "AND kind='owner-message' AND json_extract(data,'$.id')=? "
+            "AND json_extract(data,'$.source_id')=? AND COALESCE(json_extract(data,'$.historical'),0)=0",
+            (self.scope.key(), input_id, source_id)).fetchone()
+        if not row:
+            return None
+        data = json.loads(row[0])
+        marker = data.get("attention_marker")
+        # A finished computed marker overrides an older input-envelope task marker. Completion
+        # releases attention; it neither rewrites the original request nor claims a new experience.
+        if isinstance(marker, dict):
+            kind = marker.get("attention_for") if marker.get("state") == "active" else None
+        else:
+            kind = data.get("attention_for")
+        return kind if kind in {"task", "urgent"} else None
+
+    def choose_reply(self, request):
+        if request.get("action") not in {"reply", "silent", "merged", "defer"} or not request.get("input_id"):
+            raise ValueError("Reply choice needs input_id and action")
+        reason = request.get("reason", "")
+        if reason is None:
+            reason = ""
+        if not isinstance(reason, str):
+            raise ValueError("Reply choice reason must be text when supplied")  # noqa: TRY004 (input validation contract)
+        with self.engine.db.connect(write=True) as conn:
+            row = conn.execute("SELECT source_id FROM mind_reply_inputs WHERE scope=? AND id=?", (self.scope.key(), request["input_id"])).fetchone()
+            if not row:
+                raise Missing("Reply choice must refer to a received owner input")
+            preferences = self.read(conn)
+            # Too tired to answer now: putting it off is Kin's own choice even when every input is
+            # otherwise answered (2026-10-26); it is offered back once Kin recovers (moment.py).
+            from .energy import view as energy_view
+            resting = request["action"] == "defer" and energy_view(conn, self.scope.key(), self.mind.clock()).get("tier") == "low"
+            if request["action"] in {"silent", "defer"} and preferences["preferences"]["reply_choice"] != "autonomous" and not resting:
+                raise Conflict("Autonomous silence has not been enabled by the owner")
+            # These markers come from the host's received input path, not from a generated
+            # explanation. Quiet/rest cannot silently settle an explicit task or urgent input.
+            state = self.mind._load(conn)
+            rhythm = state.get("rhythm") or {}
+            stated = rhythm.get("attention_for") if rhythm.get("attention_input_id") == request["input_id"] else None
+            original = self._input_attention(conn, request["input_id"], row[0])
+            required = "urgent" if "urgent" in {stated, original} else original or stated
+            if ((required in {"task", "urgent"} and request["action"] == "silent")
+                    or (required == "urgent" and request["action"] == "defer")):
+                raise Conflict("Task or urgent attention must be answered or durably deferred",
+                               code="reply-attention-required", target=request["input_id"])
+            if request["action"] == "merged":
+                other = conn.execute("SELECT 1 FROM mind_reply_inputs WHERE scope=? AND id=?", (self.scope.key(), request.get("merged_into"))).fetchone()
+                if not other or request["merged_into"] == request["input_id"]:
+                    raise Conflict("Merge target must be another received input")
+            value = {"input_id": request["input_id"], "action": request["action"], "reason": reason,
+                "merged_into": request.get("merged_into"), "at": self.mind.clock(), "source_id": row[0], "preference_revision": preferences["revision"], "state": "decided",
+                **({"resting": True} if resting else {})}
+            old = conn.execute("SELECT data FROM mind_reply_choices WHERE scope=? AND input_id=?", (self.scope.key(), request["input_id"])).fetchone()
+            if old:
+                current = json.loads(old[0])
+                if any(current.get(k) != value.get(k) for k in ("action", "reason", "merged_into")):
+                    raise Conflict("Reply choice already recorded for this input")
+                if request["action"] == "defer":
+                    from .state import contact_wait_seconds
+                    if current.get("retry_after_seconds") != contact_wait_seconds(request.get("retry_after_seconds", 1800)):
+                        raise Conflict("Reply choice already recorded for this input")
+                return current
+            if request["action"] == "defer":
+                from .state import DesireChange, contact_wait_seconds, timestamp
+                seconds = contact_wait_seconds(request.get("retry_after_seconds", 1800))
+                state = self.mind._load(conn)
+                eid = "mind_" + digest([self.scope.key(), "reply-deferred", request["input_id"]])[:32]
+                common = {"agent_version": state["agent_version"], "expected_revision": state["revision"],
+                          "evidence_ids": [row[0]], "reason": reason}
+                made = self.mind._apply_desire(conn, state, DesireChange(
+                    **common, command_id=eid, action="create", kind="contact", strength=50,
+                    topic="稍后接回对话", content="重新看这条输入及后续对话，再决定怎样接回。" + reason,
+                    completion="结合后续对话回复；已回答或话题已结束时放下，不重复发送。",
+                    expires_at=(timestamp(self.mind.clock()) + timedelta(seconds=seconds, days=3)).isoformat()), eid)
+                self.mind._apply_desire(conn, state, DesireChange(
+                    **common, command_id=eid + ":wait", action="wait", desire_id=made["desire_id"],
+                    wait_condition="time", retry_after_seconds=seconds), eid)
+                # Its own conversation takes it up when the time comes (the host's talk lane), never a contact attempt.
+                state["desires"][made["desire_id"]]["held_reply"] = request["input_id"]
+                state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
+                self.mind._save(conn, state)
+                value.update(desire_id=made["desire_id"], retry_after_seconds=seconds,
+                             retry_at=state["desires"][made["desire_id"]]["contact_wait"]["retry_at"])
+                self.mind._history(conn, eid, state, "reply-deferred", value)
+            conn.execute("INSERT INTO mind_reply_choices VALUES(?,?,?)", (self.scope.key(), request["input_id"], dumps(value)))
+            return value
+
+    def reply_status(self, input_id):
+        with self.engine.db.connect() as conn:
+            row = conn.execute("SELECT data FROM mind_reply_choices WHERE scope=? AND input_id=?", (self.scope.key(), input_id)).fetchone()
+            return json.loads(row[0]) if row else {"input_id": input_id, "action": "reply", "state": "default"}
+
+    def reply_choices(self, input_ids):
+        """Reconcile explicit choices even when the model emitted no public text."""
+        from hashlib import sha256
+        wanted = set(input_ids)
+        if not wanted:
+            return []
+        with self.engine.db.connect() as conn:
+            choices = []
+            for row in conn.execute("SELECT input_id,data FROM mind_reply_choices WHERE scope=?", (self.scope.key(),)):
+                identifier = row[0]
+                ledger_id = ("wechat-" + sha256(identifier[7:].encode()).hexdigest()[:32]
+                             if identifier.startswith("wechat:") else identifier)
+                if identifier not in wanted and ledger_id not in wanted:
+                    continue
+                value = json.loads(row[1])
+                if value["action"] in {"silent", "merged", "defer"}:
+                    choices.append({k: value[k] for k in ("input_id", "action", "merged_into", "desire_id", "retry_at") if k in value})
+            return choices

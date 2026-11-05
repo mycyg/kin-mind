@@ -1,0 +1,1001 @@
+"""Private host entry point. Configuration contains paths, never inline API keys."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+
+from eventmem.core import Engine
+from eventmem.core.db import digest, dumps
+from eventmem.core.integrity import enforce_source_root, warn_interpreter
+from eventmem.core.models import Scope, SourceInput
+from eventmem.paths import atomic_write
+
+from .actions import ActionEvents
+from .appraisal import Appraisals, DailyReview, DeepSeek
+from .conflicts import classify
+from .context import Contexts
+from .continuity import ConcernChange, ContinuityConfig
+from .exploration import Explorations
+from .exploration_cadence import ExplorationCadence
+from .liveness import checks_enabled, record_alive
+from .memory import MemoryContinuity
+from .state import Mind
+
+
+# The memory switches a fresh KIN starts with: the set the old KIN ran with (its reference store).
+# Her appraisals form her memories and she sets her own next review.
+FRESH_MEMORY = dict.fromkeys((
+    "records", "semantic", "context", "idle", "operational_lanes", "manifests", "manifest_restore",
+    "context_receipts", "continuity_overviews", "continuity_quality", "sharing", "graph", "associations",
+    "graph_recall", "event_lifecycle", "adaptive_recall", "auto_volumes", "temperature_shadow",
+    "semantic_actions", "autonomous_plans", "creative_execution", "usage_reinforcement", "procedure_learning",
+), True)
+
+
+def load_config(path):
+    config = json.loads(Path(path).read_text())
+    os.environ["KIN_MODEL_CONFIG_FILE"] = str(Path(path).parent / "state" / "model-config.json")
+    user_file = Path(path).parent / "state" / "model-config.json"
+    if user_file.exists():
+        user = json.loads(user_file.read_text())
+        if user.get("version") != 1:
+            raise ValueError("Invalid model configuration version")
+        profiles = user.get("roleProfiles", {})
+        for role in ("creation", "exploration"):
+            profile = profiles.get(role)
+            if profile is None or isinstance(profile, dict) and profile.get("mode") == "follow-main":
+                continue
+            if not isinstance(profile, dict) or not profile or set(profile) - {"mode", "model", "reasoningEffort", "authentication", "providerId"} or any(not isinstance(v, str) or not v.strip() for v in profile.values()):
+                raise ValueError("Invalid role model profile")
+            for field, suffix in (("model", "_model"), ("reasoningEffort", "_reasoning")):
+                if field in profile:
+                    config[role + suffix] = profile[field]
+    # A dedicated existing file may supply the DeepSeek key. Never execute it.
+    for line in Path(config["credentials_file"]).read_text().splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "EVENTMEM_API_KEY":
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    from . import lifecycle
+    lifecycle.PACE = config.get("pace", 1)
+    return config
+
+
+# The actions whose answers the host puts in front of a model: the memory context before a reply, the
+# state a draft or an ordinary turn is given, the wishes a contact attempt offers, a creation step's
+# claim with its brief (the creator's prompt), the checkpoint a new session is restored from, and the
+# history and graph reads. Each is shown as `model_view.for_model` shows it: evidence references as
+# their trace, a source without its metadata (the owner's decision, 2026-09-28). The host hands none
+# of them back to the store as a reference; it names what it was given by id.
+MODEL_FACING = frozenset({"memory-context", "read", "ingest", "state-overview", "share-history", "work-history",
+                          "graph", "graph-detail", "event-thread", "autonomous-plans", "procedure-memory", "traits",
+                          "candidate", "claim", "plan-claim", "prepare-exploration", "session-checkpoint"})
+
+# The actions a host may run in one recipient's conversation: it names the recipient
+# (`recipient_person_id`) and the conversation (`conversation_key`), and the action runs in that
+# recipient's view of the one store, as `companion-host-call` runs them. A runtime event keeps both
+# names, which its delivery record carries; the others are given the view instead.
+RECIPIENT_ACTIONS = frozenset({"ingest", "observe", "memory-context", "runtime-event", "review-due", "review",
+                               "candidate", "reconsider", "claim", "check", "settle", "sharing-preflight",
+                               "private-notes", "private-note-save", "chat-tool"})
+
+
+def dispatch(config, action, request):
+    result = _dispatch(config, action, request)
+    if action in MODEL_FACING:
+        from .model_view import for_model
+        return for_model(result)
+    return result
+
+
+def _dispatch(config, action, request):
+    if action == "model-lease":
+        # The fallback of the lease routes. Answered before any engine opens, so a busy
+        # database costs the caller two seconds and never the engine's thirty.
+        from .model_lanes import lease_command
+        return lease_command(config["root"], request)
+    registry = config.get("session_registry_file")
+    if registry and Path(registry).exists():
+        binding = json.loads(Path(registry).read_text())["binding"]
+        config = {**config, "session_id": binding["threadId"]}
+    engine = Engine(Path(config["root"]))
+    from .model_lanes import context_lane, declared, sync_capacity
+    # `recover` is the host's start-up call: there the configured capacity replaces what meta
+    # holds. Any other action only fills a missing value.
+    sync_capacity(engine, config, startup=action == "recover")
+    if action == "deleted-sources":
+        # Which of the host's own copies stand on a deleted source: named by it, or by the owner input it was stored from.
+        from .erasure import tombstoned
+        from .sealed import source_id
+        scope = Scope.model_validate(config["scope"])
+        inputs = {source_id("kin-owner-input", key, scope): key for key in request.get("owner_input_ids") or []}
+        with engine.db.connect() as conn:
+            gone = tombstoned(conn, [*(request.get("source_ids") or []), *inputs])
+        return {"deleted": sorted(inputs.get(sid, sid) for sid in gone)}
+    if action.startswith("companion-"):
+        from .companion_host import dispatch_companion
+        return dispatch_companion(engine, config, action, request)
+    from .companion_view import ACTIVE_VIEW, CompanionView, companion_scope
+    if action in RECIPIENT_ACTIONS and request.get("recipient_person_id") and ACTIVE_VIEW.get() is None:
+        view = CompanionView(engine, Scope.model_validate(config["scope"]), request["recipient_person_id"],
+                             request.get("conversation_key") or config["session_id"])
+        if action != "runtime-event":
+            request = {k: v for k, v in request.items() if k not in ("recipient_person_id", "conversation_key")}
+        with companion_scope(view):
+            return _dispatch(config, action, request)
+    mind = Mind(engine, Scope.model_validate(config["scope"]))
+    mind.unified_targets = request.get("unified_targets") or {}
+    def review_provider():
+        if config.get("main_session_review") or config.get("companion", {}).get("shared_session"):
+            from .appraisal import NativeReview
+            import sys
+            def exchange(payload):
+                print(json.dumps({"native_review": payload}, ensure_ascii=False), flush=True)
+                response = json.loads(sys.stdin.readline())
+                if response.get("id") != payload["id"]:
+                    raise RuntimeError("native-review-response-mismatch")
+                return response
+            if not request.get("native_review_profile"):
+                raise RuntimeError("main-session-required")
+            provider=NativeReview.from_engine(engine, profile=request["native_review_profile"], exchange=exchange,
+                                            used_tokens=request.get("native_review_used_tokens") or 0)
+            provider.native_attempt=(request.get("run_id") or action, "host")
+            return provider
+        else:
+            return DeepSeek.from_engine(engine)
+
+    def background_provider():
+        """The one entry of the background lane: the shared session's isolated DeepSeek assessment,
+        else DeepSeek directly."""
+        return review_provider() if config.get("companion", {}).get("shared_session") else DeepSeek.from_engine(engine)
+
+    if config.get("contact_policy_file"):
+        # Kin sees the contact constraints the host applies, read live from its policy (K1-03).
+        mind.register_contact_policy(config["contact_policy_file"])
+    if action in {"private-note-save", "private-notes"}:
+        from .private_notes import PrivateNotes
+        notes = PrivateNotes(mind)
+        if action == "private-note-save":
+            return notes.save(request)
+        if request.pop("recent", False):
+            return notes.recent()
+        return notes.read(**request)
+    if action in {"chat-tools", "chat-tool"}:
+        # Core's own tools in KIN's DSH conversations (chat_tools): their schemas, or one call.
+        from . import chat_tools
+        if action == "chat-tools":
+            return {"tools": chat_tools.tools(engine)}
+        return chat_tools.call(engine, config["scope"], request["name"], request.get("arguments"))
+    if action in {"energy-configure", "energy-activity"}:
+        from .energy import configure, activity
+        return (configure if action == "energy-configure" else activity)(mind, request)
+    if action == "drives-configure":
+        from .drives import configure
+        return configure(mind, request)
+    if action == "liveness-facts":
+        # The host's contact pause and fault watch: the store's liveness facts, read-only, with no
+        # model, executor or embedding service asked (operational_status.liveness_read).
+        from .operational_status import liveness_read
+        return liveness_read(mind, request.get("part"))
+    if action.startswith("plan-") or action in {"autonomous-plans", "manage-autonomous-plan", "procedure-memory"}:
+        from .plans import AutonomousPlans
+        from .procedures import Procedures
+        plans = AutonomousPlans(mind)
+        if action == "autonomous-plans":
+            return plans.read(**request)
+        if action == "manage-autonomous-plan":
+            return plans.manage(request)
+        if action == "plan-migrate":
+            return plans.migrate_desires()
+        if action == "plan-deferral":
+            # The router's deferral pass (WS3) hands over a task Kin chose to do later (N10).
+            return plans.defer_owner_task(request)
+        if action == "plan-started":
+            return plans.started(**request)
+        if action == "plan-renew":
+            return plans.renew(**request)
+        if action == "plan-recover":
+            return plans.recover(**request)
+        if action == "plan-interrupt":
+            # The host's static reason for stopping goes into the plan's receipt, so Kin sees why
+            # a step stopped instead of one generic phrase (K2-02). Never free text.
+            reason = request.get("reason")
+            if not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", reason):
+                reason = "executor-stopped-before-settlement"
+            return plans.settle(request["run_id"], request["owner"], request["fence"], state="interrupted",
+                result={"checkpoint_retained": True, "reason": reason})
+        if action == "plan-result":
+            from .creation import accept_result
+            return accept_result(mind, config, request, provider=review_provider() if config.get("companion", {}).get("shared_session") else None)
+        if action == "plan-claim":
+            from .decision_context import execution_brief
+            from .erasure import tombstone_mark
+            with mind.engine.db.connect() as conn:
+                # Before the claim reads the plan: what was deleted before it, the run never has the
+                # words of, and only the deletes after it count against its result (CL6E-MM-02).
+                mark = tombstone_mark(conn)
+            result = plans.claim(**request)
+            if result["state"] == "claimed":
+                shown = []
+                result["brief"] = execution_brief(mind, question=result["step"]["goal"],
+                    evidence_ids=[r["record_id"] for r in result["run"]["decision"]["evidence"]],
+                    plan=result["plan"], step=result["step"], shown=shown, since=mark)
+                # What the brief showed is what the run's result is checked against when stored (CR5-MM-02).
+                plans.note_shown(result["run"]["id"], shown, mark)
+            return result
+        if action == "procedure-memory":
+            return Procedures(mind).read(**request)
+        raise ValueError("Unknown autonomy operation")
+    session_context = None
+    observation_file = config.get("session_observation_file")
+    if observation_file and Path(observation_file).exists():
+        session_context = json.loads(Path(observation_file).read_text())
+    from .dsh_executor import exploration_capabilities
+    jobs = Appraisals(mind, exploration_capabilities=exploration_capabilities(config),
+                      session_context=session_context)
+    explorer = Explorations(mind)
+    cadence = ExplorationCadence(mind)
+    actions = ActionEvents(mind)
+    memory = MemoryContinuity(mind)
+    if action == "ensure-initialized":
+        # A fresh data directory gets its role state on first start; an existing one is left alone.
+        # The seed is setup evidence in its own namespace, so it never surfaces as a memory.
+        with engine.db.connect() as conn:
+            if conn.execute("SELECT 1 FROM mind_state WHERE scope=?", (mind.scope.key(),)).fetchone():
+                return {"initialized": False}
+        seed = engine.receive(SourceInput(namespace="kin-setup", key="initialize", scope=mind.scope,
+            text=request.get("text") or "KIN starts here.", authority="explicit", occurred_at=mind.clock(),
+            extract=False, metadata={"host_event": "setup"}))
+        mind.initialize(agent_version=config["agent_version"], evidence_ids=[seed["id"]])
+        memory.configure(FRESH_MEMORY)
+        mind.configure_continuity(ContinuityConfig(
+            command_id="setup:continuity", agent_version=config["agent_version"], expected_revision=mind.read()["revision"],
+            evidence_ids=[seed["id"]], features=dict.fromkeys(("interpretation", "concerns", "expression", "rhythm"), True),
+            reason="KIN wakes with her whole inner life on, as the old KIN ran"))
+        return {"initialized": True}
+    # KIN's inner world as the DSH page reads it: her diary (and the owner's replies), her dreams,
+    # and the letters the owner seals for a later day. None of these calls a model.
+    if action == "diary":
+        from . import diary
+        return diary.read(mind, cursor=request.get("cursor", 0), limit=request.get("limit", 20))
+    if action == "diary-reply":
+        from . import diary
+        return diary.reply(mind, request, agent_version=config["agent_version"])
+    if action == "dreams":
+        from . import dreams
+        return dreams.read(mind, cursor=request.get("cursor", 0), limit=request.get("limit", 20))
+    if action == "explorations":
+        from .activities import select_activities
+        return select_activities(mind, kind="exploration", cursor=request.get("cursor", 0),
+                                 limit=request.get("limit", 20), historical=True)
+    if action == "letters":
+        from . import sealed
+        # A letter whose day has come opens when it is looked for, not only at the review minute.
+        sealed.open_due(mind)
+        return sealed.entries(mind)
+    if action == "seal-letter":
+        from . import sealed
+        return sealed.seal_letter(mind, request.get("text"), request.get("unlock_at"), request.get("command_id"))
+    if action == "operational-status":
+        from .operational_status import operational_status
+        return operational_status(mind, config)
+    if action == "appraisal-triage":
+        # Operator action, the one her health page points to: every quarantined appraisal sorted
+        # into a class, with what would be done to it. Nothing is written without `--apply`; ids,
+        # classes, counts and static codes only.
+        from .recovery import triage_quarantined
+        options = {key: request[key] for key in ("command_id", "source", "resume", "retire", "job_ids",
+                                                 "per_slot", "spacing_minutes") if key in request}
+        return triage_quarantined(mind, apply=bool(request.get("apply")), **options)
+    if action.startswith("history-"):
+        # Operator actions on the stored history itself. Each one registers with the history
+        # registry instead of adding a branch here, so a package that ships a new command does
+        # not have to touch this dispatch to be reachable.
+        # The configuration travels with them because compaction has to prove nothing is running,
+        # and where the host keeps its pid files and its status file is not something the store
+        # knows. Commands that do not need it are not given it.
+        from .history_admin import dispatch as history_command
+        return history_command(mind, action, request, config)
+    if action == "appraisal-attempts":
+        # Read-only accounting: outcomes, static codes, digests and usage. No private text.
+        from .attempts import read as read_attempts
+        return read_attempts(engine, mind.scope.key(), job_id=request.get("job_id"),
+                             limit=request.get("limit", 20))
+    if action in {"session-snapshot", "session-checkpoint", "session-validate"}:
+        from .session_checkpoint import SessionCheckpoint
+        checkpoints = SessionCheckpoint(mind, agent_version=config["agent_version"])
+        if action == "session-validate":
+            return checkpoints.validate(request["checkpoint"])
+        if action == "session-snapshot":
+            if memory.settings()["event_lifecycle"] and isinstance(request.get("foreground"), bool):
+                from .lifecycle import foreground_lease
+                foreground_lease(engine, mind.scope.key(), "host:" + config["session_id"], active=request["foreground"], seconds=120)
+            return checkpoints.snapshot(request.get("pending"), tasks=request.get("tasks"), intent=request.get("intent"), include_business=config.get("companion",{}).get("shared_session") is True)
+        snapshot = dict(request['snapshot'])
+        if not request.get('shadow') and not memory.settings().get('manifest_restore'):
+            snapshot.pop('manifestVersion', None)
+            snapshot.pop('linked', None)
+        # The checkpoint carries the user's session across a rotation, so somebody is waiting
+        # for it unless the host says this one is maintenance.
+        # Background maintenance may summarize missing historical coverage through
+        # the existing compressor. Dispatch and rolling snapshots explicitly pass
+        # allow_model=False: they must never wait for another model inside a turn.
+        # A shared conversational session does not turn a bounded text transform
+        # into a second appraisal/personality session.
+        with declared(context_lane("work", request.get("access_origin", "user_query")), "session-checkpoint"):
+            return checkpoints.build(snapshot, request["binding"], budget=request.get("budget", 2000), provider=DeepSeek.from_engine(engine, role="memoryCompression") if request.get("allow_model", True) else None, allow_model=request.get("allow_model", True), adaptive_budget=True, restore_capacity=request.get('restore_capacity'))
+    if action.startswith("context-delivery-"):
+        from .context_delivery import ContextDelivery
+        deliveries = ContextDelivery(Contexts(mind))
+        methods = {"context-delivery-begin": deliveries.begin, "context-delivery-ack": deliveries.acknowledge,
+                   "context-delivery-uncertain": deliveries.uncertain, "context-delivery-pending": deliveries.pending,
+                   "context-delivery-metrics": deliveries.metrics, "context-delivery-prepare": deliveries.prepare}
+        if action not in methods:
+            raise ValueError('Unknown context delivery operation')
+        return methods[action](**request)
+    if action == "session-review":
+        if not config.get("adaptive_sessions") or not session_context:
+            return {"state": "disabled"}
+        # The observed snapshot is the stimulus; nothing is written into memory for a review.
+        # The host's attempt is part of the queue key: the same attempt is one job, a new
+        # attempt a new one, and the answer names the attempt it belongs to (CR-RT-08).
+        if request.get("snapshotId") not in (None, session_context["id"]):
+            return {"state": "stale", "snapshotId": session_context["id"], "requestId": request.get("id")}
+        queued = jobs.enqueue_maintenance(session_context["id"], config["agent_version"], request_id=request.get("id"))
+        # 这一段的我们 (`window_notes`, default off): a review at elevated pressure also queues the
+        # note of this stretch, one row, for the enrichment lane to write. It never holds up the
+        # review it rides on, and the answer stays the review's own.
+        try:
+            from .window_notes import observe as note_this_stretch
+            note_this_stretch(mind, session_context)
+        except Exception as error:  # noqa: BLE001 - the review stands; the failure is counted
+            with engine.db.connect(write=True) as conn:
+                conn.execute("INSERT INTO metrics(name,value,created_at,data) VALUES('window_note_queue_failed',1,?,?)",
+                             (mind.clock(), json.dumps({"error": type(error).__name__})))
+        return queued
+    if action == "configure-habits":
+        return memory.habits.update(request)
+    if action == "owner-habit":
+        return memory.habits.owner_setting(request)
+    if action == "reply-choice":
+        return memory.habits.choose_reply(request)
+    if action == "reply-choices":
+        return memory.habits.reply_choices(request["input_ids"])
+    if action == "reply-status":
+        return memory.habits.reply_status(request["input_id"])
+    if action == "configure-model-capacity":
+        from .model_runtime import configure_capacity
+        return configure_capacity(engine, request["limit"])
+    if action == "share-cancel":
+        return memory.sharing.cancel(request["draft_id"])
+    if action == "share-references":
+        with engine.db.connect() as conn:
+            return {"references": memory.sharing.references(conn, reply_id=request.get("reply_id"),
+                bubble_id=request.get("reference_bubble_id"), bubble_index=request.get("reply_bubble_index"))}
+    if action == "sharing-preflight":
+        # Only the concrete send boundary reserves content across channels;
+        # registering a draft's reference alone remains a reversible draft.
+        return memory.sharing.preview(request) if request.get("dry_run") or request.get("dryrun") else memory.sharing.prepare(request)
+    if action == "reply-references":
+        return memory.sharing.register(request)
+    if action == "graph":
+        return memory.graph.read(**request)
+    if action == "graph-detail":
+        return memory.graph.detail(request["identifier"])
+    if action == "graph-revise":
+        return memory.graph.revise(request)
+    if action == "event-thread":
+        return Contexts(mind).event_thread(**request)
+    if action in {"lifecycle-status", "lifecycle-backfill"}:
+        from .lifecycle import EventLifecycle
+        lifecycle = EventLifecycle(mind, memory.graph)
+        return lifecycle.status() if action == "lifecycle-status" else lifecycle.backfill(**request)
+    if action == "migrate-evidence-isolation":
+        # Operator action. A dry run writes nothing; the impact list goes to `--output` and only
+        # its counts are printed, because the list itself can name thousands of identifiers.
+        from .isolation_migration import IsolationMigration
+        migration = IsolationMigration(mind)
+        options = {"apply": bool(request.get("apply")), "output": request.get("output")}
+        result = (migration.undo(**options) if request.get("undo")
+                  else migration.run(**options, registry_file=request.get("registry")))
+        return {k: v for k, v in result.items()
+                if k in {"migration", "operation", "state", "applied", "rules_version", "summary", "steps", "output"}}
+    if action == "desire-archive":
+        # Operator action. It does not write without `--apply`, and the dry run asks for no flag at
+        # all: it reads what the retention rule would keep, move and let go, and what holds the
+        # rest, which is what makes it safe against a copy of a live store. `days` and `keep`
+        # override the configured rule for this run only.
+        from .desire_archive import archive
+        return archive(mind, apply=bool(request.get("apply")), days=request.get("days"),
+                       keep=request.get("keep"), limit=request.get("limit"))
+    if action == "exploration-decision-archive":
+        # Operator action, as the wish archive's: it does not write without `--apply`, and the dry
+        # run needs no flag.
+        from . import exploration_decision_archive as decisions
+        return decisions.archive(mind, apply=bool(request.get("apply")), days=request.get("days", decisions.DAYS),
+                                 keep=request.get("keep", decisions.KEEP), limit=request.get("limit"))
+    if action == "slim-evidence-refs":
+        # Operator action (evidence_refs). The dry run writes nothing and says how many references
+        # the document and the two archives hold, how many would change and what that does to their
+        # size. `--apply` keeps them to what their readers read, in one recorded revision, and marks
+        # the document so every later save does the same; a second apply writes nothing. `--undo
+        # --apply` puts every reference back from the sources table and clears the mark: it is what
+        # runs before a rollback to a release that expects the full references. Never gated.
+        from .evidence_refs import run as slim_evidence_refs
+        return slim_evidence_refs(mind, apply=bool(request.get("apply")), undo=bool(request.get("undo")))
+    if action in {"archive-memory", "archive-memory-backfill"}:
+        # Operator actions. Without `--apply` both only read: the queue's counts, or what the
+        # backfill would queue and the calls that would take. `archive-memory --apply` runs one
+        # batch now (one paid DeepSeek call at most); `retry_failed` first puts back what ran out
+        # of attempts. `archive-memory-backfill --apply` queues what was archived before, once.
+        from . import archive_memory
+        if action == "archive-memory-backfill":
+            return archive_memory.backfill(mind, apply=bool(request.get("apply")), kinds_wanted=request.get("kinds"))
+        if not request.get("apply"):
+            return archive_memory.status(mind)
+        retried = archive_memory.retry_failed(mind) if request.get("retry_failed") else 0
+        return {**archive_memory.run(mind, review_provider(), limit=request.get("limit", archive_memory.BATCH)),
+                **({"retried": retried} if retried else {})}
+    if action == "persona-save":
+        from eventmem.core.prompts import PromptStore
+        text = request["text"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Persona must not be empty")
+        return PromptStore(engine.db.root / "prompts").write("persona", text)
+    if action == "configure-memory":
+        return memory.configure(request)
+    if action == "runtime-event":
+        result = memory.ingest(request)
+        # What she said in a group is remembered; no review waits for it there (as with group talk, `ingest`).
+        if result.get("source_id") and memory.settings()["semantic"] and not request.get("historical") and not _conversation(request, None).get("conversation_kind") == "group":
+            result["appraisal"] = jobs.enqueue([result["source_id"]], config["agent_version"], origin="reflection", stimulus="delivery" if request["kind"] == "delivery" else "runtime-result")
+        return result
+    if action == "memory-context":
+        from .adaptive_recall import select_mode
+        from .dialogue import clock_context
+        requested_mode = request.get("mode", "auto")
+        if request.get("purpose") == "read" and requested_mode == "auto":
+            requested_mode = "deep"
+        if memory.settings()["adaptive_recall"] and select_mode(request.get("query", ""), requested_mode, request.get("history", False)) == "deep":
+            request.setdefault("allow_model", True)
+        if config.get("adaptive_sessions"):
+            request["native_pressure_managed"] = True
+        if memory.settings().get('context_receipts') and request.get('session') and request.get('purpose') != 'read':
+            request['receipt_mode'] = True
+        # The host's own injection: the one build relevance admission and quiet marks apply to.
+        request['automatic'] = True
+        request['activity_recall'] = True
+        # The source pointer follows a wish/draft into the actual context build;
+        # the context reads the original even with graph recall or dreams off.
+        if not request.get('activity_focus') and isinstance(request.get('intent'), dict):
+            request['activity_focus'] = request['intent'].get('activity_ref') or request['intent'].get('exploration_id')
+        # A lean draft snapshot carries the last turns itself: who said what, when, and its source id.
+        recent = request.pop("recent_dialogue", False)
+        built = {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
+        if recent:
+            from .dialogue import recent_dialogue
+            built["recent_dialogue"] = [{k: turn[k] for k in ("role", "text", "occurred_at", "source_id", "speaker_person_id", "recipient_person_id") if k in turn}
+                                        for turn in recent_dialogue(mind)]
+        return built
+    if action == "state-overview":
+        return Contexts(mind).affective(request.get("query", ""))
+    if action == "prepare-memory":
+        if not memory.settings()["context"]:
+            return {"state": "disabled"}
+        recent = memory.semantic_context(event_limit=1)["recent_interaction"]
+        owner = next((e for e in reversed(recent) if e.get("kind") == "owner-message"), None)
+        if not owner:
+            return {"state": "idle"}
+        result = Contexts(mind).warm(query=owner.get("text", ""))
+        return {k: v for k, v in result.items() if k in {"state", "tokens", "cache_hit", "receipt"}}
+    if action == "memory-compact-ack":
+        return Contexts(mind).compact_ack(**request)
+    if action == "memory-injection-ack":
+        return Contexts(mind).injection_ack(**request)
+    if action in {"share-history", "work-history"}:
+        return Contexts(mind).read_history("share" if action == "share-history" else "work", **request)
+    if action == "configure-continuity":
+        return mind.configure_continuity(ContinuityConfig.model_validate(request))
+    if action in {"attention", "continuity-attend", "continuity-finish-attention"}:
+        operation = request.get("op", "finish" if action == "continuity-finish-attention" else "attend")
+        if operation == "attend":
+            return mind.attend(request["input_id"], request.get("attention_for", "owner_message"))
+        if operation == "finish":
+            return mind.finish_attention(request["input_id"])
+        raise ValueError("Attention operation must be attend or finish")
+    if action == "concern":
+        return mind.manage_concern(ConcernChange.model_validate(request))
+    if action == "migrate-continuity":
+        return jobs.migrate_continuity(request["evidence_ids"], request["agent_version"])
+    if action == "configure-actions":
+        return actions.configure(request)
+    if action == "observe":
+        source = engine.receive(SourceInput(namespace="kin-assistant-output", key=request["id"],
+            scope=mind.scope, session=config["session_id"], text=request["text"], authority="model",
+            occurred_at=request["at"], extract=not memory.settings()["semantic"],
+            metadata={"host_event": "assistant-result", "role": "assistant", "channel": request["channel"],
+                      **_conversation(request, "agent:kin")}))
+        memory.ingest({**request, **_conversation(request, "agent:kin"), "kind": "assistant-message", "source_id": source["id"], "session": config["session_id"]})
+        if _conversation(request, None).get("conversation_kind") == "group":
+            return {"source_id": source["id"]}
+        return jobs.enqueue([source["id"]], config["agent_version"], origin="reflection", stimulus="assistant-result")
+    if action == "ingest":
+        # Only an authenticated host calls this. Internal results have another origin.
+        source = engine.receive(
+            SourceInput(
+                namespace="kin-owner-input",
+                key=request["id"],
+                scope=mind.scope,
+                session=request.get("session") or config["session_id"],
+                text=request["text"],
+                authority="explicit",
+                occurred_at=request["at"],
+                extract=not memory.settings()["semantic"],
+                metadata={
+                    "host_event": "message",
+                    "role": "user",
+                    "channel": request["channel"],
+                    **_conversation(request, request.get("speaker_person_id")),
+                },
+            )
+        )
+        # Group talk is remembered as it is said; whether to chime in is the host's contact round,
+        # and the reviews that come round take it in (the companion host's `companion-ingest` did the same).
+        job = None if request.get("conversation_kind") == "group" else jobs.enqueue([source["id"]], config["agent_version"])
+        # Who said it acts in the event graph: without an actor every message would be the owner's (graph.runtime),
+        # and one owner entity would join everyone's messages to each other.
+        speaker = request.get("speaker_person_id")
+        actor = {"actor": speaker} if speaker and speaker != "person:person_a" else {}
+        memory.ingest({**request, **_conversation(request, speaker), **actor, "kind": "owner-message", "source_id": source["id"], "session": request.get("session") or config["session_id"]})
+        # A resident action only stores (CR4-MM-05): whatever the request asks, `ingest` prepares no
+        # context. A context that may call a model -- a deep recall, an embedding -- is prepared by
+        # `memory-context`, a worker of its own under the model lanes' admission. With the context
+        # layer off, the answer is the state view, as before, and nothing to prepare.
+        if memory.settings()["context"]:
+            return {"source_id": source["id"], "appraisal": job, "memory_enabled": True}
+        state = mind.read(query=request["text"])
+        # 此刻的状态 leads this fallback as it leads the memory context (moment.py).
+        from .moment import current as moment
+        return {
+            "source_id": source["id"],
+            "appraisal": job,
+            "state": state,
+            "moment": moment(mind, state),
+            "findings": explorer.recent(),
+            "memory_context": {"state": "disabled", "text": "", "tokens": 0},
+        }
+    if action == "read":
+        projection = request.get("projection")
+        if projection is not None:
+            # A bounded part of the state for a reader that uses only that (interaction_projection):
+            # a contact draft. Without it the answer is the whole view, as it always was.
+            from .interaction_projection import PROJECTION, interaction_projection
+            if projection != PROJECTION or request.get("history"):
+                raise ValueError("Unknown state projection")
+            return {"projection": PROJECTION, "state": interaction_projection(mind.read(query=request.get("query", "")))}
+        from .drives import owner_private, view as drives_view
+        with mind.engine.db.connect() as conn:
+            drives = drives_view(conn, mind.scope.key(), mind.clock(), private=owner_private())
+        return {
+            "state": mind.read(history=request.get("history", 0), query=request.get("query", "")),
+            "drives": drives,
+            "exploration_capabilities": jobs.exploration_capabilities,
+            "appraisals": jobs.status(),
+            "findings": explorer.recent(),
+            "exploration_cadence": cadence.status(),
+            "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
+        }
+    if action in {"traits", "trait-revoke", "traits-migrate"}:
+        from .traits import Traits
+        ledger = Traits(mind)
+        if action == "traits":
+            return ledger.read(request.get("identifier"), limit=request.get("limit", 12), history=request.get("history", False))
+        if action == "trait-revoke":
+            # An owner correction that must not wait for an appraisal. The cited source decides
+            # whether it is recorded as the owner's own correction or as the operator's.
+            return ledger.revoke(request)
+        # Idempotent, and a dry run writes nothing.
+        return ledger.migrate(apply=bool(request.get("apply")))
+    if action in {"play-configure", "interests-seed"}:
+        # Operator actions: the play defaults, and the interests' migration after release (play.py).
+        from . import play
+        return play.configure(mind, request) if action == "play-configure" else play.seed(mind, DeepSeek.from_engine(engine))
+    if action == "configure-autonomy":
+        return mind.configure_autonomy(request)
+    if action == "configure-behavior":
+        return mind.configure_behavior(request)
+    if action == "configure-contact":
+        return mind.configure_contact(request)
+    if action == "configure-contact-frequency":
+        return mind.configure_contact_frequency(request)
+    if action == "review-enrichment":
+        if config.get("review_paused") or not memory.settings()["operational_lanes"]:
+            return {"state": "paused"}
+        if not request.get("job_id"):
+            # And the note of a window's stretch (window_notes, off by default), first: the next
+            # checkpoint carries it only once it is written.
+            from . import window_notes
+            if window_notes.due(mind):
+                return window_notes.run(mind, background_provider())
+            # The background lane also writes the memories of archived records (archive_memory):
+            # when it has no job of its own to run, or when they have waited an hour for it.
+            from . import archive_memory
+            if archive_memory.due(mind, waited=0 if not jobs.runnable("enrichment") else archive_memory.STARVED_SECONDS):
+                return archive_memory.run(mind, background_provider())
+        return jobs.run_one(background_provider(), lane="enrichment", job_id=request.get("job_id"))
+    def review_pause():
+        if config.get("review_paused"):
+            return {"state": "paused", "reason": "host-maintenance"}
+        from .history import COMPACTING, compacting
+        with engine.db.connect() as conn:
+            # Every commit is refused while history compaction owns the store (WS6, K3-14): the
+            # minute neither queues nor claims anything until it ends.
+            return {"state": "paused", "reason": COMPACTING} if compacting(conn) else None
+
+    def review_minute(run=None):
+        """The minute's review: queue what is due, run one appraisal when `run` is given, then
+        settle the wishes it decided. No extra model call is used for the clock."""
+        from . import recipient
+        unified = config.get("companion", {}).get("shared_session") is True
+        secondary = unified and recipient.current() != recipient.person_a
+        if not secondary:actions.crossings()
+        from .plans import AutonomousPlans
+        plans = AutonomousPlans(mind)
+        plans.tick(actions)
+        if not secondary:memory.queue_idle(actions)
+        if not secondary:
+            # Boredom may wake that idle review early (play.py).
+            from .play import wake
+            wake(mind, actions, memory)
+        actions.review_unselected()
+        actions.drain(jobs)
+        if secondary:
+            # Retire only unmixed legacy idle wakes, after draining their local events.
+            with engine.db.connect(write=True) as conn:
+                conn.execute("UPDATE mind_appraisals SET state='superseded' WHERE scope=? AND " + recipient.predicate() + " AND state='pending' AND json_extract(data,'$.stimulus')='idle-review' AND COALESCE(json_array_length(json_extract(data,'$.batch_ids')),0)=0", (mind.scope.key(),))
+        from . import recipient
+        if recipient.current()==recipient.person_a and memory.settings()["semantic"]:
+            memory.queue_history(jobs, config["agent_version"])
+            if memory.settings()["graph"]:
+                from .graph_migration import GraphMigration
+                GraphMigration(mind).queue_history(jobs, config["agent_version"])
+        # Sealed letters and diaries whose day has come become their sources (sealed.py). No model call.
+        from .sealed import open_due
+        open_due(mind)
+        result = run() if run else None
+        plans.sync_wishes()
+        if run and isinstance(result, dict) and result.get("state") == "complete":
+            # After a committed assessment the retention rule runs (desire_archive): a read that
+            # finds nothing to move writes nothing, and a move is one revision of its own.
+            from .desire_archive import retain
+            retention = retain(mind)
+            if retention["state"] not in {"disabled", "idle"}:
+                result = {**result, "desire_retention": retention}
+        actions.drain(jobs)
+        # Settled exploration decisions leave the document once nothing reads them there: only with
+        # `exploration_decision_archive` on, and one count query a minute while nothing can move.
+        from .exploration_decision_archive import auto as archive_decisions
+        archive_decisions(mind)
+        if cadence.status()["state"] == "ready":
+            from .recipient import current as current_recipient
+            person = current_recipient()
+            filename = "mind-exploration-request.json" if person == "person:person_a" else "mind-exploration-request-" + person.replace(":", "-") + ".json"
+            wake = Path(config["exploration_stop_file"]).parent / filename
+            if not wake.exists():
+                # `mind-exploration-request.tmp` was one name two reviews shared, and
+                # the host reads this file the moment it appears: a second review
+                # renaming the first one's half-written temporary put a truncated
+                # request in front of it. A name of its own per write, and the bytes
+                # reach the disk before the rename rather than after it.
+                atomic_write(wake, json.dumps({"kind": "internal-exploration-wakeup", "at": mind.clock()}))
+        return result
+
+    if action == "review-due":
+        # T-14: the resident worker does the minute's bookkeeping and says whether an appraisal is
+        # there to run; the host starts a model process only then. `tick: false` only asks.
+        paused = review_pause()
+        if paused:
+            return paused
+        if request.get("tick", True):
+            review_minute()
+        due = {lane: jobs.runnable(lane) for lane in ("action", "enrichment")}
+        if not due["enrichment"] and memory.settings()["operational_lanes"]:
+            # The memories of archived records are the background lane's work too (archive_memory).
+            from .archive_memory import due as memories_due
+            from .window_notes import due as notes_due
+            due["enrichment"] = memories_due(mind) > 0 or notes_due(mind) > 0
+        # The day's review has a gate of its own now: the host starts it only when there is something
+        # to merge or evaluate, never to be told again that it is still waiting.
+        return {"state": "due" if any(due.values()) else "idle", **due, "daily": DailyReview(mind).due()}
+    if action == "review":
+        paused = review_pause()
+        if paused:
+            return paused
+        return review_minute(lambda: jobs.run_one(review_provider(), lane="action"))
+    if action == "daily":
+        provider = review_provider()
+        provider.native_attempt = ("daily:" + mind.clock()[:10], config["agent_version"])
+        return DailyReview(mind).run(provider, config["agent_version"])
+    if action == "prepare-exploration":
+        view = mind.read()
+        reservation = cadence.reserve(config["agent_version"])
+        if reservation["state"] != "ready":
+            return reservation
+        return {**reservation, "desires": view["desires"],
+                "recent_results": [x["result"] for x in explorer.recent(6) if x.get("result")],
+                "autonomy": view.get("autonomy", {})}
+    if action == "explore":
+        stop = Path(config["exploration_stop_file"])
+        backend = config.get("exploration_backend")
+        if backend != "dsh":
+            # Exploration runs on a DSH helper (dsh_executor). Any other backend pauses instead
+            # of running anything.
+            return {"state": "waiting", "reason": "exploration-backend-unknown", "detail": str(backend)}
+        from .dsh_executor import exploration_capabilities, prepare_dsh_exploration
+        def repair_final(text, ledger, *, timeout):
+            from .exploration import Findings
+            provider = DeepSeek.from_engine(engine)
+            provider.timeout = timeout
+            try:
+                fixed, receipt = provider.structured("repair_exploration_result", Findings,
+                    "只修正原探索结果的 JSON 包装、结构与字段格式。只使用原结果和给定来源账本，不执行工具、不添加发现或证据、不降低引用要求。返回单个完整结果；无法补足的来源保留缺口。",
+                    {"original_result": text, "source_ledger": ledger})
+                return fixed.model_dump(), receipt
+            except Exception as error:
+                error.receipt = getattr(provider, "failure_receipt", None)
+                raise
+        prepared = prepare_dsh_exploration(config, engine, repair=repair_final)
+        if prepared["state"] != "ready":
+            return prepared
+        web = None
+        if exploration_capabilities(config)["capabilities"]["search"]["available"]:
+            web = {"enabled": True}
+        return explorer.run(
+            prepared["executable"],
+            config["exploration_directory"],
+            config["agent_version"],
+            canceled=stop.exists,
+            model=prepared["model"],
+            runner=prepared["runner"],
+            brief=request.get("brief"),
+            desire_id=request.get("desire_id"),
+            budget_seconds=int(request.get("budget_seconds") or prepared["budget_seconds"]),
+            web=web,
+        )
+    if action == "candidate":
+        return mind.contact_candidate()
+    if action == "reconsider":
+        return mind.reconsider_contacts(**request)
+    if action == "claim":
+        return mind.claim_contact(**request)
+    if action == "check":
+        return mind.check_contact(**request)
+    if action == "settle":
+        return mind.settle_contact(**request)
+    if action == "recover":
+        from . import settling
+        memory = MemoryContinuity(mind)
+        with engine.db.connect(write=True) as conn:
+            enrichment_rescheduled = settling.recover(conn, mind.scope.key(), settling.minutes(memory.settings(conn)))
+        # CR-MIND-12: an older release kept the session judgment in the versioned state.
+        mind.retire_session_advice()
+        # Emotion system v2: the dimensions this release adds join a state initialized before them.
+        mind.extend_dimensions(agent_version=config["agent_version"])
+        # Sync updated role default baselines, half-lives and descriptions for non-evolved dimensions.
+        mind.sync_role_profile(agent_version=config["agent_version"])
+        # Emotion system v2b: the derived layers' block, with every slow layer starting where its score
+        # stands, joins a state kept before them -- after the dimensions, so each gets its anchor.
+        mind.ensure_affect_layers(agent_version=config["agent_version"])
+        # The owner's recorded word on contact frequency, which the host config names, becomes the
+        # state's own field (2026-09-27); it reached an assessment only through one expression style.
+        mind.adopt_contact_frequency(config.get("contact_frequency_evidence_ids"), agent_version=config["agent_version"])
+        # A start-up used to assume the previous service was gone and interrupt every
+        # running exploration. It asks now: a row is interrupted only when its worker
+        # is provably gone — the pid is dead, the pid became some other process, or
+        # the budget it recorded has run out. Anything it cannot establish is left
+        # running, because a start-up that races a live exploration must lose.
+        with engine.db.connect(write=True) as conn:
+            evidence = checks_enabled(conn, mind.scope.key())
+            running = conn.execute("SELECT id,data FROM mind_explorations WHERE scope=? AND state='running'", (mind.scope.key(),)).fetchall()
+            current = mind._load(conn)
+            interrupted, retained = [], []
+            for row in running:
+                data = json.loads(row["data"])
+                if evidence and record_alive(data.get("liveness")):
+                    retained.append(row["id"])
+                    continue
+                interrupted.append(row["id"])
+                desire = current["desires"].get(data.get("desire_id"))
+                if desire and desire["status"] == "in_progress":
+                    desire.update(status="wanted", revision=desire["revision"]+1, updated_at=mind.clock())
+            if interrupted:
+                current["revision"] += 1
+                current["updated_at"] = mind.clock()
+                mind._save(conn, current)
+                mind._history(conn, "mind_" + digest([mind.scope.key(), current["revision"]])[:32], current, "exploration-recovery", {"interrupted": len(interrupted)})
+            for identifier in interrupted:
+                conn.execute(
+                    "UPDATE mind_explorations SET state='interrupted' WHERE id=? AND scope=? AND state='running'",
+                    (identifier, mind.scope.key()),
+                )
+            attempts = conn.execute(
+                "SELECT id,data FROM mind_contacts WHERE scope=? AND state='drafting'",
+                (mind.scope.key(),),
+            ).fetchall()
+        # No platform submission occurred while drafting. Resume the same intent ID;
+        # the next claim refreshes its execution epoch and the model sees current context.
+        with engine.db.connect(write=True) as conn:
+            for attempt in attempts:
+                data = json.loads(attempt["data"])
+                data["resume_draft"] = True
+                conn.execute("UPDATE mind_contacts SET data=? WHERE id=?", (dumps(data), attempt["id"]))
+            current = mind._load(conn)
+            resumed = []
+            for desire in current["desires"].values():
+                if desire["status"] == "waiting" and desire.get("contact_wait", {}).get("decided_by") == "host":
+                    desire.pop("contact_wait", None)
+                    desire.update(status="wanted", revision=desire["revision"]+1, updated_at=mind.clock())
+                    resumed.append(desire["id"])
+            if resumed:
+                current.update(revision=current["revision"]+1, updated_at=mind.clock())
+                mind._save(conn, current)
+                mind._history(conn, "mind_"+digest([mind.scope.key(), "retire-host-waits", resumed])[:32], current,
+                              "contact-recovery", {"resumed_wishes": resumed})
+        # Every settled run's working directory that still has its words loses them now, the ones
+        # just interrupted among them, rather than when the next exploration starts (OPS-03).
+        directory = config.get("exploration_directory")
+        swept = explorer.sweep_workdirs(directory) if directory else []
+        return {"state": "recovered", "canceled_drafts": 0, "resumable_drafts": len(attempts),
+                "enrichment_rescheduled": enrichment_rescheduled,
+                "interrupted_explorations": interrupted, "live_explorations": retained,
+                "swept_workdirs": len(swept)}
+    raise ValueError("Unknown host action")
+
+
+MIGRATION_ACTION = "migrate-evidence-isolation"
+# The operator actions that run from a terminal with nothing to pipe in, so `--apply` is how they
+# are told to write. Every one of them defaults to a dry run.
+APPLY_ACTIONS = (MIGRATION_ACTION, "desire-archive", "history-compact", "history-restore", "appraisal-triage",
+                 "exploration-decision-archive", "archive-memory", "archive-memory-backfill", "slim-evidence-refs")
+# The operator actions `--undo` is read for.
+UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
+
+
+# The resident worker's actions (§5.7): short reads and writes on the store, no model call and
+# no long executor. Exploration, creation's completion review, memory preparation and every
+# request that may take a native review keep their own process, executor and lease.
+RESIDENT_ACTIONS = frozenset({
+    "private-note-save", "private-notes",
+    "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
+    "check", "settle", "energy-configure", "energy-activity", "plan-started", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
+    "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
+    "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",
+    "context-delivery-metrics", "configure-habits", "reply-choice", "review-due", "liveness-facts",
+    "attention", "continuity-attend", "continuity-finish-attention",
+    "sharing-preflight", "share-references", "share-cancel", "deleted-sources",
+    # The DSH plugin's per-turn context and its home page reads. The plugin asks for `mode: light`
+    # context, which never calls a model, so these stay short like the rest of this set.
+    "ensure-initialized", "memory-context", "state-overview", "autonomous-plans", "graph", "event-thread",
+    "persona-save", "work-history", "share-history", "diary", "diary-reply", "dreams", "explorations", "letters", "seal-letter", "configure-memory",
+    # Her chat tools (chat_tools: plans, store reads and writes, no model) and the owner's choices on her page.
+    "chat-tools", "chat-tool", "owner-habit",
+})
+
+
+def _conversation(request, speaker):
+    """Who said it, to whom and where, for a message in one recipient's conversation (RECIPIENT_ACTIONS).
+    Outside one, nothing: the owner's own messages carry no names, as they always did."""
+    from .companion_view import ACTIVE_VIEW
+    view = ACTIVE_VIEW.get()
+    if not view:
+        return {}
+    return {"recipient_person_id": view.person, "conversation_key": view.conversation,
+            "conversation_kind": request.get("conversation_kind") or ("group" if view.person.startswith("group:") else "p2p"),
+            **({"speaker_person_id": speaker} if speaker else {})}
+
+
+def _failure(error):
+    found = classify(error)
+    return {"error": type(error).__name__, "kind": found.kind, **({"code": found.code} if found.code else {})}
+
+
+def serve(config, stdin=None, stdout=None):
+    """The resident worker (§5.7): one request per line, `{id, action, args, timeoutMs}`, answered in
+    order as `{id, ok, result|error}`. Requests run one at a time; the caller owns each timeout and
+    restarts this process when one runs over. Anything a request prints goes to stderr, so the
+    answer stream carries frames only."""
+    import sys
+
+    stdin, out = stdin or sys.stdin, stdout or sys.stdout
+    previous, sys.stdout = sys.stdout, sys.stderr
+    try:
+        while True:
+            line = stdin.readline()
+            if not line:
+                return None
+            if not line.strip():
+                continue
+            try:
+                frame = json.loads(line)
+                identifier, action = frame["id"], frame["action"]
+                args = frame.get("args") or {}
+                if not isinstance(args, dict):
+                    raise TypeError("args")
+            except (ValueError, KeyError, TypeError):
+                reply = {"id": None, "ok": False, "error": {"error": "ValueError", "kind": "semantic", "code": "invalid-frame"}}
+            else:
+                if action not in RESIDENT_ACTIONS:
+                    reply = {"id": identifier, "ok": False,
+                             "error": {"error": "ValueError", "kind": "semantic", "code": "not-a-resident-action"}}
+                else:
+                    try:
+                        reply = {"id": identifier, "ok": True, "result": dispatch(config, action, args)}
+                    except Exception as error:  # noqa: BLE001 - one request's failure is its own answer
+                        reply = {"id": identifier, "ok": False, "error": _failure(error)}
+            out.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            out.flush()
+    finally:
+        sys.stdout = previous
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    # Only the operator actions read these; every other action takes its request on stdin as
+    # before. A dry run is the default, so nothing is written without `--apply`.
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--undo", action="store_true")
+    parser.add_argument("--output")
+    parser.add_argument("--registry")
+    parser.add_argument("action")
+    args = parser.parse_args()
+    try:
+        import sys
+
+        config = load_config(args.config)
+        # The live contact policy sits beside the host's configuration unless it names another.
+        policy = Path(args.config).resolve().with_name("proactive-policy.json")
+        if "contact_policy_file" not in config and policy.exists():
+            config["contact_policy_file"] = str(policy)
+        # Before the store opens and before the request is even read: the code this process
+        # would run has to be the code the deployment points at. A refusal is a SystemExit,
+        # which the handler below cannot turn into a result -- an ordinary exception here
+        # would be printed as one more failed action and the host would keep running the
+        # wrong copy, which is the exact failure this check exists for.
+        enforce_source_root(config.get("source_root"))
+        # And whether the next worker will have anything to start with. Only said,
+        # never acted on: this process is running, so a broken interpreter cannot
+        # hurt it, and refusing would remove the one path still able to report it.
+        warn_interpreter(config.get("python"))
+        if args.action == "serve":
+            return serve(config)
+        # An operator runs these from a terminal, with no request to pipe in.
+        raw = "" if sys.stdin.isatty() else (sys.stdin.readline() if (args.action in {"review", "daily", "companion-host-call"} and config.get("main_session_review") or config.get("companion", {}).get("shared_session")) else sys.stdin.read())
+        request = json.loads(raw) if raw.strip() else {}
+        if args.action in APPLY_ACTIONS:
+            if args.apply and args.dry_run:
+                raise ValueError("Choose either a dry run or an apply")
+            request["apply"] = args.apply
+        if args.action == MIGRATION_ACTION:
+            request.update(undo=args.undo, output=args.output, registry=args.registry)
+        elif args.action in UNDO_ACTIONS:
+            request["undo"] = args.undo
+        elif args.undo:
+            raise ValueError("--undo belongs to a migration")
+        result = dispatch(config, args.action, request)
+    except Exception as error:  # noqa: BLE001 - worker boundary persists a redacted failure receipt
+        # Caller sees an error category, never provider payloads or credentials.
+        # Additive: the class stays the caller's contract, the taxonomy tells it
+        # whether waiting can help. Static codes only, never the failing payload.
+        result = _failure(error)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

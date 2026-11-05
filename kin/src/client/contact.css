@@ -1,0 +1,37 @@
+/* The people she knows (Settings), her reaching out (此刻), and her stickers and voice messages in the chat. */
+
+.kin-field {
+  flex: 1; min-width: 0; height: 32px; box-sizing: border-box; padding: 0 12px; border: 0; outline: none; border-radius: 999px;
+  background: var(--kin-fill-2); box-shadow: inset 0 1px 2px rgb(80 40 90 / .12), inset 0 0 0 1px var(--kin-rim-2);
+  color: inherit; font: inherit; font-size: 13px;
+}
+.kin-field:focus { box-shadow: var(--kin-ring); }
+.kin-person-head { display: flex; align-items: center; gap: 8px; }
+.kin-person-head .kin-field { font-weight: 500; }
+.kin-accounts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 6px 10px; margin-top: 8px; }
+.kin-accounts label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--kin-ink-3); }
+.kin-accounts label span { flex: none; width: 2.6em; }
+.kin-person .kin-switch-row { padding: 8px 0 0; border: 0; }
+.kin-strangers { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--kin-hairline); }
+.kin-stranger { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 4px 0; font-size: 13px; }
+.kin-hours { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 12px; color: var(--kin-ink-3); }
+
+.kin-reach-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "name last" "why why"; gap: 0 12px; }
+.kin-reach-name { grid-area: name; font-weight: 500; }
+.kin-reach-row > .kin-dim:nth-child(2) { grid-area: why; }
+.kin-reach-row > .kin-dim:nth-child(3) { grid-area: last; }
+.kin-reach-alert {
+  margin: 0 0 8px; padding: 6px 12px; border-radius: 12px; font-size: 12.5px;
+  background: rgb(226 119 159 / .12); color: color-mix(in srgb, var(--kin-rose) 70%, var(--kin-ink));
+}
+.kin-sent { margin-top: 6px; padding-top: 4px; border-top: 1px solid var(--kin-hairline); font-size: 13px; }
+.kin-sent-words { font-family: var(--kin-voice); }
+.kin-reach-rules { margin: 8px 0 0; }
+
+@container (min-width: 520px) {
+  .kin-reach-row { grid-template-columns: 7em minmax(0, 1fr) auto; grid-template-areas: "name why last"; align-items: baseline; }
+}
+
+/* A sticker sits in her bubble at sticker size; a voice clip is a player with her words under it. */
+.kin-sticker { display: block; max-width: 140px; max-height: 140px; border-radius: 12px; }
+.kin-audio { display: block; width: 240px; max-width: 100%; height: 34px; margin-bottom: 4px; }

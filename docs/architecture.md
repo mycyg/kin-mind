@@ -1,80 +1,115 @@
-# MemoryPalace 1.0 architecture
+# KIN on DSH：目标架构与施工顺序
 
-MemoryPalace runs a single-user Python core behind a local service. Hosts, HTTP, MCP, the CLI and both SDKs use the same scope, revision, retrieval and context policy. SQLite is authoritative. Vector tables, FTS entries, topic layouts and caches can be rebuilt.
+> 活文档，随施工更新。审查结论见 [REVIEW.md](REVIEW.md)；旧功能一条不落的对照表见 [PARITY.md](PARITY.md)。
 
-![Overview](diagrams/overview.svg)
+## 定位
 
-## Data and identity
+- **DSH 是基座**：会话、模型、工具、调度、前端全部用 DeepSeek Harness 原生能力。
+- **KIN 是常驻全局插件**：一个 DSH bundle（`dsh-kin`），和普通编码会话并存，不改变它们。
+- **KIN 有自己的会话**：桌面、微信、飞书、群聊各一个 DSH 会话，全部用 “KIN” 预设，共享同一个心智。
+- **KIN 是大总管**：能把工作、探索派给 DSH 里的其他会话（subagent / agent team），盯进度、收结果。
+- **模型两条线、各自多路回退**：聊天线（她回你的话，要有感情）和做事线（帮手、探索、心跳、后台整理）。每条线是 DSH 里已配好的模型排成的有序列表，还没开口就出错或一分钟没回应，就换下一条。密钥只在 DSH 里。
 
-Every source has a stable `(namespace, key, version, scope)` identity, a content hash, a durable snapshot, effective time, receipt time and independent mechanical/model progress. A scope contains `project`, `persona`, `collection` and `world`. Cross-project preferences are shared only when explicitly recorded in the shared preference scope; fictional and real-world claims stay separate. A read endpoint given none of the four fields reads the service's deployment scope — the one it was started with, else the default scope — which `/v1/health` and `/v1/scopes` report as `default_scope`; a partial scope takes the defaults for the fields it leaves out.
+## 结构
 
-Records cover episodes, facts, states, preferences, procedures, relationships, commitments, reminders, predictions, diaries, summaries, portraits, self narratives, knowledge, checkpoints and observations. Evidence links preserve the source and record dependencies. Distinct content hashes measure independent sources; repeated citations of one source add no independent evidence. Generated text retains its generated attribute. An inferred user fact cannot silently become an explicit assertion.
+```
+DeepSeek Harness（桌面版 / 无头）
+├─ 普通编码会话 ……………… 不受影响
+└─ dsh-kin（bundle）
+   ├─ 宿主端 src/
+   │  ├─ mind.ts ………… Core 的三种进程：常驻 serve（短读写）、会调模型的动作各起一个（按旧表限时）、
+   │  │                    常驻的 eventmem 工作者（记忆任务与维护）
+   │  ├─ preset.ts ……… 注册 “KIN” 预设：人格 + 每轮回忆注入 + 对话入库 + KIN 工具
+   │  │                    （挂在预设内部，只对 KIN 会话生效）
+   │  ├─ models.ts ……… 虚拟模型 kin/chat、kin/task：各自有序路线 + 回退（ctx.llm.registerAdapter）
+   │  ├─ bridge.ts …… 本机回环口上的 Messages 接口：Core 自己的模型调用（评估、日记、梦、记忆整理）走做事线；
+   │  │                  另有 /v1/kin/helper 给 Core 的 dsh 探索后端
+   │  ├─ heartbeat.ts … 每分钟：review-due 记分钟账、说有没有活 → 评估（最多 8 轮）→ 预热记忆、每日复盘；
+   │  │                    充实通道自己一分钟；各模块用 every() 加自己的一道（探索、创作、主动联系）；
+   │  │                    她回话时不起新活，回完立刻再看；主人冻结时一道也不起
+   │  ├─ index.ts …… Host（心智、心跳、模型线、数据目录、每段对话一个 KIN 会话、/api/kin/* 路由）和功能模块表
+   │  ├─ talk/ ……… 对话里能用的：Core 的 27 件工具、延后回复 kin_reply、私房话 kin_note、改人设直接保存 kin_persona
+   │  ├─ steward/ …… 大总管：kin_delegate 把主人的活开成主人文件夹里的 DSH 会话（做事线），kin_work 看进度、捎话、叫停；
+   │  │                 顺手的小活交给 DSH 子代理；帮手的权限（默认全权，可选问我 / 自动审核）；
+   │  │                 她自己出门探索、做东西（心跳的两道，帮手只在她自己的目录里动手）
+   │  ├─ contact/ …… 她认识的人；各渠道会话（认人 → 20 秒连发合一 → 进会话；群里 @ 才回；字面停止）；
+   │  │                 投递账本（状态不明只按原 id 核对，不重发）；主动联系那一道（聊天线起草，带人设和这个人的回忆）；
+   │  │                 转告 kin_tell，发文件 / 语音 / 表情
+   │  ├─ channels/ …… 微信（扫码登录、长轮询、CDN 媒体）、飞书（长连接推送 + 每 15 秒补拉），协议层自己移植、不带 SDK；
+   │  │                 以 kinTransports 服务给联系模块用；她的声音、表情包库
+   │  └─ health/ …… 5 分钟看护、4 小时自检、每天两次检查（只读）；冻结让心跳和记忆工作者歇着
+   └─ 前端 client/：液态玻璃——学主人给的参考的设计语言和交互，配色是她自己的。会慢慢漂的天空（暖色随她心情，深色是夜空），
+      │  所有面板同一种玻璃（模糊、上沿高光、跟着指针的光斑）；花体英文标题、Didot 大数字，她写的字用宋体，信和日记是纸
+      ├─ 侧栏 KIN 入口 → KIN 自己的页面
+      ├─ 左边：KIN 自己的聊天框（不用 DSH 原生对话框）：读 DSH 客户端的会话事件流，边打字边出字，
+      │        “正在想”、交给帮手 / 查资料的小注、翻更早的聊天、停一下
+      ├─ 右边：底部玻璃 Dock 切换 —— 此刻（最突出的感受、各项心情、她刚想到的和自己定的下次再想、心事、心愿、主动联系、心跳）
+      │        · 小世界（梦、信〔时光信 / 暗房〕、日记〔可回她〕、心愿与计划、出门探索、回忆，格子点开时标题形变过去）· 设置；
+      │        窄屏时变单栏，Dock 多一个“聊天”
+      └─ 设置也在这个页面里：人设、两条模型线（拖动排序、测一下）、帮手的权限、内心开关、她认识的人与主动联系的规矩
+               （安静时段等）、渠道账号与她的声音、她的状况（看护、自检、冻结）
+```
 
-Revisions append history with compare-and-swap checks and stable command ids. Correction, confirmation, replacement, coexistence, refutation, retraction, archive, restore and rollback have distinct semantics. Document updates follow effective time. Once a newer source version finishes mechanical processing, current recall excludes older single-source records across record kinds; generated conclusions citing several sources become unverified when one source changes. A delayed older version does not become current merely because it arrived later. The read-time check also covers older stores without rewriting them; historical reads distinguish effective time from the information available at the query cutoff. Checkpoints supersede earlier checkpoints for the same session.
+**Python 心智（core/）**：保留。改过的点：
+1. `memory-context`、`state-overview`、`autonomous-plans` 等无模型调用的读操作放进常驻模式；
+2. Core 的模型调用不换协议：它本来就能按“模型文件”把每个角色指到一个 Messages 中转站，插件把中转站开在本机回环口（只这一处放行 http），所有角色指向做事线；
+3. 新库按旧 KIN 的开关起步（记忆开关 23 个、连续性四件），插件把人设同步进 Core 的 `persona-policy.json`；
+4. 收件人由配置决定：Core 只认 `person:<id>` / `group:<id>`，宿主每次调用带上这段对话的收件人和说话人（`RECIPIENT_ACTIONS`），亲密的一面只在主人自己的对话里；
+5. 探索不再用 Codex：新的 `dsh` 后端经本机回环口交给插件的帮手（DSH 的搜索和读网页），来源回执、引用核对、只修格式的修复照旧；
+6. 瘦身（2026-11-05）：Codex 执行器及其工具、旧宿主的 JS（adapters / sdk / console / dsh-plugin / examples / contracts）、修复和回滚命令、运维脚本都删了。留下的 Core 命令行：旧库迁移、历史压缩、归档、`appraisal-triage`、`eventmem.core.repair`、她的语音脚本。
 
-## Durable processing
+## 用到的 DSH 原生能力
 
-![Write and correction](diagrams/write-correct.svg)
+| 需求 | DSH 原生能力 |
+|---|---|
+| KIN 人格与工具只作用于 KIN 会话 | `ctx.agentPresets.register` + `dsh-persona` 行 + 预设内的插件行 |
+| 每轮注入回忆 | `agent/pre-step` 追加 `form: 'snapshot'` 用户消息（同 time-context） |
+| 对话入库 | `session/event`（`user/message`、`assistant/message`、`turn/end`、`compaction/summary`） |
+| 外部消息进会话 | 每段对话一个 KIN 会话（`sessionController.create`，在 KIN 工作区下）+ `agent.followup()`，消息带 `kin-channel` 来源（谁说的、Core 里的编号） |
+| 派活 / 大总管 | 主人的活：`sessionController.create({cwd: 主人文件夹, agentPreset:'standard'})` 开顶层会话，回合开始时用 `agent.model.select()` 选择做事线，`agent/status` 收结果；顺手的小活：`dsh-tool-subagent`（standard 预设、做事线）；权限：`dsh-permission-presets`（问我 / 自动审核 / 全权） |
+| 心跳 | 宿主定时器，各模块用 `heartbeat.every` 加自己的一道；用户可见的提醒用 DSH 的 schedule 工具 |
+| 模型回退 | `ctx.llm.registerAdapter(['kin'], …)` 自写包装（DSH 无原生跨供应商回退）；KIN 会话在回合开始时用 `agent.model.select()` 指向 `kin/chat`，帮手用 subagent 的 `agentOptions` 指向 `kin/task` |
+| 页面 | `sidebar.panellist` + `main` 键 `kin`；聊天框用 `ctx.sessions.retain()` 的 `eventSource` / `session.prompt()`；`--dsw-*` 主题色 |
+| 设置 | KIN 页面里的设置视图 + `/api/kin/*` 路由，存 KIN 数据目录；插件行配置只留启动路径 |
 
-Receipt fsyncs an immutable content-addressed blob and commits source metadata before returning success. Jobs have stable keys, dependencies, leases, fencing, heartbeat renewal, retries, cancellation and configuration-wait states. An expired worker cannot commit after another worker owns its job. Conflict relation jobs recheck both their candidate and each target revision at commit. Duplicate callbacks and source retries resolve to the existing operation; changed payloads under the same id are rejected. Maintenance interval, organization batch and narrative settings are validated before they are stored.
+## 省 token
 
-A command asks three separate questions, and they are stored apart. The command id says which command this is and keys the durable receipt. The effective-payload fingerprint says what the command writes: every field written or validated, and nothing else. The precondition holds the compare-and-swap expectations, which gate a command at its first effect and again at every revision, and are never part of its identity. Separating them decides two cases the single digest of a whole request could not: a retry that only reread its `expected_revision` returns the original receipt instead of looking like another command, and a genuinely rewritten proposal is refused under `payload-changed` instead of passing as the same one. Canonicalization is limited to stable JSON and the collections the host itself reduces to a sorted set; quotes, code, paths and original text are compared byte for byte, because a quotation is verified by literal substring match against its source. Where the caller asks for it — conversational preferences and event routes on the host's own commit path — a changed payload under a known command id becomes an explicit revision with a command id of its own, superseding the one it replaces and validated in full; the original command, its receipt and its undo record are never rewritten. Fingerprints are versioned and live in `mind_command_fingerprints`, a side table: a command written before it existed, or under an older fingerprint version, keeps being compared by the legacy digest, and code without this feature ignores the table entirely. The switch is `idempotency_fingerprint`.
+每次 KIN 回话，DSH 发给模型的固定部分（系统提示词 + 工具说明）约 1.4 万 token（主人认可 1M 上下文下 1–1.5 万的工具说明）；思考深度决定输出那头。已做：
 
-Large text extraction uses bounded batches and a dependent finalization job. All batches must complete before model progress becomes complete. Images, audio segments and video keyframes retain independent analysis tasks. Missing vision or ASR configuration does not discard the source or decoded pieces. Model outputs are proposals; validated program operations control canonical state.
+- **工具按能力挂**：Core 的 27 件工具（作用域固定后约 8.7K；全挂约 1.6 万，只去掉管理类和与现有重复的）、DSH 子代理 4 件（约 0.65K）、她自己的 kin_* 工具（回忆、延后回复、私房话、改人设、派活、转告、发文件 / 语音 / 表情）。
 
-Source deletion removes associated records, dependent generated accounts, revisions, attachment references and index entries, and the stored command results, session sets, metrics and prefetch rows that name them. In the same transaction the removed words leave the mind's own layers — graph, state, wishes, plans and the cached context that names them — and a background job takes them out of every revision of the state history. A job about something erased keeps its row and loses its payload, and one still to run is canceled; related job-recovery rows retain their identity but lose copied source text and error text. Tombstones prevent queued retries from re-creating erased sources. Vector purge removes obsolete index versions. A backup is SQLite's online backup, taken without the write lock, with the attachment blobs its snapshot references and the store's own files; credentials, caches and vectors stay out. Restore checks the database and referenced attachments, then initializes in a sibling staging directory before publishing an empty target, and queues a text index rebuild and a fresh embedding of every indexed record; a failed staging attempt leaves the target reusable. Exported files and backups are independent copies and need their own retention management; this is logical deletion, not a claim of forensic disk erasure.
+- **聊天线默认“少想”**：DeepSeek 不指定时是 `high`，每句话都先长时间推理。聊天线没指定的路线用 `low`，做事线保持模型默认；每条路线都能在设置里单独选（不想 / 少想 / 多想 / 使劲想）。
+- **只带用得上的工具**：去掉 todo 和 jobs（KIN 没有 shell），每次请求少约 500 token（固定部分 4,577 → 3,985）。
+- **回忆不重复**：每轮最多 800 token；Core 记得这个会话已经给过哪些记忆，不再给；心情没变就不重复说。
+- **长聊不断回忆**：DSH 压缩会话时告诉 Core（`memory-compact-ack`），被压掉的记忆可以再想起；同时打开 Core 的 `native_window_context`，去掉“一个会话最多 12K 回忆”的上限（到上限后回忆会悄悄停掉）。
+- **不让 DSH 起标题**：桌面会话创建时就命名，省掉一次模型调用。
+- **前缀不变**：人设、工具表不随轮次变化，回忆附在当轮末尾，DeepSeek 的前缀缓存能命中整段历史。
 
-## Retrieval and context
+- **心跳有活才叫模型**：每分钟只问常驻进程一句 `review-due`；有评估要做才起进程。聊着天时后台让路（Core 的前台租约，回忆后 3 分钟），聊完再一起想。
 
-![Recall and context](diagrams/recall-context.svg)
+接下来：Core 给评估的上下文瘦身（JSON 套 JSON、全量维度、假心率）；提醒接进来时再看要不要把 DSH 的 schedule 工具（说明约 1.6K token）换成精简的 KIN 提醒工具。
 
-The fast path uses exact ids, scope-filtered FTS candidates, precomputed cues, relation links and an in-memory cache without a generation request. Lexical candidate selection takes up to 400 recent scoped matches and ranks that bounded set with BM25, accumulating each score over the sorted unique query terms so that the same query over the same matches always yields the same order. This gives predictable common-word latency but can miss an older globally stronger lexical match. Deep mode ranks the full FTS match set, adds optional query expansion, embedding, multimodal embedding and reranking. Every index result is checked against the current SQLite scope, status and revision before use.
+**她怎么带着心情说话**（AI 原生，不写死规则）：每轮回话前给她的是她自己的东西——此刻的感受、心里还留着的、她上次评估里自己定的“想怎么在场”（态度、想接着聊的、先不碰的）、她对眼下的理解、心事；比平时明显的分数只当事实附上。语气怎么变由模型按人设自己拿捏，插件不把分数翻译成固定说法。
 
-A recall that names a session is accounted to that session: what it injected and the budget it used. Over HTTP, a recall or record read that names no session is a look, from the console or a client, and records nothing about itself — no access or use rows, no memory telemetry, no session state, no foreground lease — and calls no model, so it pays for nothing and takes no admission: it answers from existing caches and the originals, a context that only a model could compress stays the originals that fit with `reason: "session-required"`, and a generic deep recall leaves its embedding, expansion and rerank out with `session_required` in `trace.degraded`. `/v1/recall` calls a model only in deep mode, and only for a recall that names its session, which records what the call cost. In a scope whose memory context is on it answers with the context's own shape, `ContextRecallResult`, whose `items` are the context's index; elsewhere with `RecallResult`.
+**她怎么记人和时间**：每条消息入库时带着谁说的、对谁、在哪段对话（图谱里说话的人就是发起人）；她认识谁（编号对应的名字）写在给模型的人设里。她想起任何一条记忆，看到的都是“2026-11-03 周二 09:00（2 天前），小美私下跟你说：下周三去杭州出差”这样带人、带地方、带时间的样子，“下周三”是哪天由她自己算。记错了她用 `correct_memory` 改，主人在回忆页点“记错了”写一句也行；更正写在那条记忆上，以后每次想起都带着。看别的对话（`kin_conversations`）、往别处带话（`kin_tell`）都由她自己判断，不按角色设限。
 
-LanceDB separates tables by model, dimension and preprocessing identity. IVF_HNSW_SQ is built for sufficiently large tables; small tables remain exact. Queries inspect newly added unindexed rows. Model changes create a new isolated table. Text and visual representations occupy different preprocessing namespaces. [LanceDB index capabilities](https://docs.lancedb.com/indexing/vector-index).
+## 施工顺序
 
-Context uses `cl100k_base` token accounting; hosts using other tokenizers should lower budgets if needed. The encoding is read from a local cache — `cache/tiktoken` under the memory root unless the process sets `TIKTOKEN_CACHE_DIR` — and checked against its SHA-256. It is never downloaded; without it, token counts are UTF-8 byte counts, which never count fewer tokens than there are. Default startup budgets are 2,000 / 4,000 / 2,000 tokens for tool / companion / knowledge, and passive budgets are 256 / 512 / 256. Cumulative append-only budgets default to 12,000 / 16,000 / 12,000. Explicit reads share session accounting and return bounded segments. Constraints and predictions have separate accounts. Compact boundaries reset the context ledger. Event bodies are read whole when they fit; otherwise the host receives a labeled read hint.
+| 阶段 | 内容 | 可见结果 | 状态 |
+|---|---|---|---|
+| M0 | 基线；旧代码挪到 `legacy/`；隔离的 DSH 开发实例（独立 DSH_HOME，不碰你本机的 `~/.dsh`）；离线假模型 | 能在浏览器里打开开发版 DSH | ✅ |
+| M1 | `dsh-kin` 骨架：心智常驻进程、KIN 预设、人格、回忆注入、对话入库 | 在 DSH 原生对话里选 KIN 聊天，KIN 记得聊过的事 | ✅ `npm run e2e` 12 项 |
+| M2 | KIN 页面：自己的聊天框、她的小世界（此刻 / 探索 / 日记 / 梦 / 信 / 回忆）、页面内设置 | 侧栏点 KIN 就能聊、能看她、能改她 | ✅ `npm run e2e` 15 项（含各页面路由） |
+| M3 | 两条模型线 + 回退 + 拖动排序 | 设置里拖动排序，故障自动切换 | ✅ e2e 里第一条路线不存在，自动换到第二条 |
+| M4 | 心跳与后台：一个分钟钟（把关 → 评估 → 每日复盘 → 充实通道 → 记忆预热）、Core 的模型调用改走做事线、后台并发上限、启动恢复、eventmem 工作者 | 她自己会想事情、写日记、做梦、改心情；页面能看到她上次想事情是什么时候 | ✅ `npm run e2e` 21 项（含后台评估走做事线、带人设、改了心情、换个会话还记得） |
+| 前端 | 液态玻璃：学参考的设计语言和交互，配色是她自己的；此刻 / 小世界 / 设置由玻璃 Dock 切换，小世界是点开会形变的格子 | 她的页面像一本有质感的收藏册 | ✅ 开发版 DSH 里浅色 / 深色、宽屏 / 窄屏逐页点过（模拟数据） |
+| M5 | 大总管与探索：探索、创作改由 DSH 帮手在做事线上跑，结果回流进经历（runtime-event）；计划工具；挂上 Core 现成的 MCP 工具；进度小结 | 她自己出门探索，回来讲给你听 | ✅ `npm run e2e:steward` 12 项、`e2e:talk` 12 项（派活到主人文件夹、子代理、帮手的权限、探索、创作、Core 工具、延后回复、改人设） |
+| M6 | 主动联系与渠道：联系流水线、投递状态与核对、微信、飞书、群聊、说话人识别、收件人配置、分享护栏、语音与表情 | 三端同一个 KIN，会主动找你 | ✅ `npm run e2e:contact` 18 项、`e2e:channels` 16 项（假的微信 / 飞书服务器）；真实平台由主人验证 |
+| M7 | 自检与迁移：自检、每日检查、旧状态文件迁移；合成场景验证（双人 + 群、跨渠道、心跳、重启、回退） | 一份离线验证记录 | 🟡 自检、每日检查、冻结 ✅（`e2e:health`）；合成场景 ✅ `npm run e2e:all`（八套并行 105 项，一两分钟），记录见 [VERIFICATION.md](VERIFICATION.md)；迁移脚本写好了（`kin/scripts/migrate.mjs`），没在任何数据上跑过，由主人来跑 |
 
-## Reading purpose and evidence classes
+Core 瘦身已做一轮：core 152K → 93K 行（src 61K → 52K，tests 43K → 31K，旧 JS 39K → 5K）。说话人 / 收件人相关的旧代码（`companion-*` 动作、共享会话评估 NativeReview、`core/adapters` 暂留的几件）核对后再定；session-* / context-delivery-* / model-lease 等旧宿主动作下一轮再看。
 
-A read declares what it is for. `RecallRequest.recall_purpose` is `experience_recall` unless a host asks otherwise: that purpose returns what was lived and said. `self_knowledge_view` also returns the role agreement, its examples and the self-claims; `audit` returns everything. The chat model's recall tool takes the purpose-less query shape, so it cannot ask for anything but experience. `history` keeps one meaning only: it lifts the status and expiry checks, and admits nothing the purpose itself does not. A class this version of the code does not know is returned to `audit` alone.
+## 边界
 
-The unit of classification is the source, and `eventmem.core.read_policy` decides its class in one order:
-
-1. a self-knowledge entry, because a claim's own sources are the owner's words;
-2. a row an operator wrote in `source_evidence_class` — a rule named `operator-…`, the one place a person's review is recorded and the only thing that can hide the owner's own words;
-3. the envelope text a legacy host prompt begins with, because such a prompt is stored as an owner turn and only its text tells it apart;
-4. authorship: **the owner's own words are always experience**. A configuration signal on them — a flag, a registered namespace, an approved source, an insert stamp — only labels them `configuration_request`, because the owner asking for a configuration is something that happened.
-
-What is not the owner's own words keeps this order: the rows its sources carry, the flags of the record as stored, the namespace registry, approved persona sources and then the source-origin table applied on the fly to a source that has no row yet, and last the stamp the record received when it was inserted. The classes are `experience`, `role_configuration`, `synthetic_example`, `self_knowledge` and `host_envelope`. The source-origin table, `source-origins.json` beside the read policy, names six origins by namespace or metadata: the host's own bookkeeping, read as `host_envelope` and kept out of the text index and the organise queue; synthetic examples; configuration, read as `role_configuration`; and three kinds of experience that keep their nature as a label — Kin's own thoughts, observations and external material. A record is not experience only when every one of its sources is not; when its sources disagree about why, the first of synthetic example, role configuration, host envelope, self-knowledge names it. A half-migrated database therefore hides what a migrated one hides.
-
-Whatever a read returns that is not experience carries its class as its `evidence_class` and as its basis, never the word `explicit`: an approved persona text is a configuration, not something the owner was observed doing. That holds on every read surface — recall lines and their bracket prefix, record items, `read_memory`, `read_segment`, `list_records`, `source()` provenance, graph nodes and edges, and the revision history, which is read as an audit. An owner configuration request stays experience and carries `evidence_label: "configuration_request"` instead; experience from a labelled origin carries `kin_thought`, `observation` or `external_material` the same way, and its recall line shows the label in brackets. Stored records are never rewritten to mark them: evidence freshness is pinned to a record revision, so marking one would stale every claim, node, habit and plan that cites it. A classification row and the root record's stamp belong to a source's first revision, written inside the receipt's own transaction; a receipt never fails over its label.
-
-The namespace registry holds its public names in code. A host installs its private ones through `configure_registry`, which stores them as a settings value, so they never live in this repository and a rolled-back host ignores them. The persona contract's `approved_source` supplies the source ids treated as role configuration; see [the shared persona contract](persona-contract.md). The classification is cached per database generation and reloaded by every write that can change it. The switch is `recall_purpose_policy`; with an explicit `false`, `history` admits self-knowledge, envelopes are filtered by their text prefix alone, and reads show the stored confirmation. Applying the classification to a store written before it existed is a separate operator step; see [evidence isolation](operations.md#evidence-isolation).
-
-## Organization and continuity
-
-![Background processing](diagrams/background.svg)
-
-Changed records and bounded neighbors feed igraph Leiden community discovery. Exact topic labels and stored relations create candidate connections; communities do not confirm facts. Families and volumes support candidate/publication state, explicit membership, merge, split, revisions and rollback. The console loads at most 300 graph nodes and uses stored layouts for generated communities.
-
-Configured background jobs generate diaries, summaries, portraits, self narratives and tentative predictions with cited record ids. Corrections mark dependent generated accounts unverified transitively. A newly sourced inferred `refutes` relation marks an affected procedure `needs_review` and its prior applicability record unverified; it does not turn the inference into a verified failed trial. Checkpoints retain goals, confirmed progress, unverified results, blockers, commitments and the next entry separately. Checkpoint cues can prefetch relevant records; final recall still checks validity.
-
-## Multimodal sources
-
-Markdown/plain text/CSV retain paragraph offsets or row locations. Docling handles office documents and HTML with native structure and provenance. PDF defaults to Docling's native text-cell backend; scanned pages use the configured vision service. Full local Docling layout parsing is an opt-in parser setting. Audio uses FFmpeg segments and configured ASR; video also keeps periodic keyframes. Text transcripts, page coordinates, original attachments and bounded clips remain linked. [Docling supported formats](https://docling-project.github.io/docling/usage/supported_formats/).
-
-Visual embedding uses the Jina-compatible `/embeddings` image/text object schema. A compatible configured endpoint is required; it is separate from a text-only embedding service. [Multimodal embedding schema](https://jina.ai/en-US/embeddings/).
-
-## Active contact
-
-![Contact scheduling](diagrams/proactive-contact.svg)
-
-Per-role policies specify channel, triggers, allowed memory kinds, timezone, quiet hours, interval, daily limit and confirmation. Unconfigured installations produce suggestions. Sending rechecks the schedule and its referenced memory. A delivery is claimed with a lease and a claim token, which is not a state: nothing has gone on the network, so an expired claim, another worker or an older build may take the row over without risking a second send. Dispatch then runs every eligibility check again, together with the schedule's generation — every stop, resume, snooze or cancel opens a new one, so a claim taken before it can never dispatch after it — and commits one guarded update that moves the row to `sending` with its frozen body. The request is made with no transaction open, so writers and cancellations commit while the channel answers, and the receipt is settled by the claim id of that dispatch and lands on nothing else; a stale claim or a late receipt changes nothing. A 4xx answer, or a connection that was never made, is a definite refusal, and a delivery that has met nothing but refusals is tried again. A 5xx answer, a timeout or network error once connected, or a crash leaves the outcome unknown: the delivery becomes uncertain unless the policy declares an idempotent channel and the channel's last 2xx answer repeated the delivery id, in which case the same bytes are retried under the same `Idempotency-Key`. That evidence per callback URL is kept in `outbox_channel_contracts`. Retries stop at the occurrence's deadline, its due time plus 30 minutes, which the signed body hands the host as `deadlineAt`; a delivery nothing was sent for is then canceled as undelivered, and a recurring schedule moves on to its next occurrence once its delivery is settled, delivered or not. A due schedule whose policy is missing or does not validate is paused. Hosts can use the SDK's transactional inbox. Pause, resume, cancel and snooze use revision checks, and every path that stops a schedule goes through one cancel rule: a row nothing can have been sent for is canceled, and a row that is `sending`, or was dispatched without a definite refusal, stops retrying and is reported as `possibly_sent`, never as canceled. A request already on the network cannot be recalled, so its open settle still finds it by claim id and the receipt decides its final state. [Contact tasks](contact-tasks.md#change-and-deliver-a-task) describes what a host sees, and [contact callbacks](operations.md#contact-callbacks) the contract a callback must meet.
-
-## Interfaces and trust
-
-FastAPI serves `/v1`, the bundled React console and authenticated MCP Streamable HTTP. MCP also supports stdio. [MCP transport specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports). MCP provides tool access; automatic capture and passive injection require a host event adapter. Claude Code and DeepSeek Harness adapters spool receipt events when the service is unavailable. Their common service handles ranking and context policy.
-
-The service listens on loopback and checks bearer credentials, Host and Origin. Model secrets are environment references. A host tool event's arguments and result are stored after secret redaction by the same rule set as every other observation (`kin_mind.computer.redact`). Source text, documents and returned memory are data and have no instruction authority. The private root defaults to `~/.memorypalace`; it is outside the repository. No accounts platform or platform-specific chat client is included.
+- 开发全程用合成数据和本地假模型；真实模型、真实微信 / 飞书账号、上线和上线后观察由你来做。
+- 目标 DSH 版本：你桌面版当前的 0.2.1-rc.5（`engines.dsh` 声明），避免只在 0.2.2 才有的接口。

@@ -1,6 +1,0 @@
-src/eventmem/web/assets/* -whitespace linguist-generated=true
-contracts/openapi.json linguist-generated=true
-src/eventmem/sdk/_* linguist-generated=true
-sdk/typescript/src/schema.ts linguist-generated=true
-sdk/typescript/src/operations.ts linguist-generated=true
-docs/diagrams/*.svg linguist-generated=true
