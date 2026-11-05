@@ -112,6 +112,7 @@ const checks = {
   'in her desktop chat the sticker shows, from her media route': report.appSticker?.media.kind === 'image' && pages.media?.status === 200
     && pages.media.type === 'image/png',
 }
+if (Object.values(checks).some(ok => !ok)) console.log('cross-session readings:', JSON.stringify(report.looks))
 for (const [name, ok] of Object.entries(checks)) console.log(`${ok ? '✓' : '✗'} ${name}`)
 console.log(`\ndrafts: ${JSON.stringify(report.drafts)}\nsent: ${JSON.stringify(report.mingSends?.map((s) => s.text))} · report: ${out}`)
 process.exit(Object.values(checks).every(Boolean) ? 0 : 1)

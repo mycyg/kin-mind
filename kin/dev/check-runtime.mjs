@@ -7,12 +7,35 @@ import { rmSync } from 'node:fs'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const output = root + '/kin/.regression'
 await build({
-  entryPoints: [root + '/kin/src/models.ts', root + '/kin/src/render.ts'],
+  entryPoints: [root + '/kin/src/models.ts', root + '/kin/src/render.ts', root + '/kin/src/model-output.ts'],
   outdir: output, format: 'esm', platform: 'node', bundle: true, packages: 'external',
 })
 try {
   const { KinModel, probe } = await import(output + '/models.js')
   const { renderContext } = await import(output + '/render.js')
+  const { modelOutput, answerText } = await import(output + '/model-output.js')
+  const wrapped = '🧠\nPrivate test reasoning.\n🪒你好呀\n\n今天过得怎么样？'
+  const expected = '你好呀\n\n今天过得怎么样？'
+  async function* streamText(text, split) {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    for (const part of [text.slice(0, split), text.slice(split)]) yield { type: 'text-delta', index: 0, text: part }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  for (let split = 0; split <= wrapped.length; split++) {
+    const chunks = []
+    for await (const chunk of modelOutput(streamText(wrapped, split))) chunks.push(chunk)
+    assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), expected)
+    assert.equal(chunks.find(c => c.type === 'block-end').block.text, expected)
+    assert.ok(!JSON.stringify(chunks).includes('Private test reasoning'))
+  }
+  for (const normal of ['🧠', '🧠 很聪明', '正文里的🪒是剃刀', 'hello']) {
+    const chunks = []
+    for await (const c of modelOutput(streamText(normal, 1))) chunks.push(c)
+    assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), normal)
+  }
+  assert.equal(answerText('🧠\nunfinished private thought'), '')
+  console.log('PASS: relay thinking envelope never reaches text deltas or final blocks, at every split; ordinary emoji retained')
   const tried = []
   const ctx = { llm: { async *stream(options) {
     tried.push(options.model)
@@ -34,7 +57,7 @@ try {
   const routes = ['throws', 'empty', 'finish', 'invalid-tool', 'ready'].map(model => ({ provider: 'test', model, effort: 'max' }))
   const model = new KinModel(ctx, () => routes)
   const chunks = []
-  for await (const chunk of model.stream({ model: 'chat' })) chunks.push(chunk)
+  for await (const chunk of model.stream({ model: 'chat', messages: [] })) chunks.push(chunk)
   assert.deepEqual(tried, routes.map(route => route.model))
   assert.equal(model.last.chat.answered.model, 'ready')
   assert.equal(model.last.chat.failed.length, 4)

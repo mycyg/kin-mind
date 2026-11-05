@@ -7,6 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import type { Context } from '@deepseek-ai/cordis'
 import type { ISessions, PendingSubmission, SessionBinding, SessionEventLikeEntry } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { answerText } from '../model-output.js'
 import { Heart, Helper, Stop } from './icons.js'
 import { Orb } from './Orb.js'
 import { clock, day } from './time.js'
@@ -233,7 +234,7 @@ function assemble(entries: readonly SessionEventLikeEntry[], pending: readonly P
     } else if (event.type === 'assistant/message') {
       event.data.message.content.forEach((block, index) => {
         const key = `e${event.seq}:${index}`
-        if (block.type === 'text' && block.text.trim()) add({ kind: 'kin', key, text: block.text.trim(), at })
+        if (block.type === 'text' && answerText(block.text).trim()) add({ kind: 'kin', key, text: answerText(block.text).trim(), at })
         else if (block.type === 'tool-call') add({ kind: 'act', key, text: actOf(block.name, block.arguments), at })
       })
     }

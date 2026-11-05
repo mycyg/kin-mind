@@ -39,7 +39,7 @@ export type Part = { text: string } | { file: string; kind: 'image' | 'voice' | 
 
 /**
  * What became of a send. `unknown` (the request may or may not have landed) is never resent under a new id:
- * it is asked about again with `check`.
+ * it is checked first, then retried under that same id within the delivery retry budget.
  */
 export interface Sent {
   state: 'accepted' | 'unknown' | 'failed'
@@ -53,7 +53,7 @@ export interface Transport {
   start(inbound: (message: Inbound) => void): Promise<void>
   close(): Promise<void>
   /** Sends one part. `id` is the delivery's own id, so a retry of the same part is recognised, not sent twice. */
-  send(to: Address, part: Part, id: string): Promise<Sent>
+  send(to: Address, part: Part, id: string, retryUnknown?: boolean): Promise<Sent>
   /** What became of a send whose outcome was unknown, where the platform can say. */
   check?(to: Address, id: string): Promise<Sent>
   /** "Typing…" while she writes, where the platform has it. */

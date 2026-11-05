@@ -106,6 +106,7 @@ export function health(host: Host) {
     // What is under way now (the old /busy): her reply, her heartbeat's rounds, when the minute last beat.
     now: {
       replying: host.replying(),
+      delivering: host.ctx.get('kinContact')?.sending ?? false,
       rounds: [...heartbeat.rounds].map(([lane, since]) => ({ lane, name: LANE_NAMES[lane] ?? lane, since })),
       lastMinute: heartbeat.lastMinute ?? null,
     },

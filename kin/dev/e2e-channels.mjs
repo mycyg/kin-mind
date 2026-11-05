@@ -97,8 +97,9 @@ checks['feishu: text, file and voice go out (voice as audio with its length)'] =
 lark.state.loseNextAnswer = true
 const lost = await feishu.send(owner, { text: '这句的回执丢了' }, 'd-lost')
 const retried = await feishu.send(owner, { text: '这句的回执丢了' }, 'd-lost')
-const checked = await feishu.check(owner, 'd-lost')
-checks['feishu: a lost answer is unknown, not sent again, and check settles it as one message'] = lost.state === 'unknown' && retried.state === 'unknown'
+const pending = await feishu.check(owner, 'd-lost')
+const checked = await feishu.send(owner, { text: '这句的回执丢了' }, 'd-lost', true)
+checks['feishu: check precedes an explicit same-id retry; the platform keeps one message'] = lost.state === 'unknown' && retried.state === 'unknown' && pending.state === 'unknown'
   && checked.state === 'accepted' && [...lark.state.sent.values()].filter((message) => message.content.includes('回执丢了')).length === 1
   && (await feishu.send(owner, { text: '这句的回执丢了' }, 'd-lost')).platformId === checked.platformId
 await feishu.close()
@@ -144,6 +145,18 @@ checks['wechat: text and voice go out; a file only when the owner named it'] = t
   && ilink.state.sent.every((msg) => msg.context_token === 'ctx-3')
   && decrypt(ilink.state.cdn.get(fileItem.media.encrypt_query_param), fileItem.media.aes_key).toString() === readFileSync(files.pdf, 'utf8')
 checks['wechat: typing reaches WeChat'] = ilink.state.typing.join() === '1'
+ilink.state.loseNextAnswer = true
+const wxLost = await wechat.send(me, { text: '回执测试' }, 'w-lost')
+const beforeRetry = ilink.state.sent.length
+const wxCached = await wechat.send(me, { text: '回执测试' }, 'w-lost')
+const noImplicitRetry = ilink.state.sent.length === beforeRetry
+const wxRetried = await wechat.send(me, { text: '回执测试' }, 'w-lost', true)
+const afterRetry = ilink.state.sent.length
+await wechat.send(me, { text: '回执测试' }, 'w-lost', true)
+checks['wechat: only an explicit unknown retry sends again, with the same client id; accepted never repeats'] = wxLost.state === 'unknown'
+  && wxCached.state === 'unknown' && noImplicitRetry && wxRetried.state === 'accepted'
+  && ilink.state.sent.at(-1).client_id === ilink.state.sent.at(-2).client_id
+  && afterRetry === beforeRetry + 1 && ilink.state.sent.length === afterRetry
 await wechat.close()
 ilink.close()
 

@@ -6,6 +6,10 @@
 - Restore original persona and migration settings, source-aware recall, direct persona edits, ordered model fallback, and active-only plan context.
 - Fix diary/dream text layout, pause unfocused animations and polling, retain worker result scope, and stop only the originating conversation’s workers.
 - Adapt model selection and subagent composition to DSH 0.2.2-rc.1; refresh dependency lock and illustrated README.
+- Decode explicit relay thought/answer envelopes before streaming or remembering replies; clean older assistant excerpts on read.
+- Check unknown receipts before up to three same-ID retries; notify only after retry exhaustion.
+- Include queued output and pending platform receipts in health activity; retain unknown delivery IDs across restarts.
+- Keep the cross-session fixture within the recent-message window on slower CI runners.
 - Run pytest through Python so repository scripts resolve on clean CI runners.
 - Verification: 106 integration checks, 1385 Core tests (1 skipped), and 10 Node checks passed.
 

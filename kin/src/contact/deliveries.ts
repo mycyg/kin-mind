@@ -3,8 +3,8 @@
  * message she decided to send on her own, a relay, a reminder, a system notice. Each delivery has one id
  * for good and each of its parts the id `<delivery>:<n>`, so a restart or a retry never sends anything
  * under a new name (PARITY "搬的时候最容易出事" 1):
- * - a part whose outcome is unknown is asked about by its own id, five minutes on, doubling to six hours;
- *   only a platform that says it never arrived lets the same part go again, under the same id;
+ * - an unknown part is checked after a minute, then retried under its own id at most three times;
+ *   confirmed parts never repeat, and only exhausted retries ask the owner to look;
  * - a delivery that began is finished: the parts after it go once the earlier ones are settled;
  * - one that never got a part out is cancelled after a few refused tries; one cut short half way needs review.
  */
@@ -33,6 +33,8 @@ export interface Delivery {
   /** An unknown outcome is asked about again then. */
   checkAt?: string
   checks?: number
+  /** Retries of the current uncertain part, persisted before each attempt. */
+  retries?: number
   /** Refusals of the next part so far. */
   tries?: number
   reason?: string
@@ -62,6 +64,10 @@ export class Deliveries {
     private readonly settled: (delivery: Delivery) => Promise<void>,
   ) {
     this.all = host.load<Record<string, Delivery>>(FILE, {})
+  }
+
+  get sending() {
+    return this.busy.size > 0
   }
 
   get(id: string): Delivery | undefined {
@@ -126,7 +132,7 @@ export class Deliveries {
       delivery.tries = 0
       if (sent.state === 'unknown') {
         delivery.checks = 0
-        delivery.checkAt = new Date(Date.now() + this.host.ms(5 * MINUTE)).toISOString()
+        delivery.checkAt = new Date(Date.now() + this.host.ms(MINUTE)).toISOString()
         delivery.reason = sent.reason
         return this.finish(delivery, 'unknown')
       }
@@ -135,18 +141,29 @@ export class Deliveries {
     return this.finish(delivery, 'accepted')
   }
 
-  /** An unknown part asked about by its own id: arrived, the rest goes; never arrived, the same part goes again; still unknown, asked later. */
+  /** Check an uncertain part before a bounded retry under the same id; only confirmed parts let the rest go. */
   private async check(delivery: Delivery, may: () => boolean) {
     const index = delivery.sent.length - 1
     const transport = this.transportOf(delivery.transport)
-    const answer: Sent = transport?.check
+    let answer: Sent = transport?.check
       ? await transport.check(delivery.to, partId(delivery, index)).catch(() => ({ state: 'unknown' as const }))
       : { state: 'unknown' }
+    if (answer.state === 'unknown' && transport && may() && (delivery.retries ?? 0) < TRIES) {
+      delivery.retries = (delivery.retries ?? 0) + 1
+      this.save()
+      const retried = await transport.send(delivery.to, delivery.parts[index]!, partId(delivery, index), true)
+        .catch((error: Error): Sent => ({ state: 'unknown', reason: error.message }))
+      // A refused retry cannot prove the original uncertain attempt never arrived.
+      if (retried.state === 'accepted') answer = retried
+      else if (retried.reason) delivery.reason = retried.reason
+    }
     if (answer.state === 'unknown') {
       delivery.checks = (delivery.checks ?? 0) + 1
-      delivery.checkAt = new Date(Date.now() + this.host.ms(Math.min(5 * MINUTE * 2 ** delivery.checks, 360 * MINUTE))).toISOString()
+      if ((delivery.retries ?? 0) >= TRIES) return void await this.finish(delivery, 'needs-review')
+      delivery.checkAt = new Date(Date.now() + this.host.ms(MINUTE)).toISOString()
       return this.save()
     }
+    delete delivery.retries
     if (answer.state === 'accepted') delivery.sent[index] = answer
     else delivery.sent.pop()
     delivery.state = 'pending'
@@ -158,7 +175,7 @@ export class Deliveries {
   private async finish(delivery: Delivery, state: State) {
     delivery.state = state
     delivery.remembered = false
-    if (state === 'accepted' || state === 'cancelled') delete delivery.checkAt
+    if (state === 'accepted' || state === 'cancelled' || state === 'needs-review') delete delivery.checkAt
     this.save()
     await this.settled(delivery)
     return delivery

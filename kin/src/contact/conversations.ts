@@ -1,3 +1,4 @@
+import { answerText } from '../model-output.js'
 /**
  * Her conversations on WeChat and Feishu, each one DSH session (a key per chat: `wechat:<chat>`, `feishu:<chat>`):
  * - what arrives is placed (whose chat, who is speaking), remembered with who said it, and, after the
@@ -75,6 +76,10 @@ export class Conversations {
     this.forwarded = host.load<Record<string, number>>('forwarded.json', {})
     // What was waiting for its quiet when she last stopped goes once her mind is up.
     void host.ready.then(() => { for (const key of Object.keys(this.inbox.bursts)) this.schedule(key, MENTION_MS) })
+  }
+
+  get pending() {
+    return this.sending.size > 0
   }
 
   get strangers() {
@@ -247,8 +252,9 @@ export class Conversations {
 
   queue(key: string, work: () => Promise<unknown>) {
     const next = (this.sending.get(key) ?? Promise.resolve()).then(work).catch((error: Error) => this.host.log(`contact: sending in ${key}: ${error.message}`))
-    this.sending.set(key, next)
-    return next
+    const done = next.finally(() => { if (this.sending.get(key) === done) this.sending.delete(key) })
+    this.sending.set(key, done)
+    return done
   }
 
   /**
@@ -337,5 +343,5 @@ function startedBy(session: Session, seq: number): string {
 }
 
 function textOf(content: readonly { type: string; text?: string }[]): string {
-  return content.flatMap((block) => (block.type === 'text' && block.text?.trim() ? [block.text.trim()] : [])).join('\n\n')
+  return content.flatMap((block) => (block.type === 'text' && block.text?.trim() ? [answerText(block.text).trim()] : [])).join('\n\n')
 }

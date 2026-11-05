@@ -2,7 +2,7 @@
  * Feishu, as legacy/feishu did it: messages pushed over the long connection, and a catch-up every 15 s that
  * lists each chat she knows from where the last complete one began (5 min overlap, never more than a day back),
  * so what a dropped connection missed still comes in, once. Attachments are saved to her data dir. Sends carry
- * an idempotency key Feishu keeps for an hour; within that hour an unknown send is checked by repeating it.
+ * an idempotency key Feishu keeps for an hour; delivery retries reuse that key.
  */
 import { mkdirSync, readFileSync } from 'node:fs'
 import { basename, extname, join } from 'node:path'
@@ -22,8 +22,6 @@ const MINUTE = 60_000
 const CATCH_UP_EVERY = 15_000
 const OVERLAP = 5 * MINUTE
 const LOOKBACK = 24 * 60 * MINUTE
-/** How long Feishu keeps a send's uuid, less a minute of safety. */
-const UUID_WINDOW = 59 * MINUTE
 const FILE_TYPES: Record<string, string> = { '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc', '.xls': 'xls', '.xlsx': 'xls', '.ppt': 'ppt', '.pptx': 'ppt', '.mp4': 'mp4' }
 
 interface FeishuState extends State {
@@ -88,9 +86,9 @@ export class Feishu implements Transport {
     return this.problem && this.current.state === 'connected' ? { ...this.current, reason: this.problem } : this.current
   }
 
-  async send(to: Address, part: Part, id: string): Promise<Sent> {
+  async send(to: Address, part: Part, id: string, retryUnknown = false): Promise<Sent> {
     const prior = this.store.value.sent[id]
-    if (prior && prior.state !== 'failed') return sent(prior)
+    if (prior && (prior.state === 'accepted' || (prior.state === 'unknown' && !retryUnknown))) return sent(prior)
     this.store.value.chats[to.chat] ??= { kind: to.kind, covered: Date.now() }
     let message: { msg_type: string; content: string }
     try {
@@ -117,12 +115,6 @@ export class Feishu implements Transport {
       if (data?.items?.some((item: { chat_id: string }) => item.chat_id === receipt.chat)) {
         return this.store.settle(id, { ...receipt, state: 'accepted', reason: undefined })
       }
-    } else if (Date.now() - receipt.at < UUID_WINDOW) {
-      // Within the hour the same request (same uuid) can only ever make one message: repeating it settles it.
-      const answer = await this.submit(receipt.request)
-      if (answer.state === 'accepted') return this.store.settle(id, { ...receipt, ...answer, reason: undefined })
-    } else {
-      return this.store.settle(id, { ...receipt, reason: '过了飞书去重的一小时，已经没法确认' })
     }
     return sent(receipt)
   }

@@ -132,9 +132,9 @@ export class WeChat implements Transport {
     })
   }
 
-  async send(to: Address, part: Part, id: string): Promise<Sent> {
+  async send(to: Address, part: Part, id: string, retryUnknown = false): Promise<Sent> {
     const prior = this.store.value.sent[id]
-    if (prior && prior.state !== 'failed') return sent(prior)
+    if (prior && (prior.state === 'accepted' || (prior.state === 'unknown' && !retryUnknown))) return sent(prior)
     const at = Date.now()
     const fail = (reason: string) => this.store.settle(id, { chat: to.chat, at, state: 'failed', reason })
     if ('file' in part && (part.kind === 'file' || part.kind === 'video') && !part.named) return fail('微信上只发主人点名要的文件')

@@ -6,6 +6,7 @@
  * an error, or no first chunk within a minute. Once a route answers it keeps the turn.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
+import { answerText, modelOutput } from './model-output.js'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   LlmAdapter, ReasoningEffortId, type GenerateOptions, type LlmFailure, type LlmResolvedModelInfo, type StreamChunk,
@@ -91,6 +92,13 @@ export class KinModel extends LlmAdapter {
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const lane = laneOf(options.model)
+    // Older sessions can already contain the relay envelope. Do not feed it back as spoken dialogue.
+    const messages = options.messages.map((message) => {
+      if (message.role !== 'assistant') return message
+      const content = message.content.map((block) => block.type === 'text' ? { ...block, text: answerText(block.text) } : block)
+      if (content.every((block, i) => block.type !== 'text' || block.text === (message.content[i] as { text: string }).text)) return message
+      return { ...message, content, source: { ...message.source, replayState: undefined } }
+    })
     const failed: LastCall['failed'] = []
     let failure: LlmFailure | undefined
     for (const route of this.routes(lane)) {
@@ -104,10 +112,10 @@ export class KinModel extends LlmAdapter {
       failure = undefined
       const effort = await this.effortOf(lane, route)
       try {
-        for await (const chunk of this.ctx.llm.stream({
-          ...options, provider: route.provider, model: route.model, signal: attempt.signal,
+        for await (const chunk of modelOutput(this.ctx.llm.stream({
+          ...options, messages, provider: route.provider, model: route.model, signal: attempt.signal,
           reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
-        })) {
+        }))) {
           if (!answering) {
             if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
               failure = chunk.reason.failure

@@ -1,4 +1,5 @@
 /** What one of her turns holds, read from DSH's session log. */
+import { answerText } from './model-output.js'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
@@ -8,8 +9,8 @@ export function spoken(message: UserMessage): boolean {
   return message.source.kind === 'user' || message.source.kind === 'kin-channel'
 }
 
-export function textOf(message: { content: readonly { type: string; text?: string }[] }): string {
-  return message.content.flatMap((block) => (block.type === 'text' && block.text ? [block.text] : [])).join('\n').trim()
+export function textOf(message: { role?: string; content: readonly { type: string; text?: string }[] }): string {
+  return message.content.flatMap((block) => (block.type === 'text' && block.text ? [message.role === 'assistant' ? answerText(block.text) : block.text] : [])).join('\n').trim()
 }
 
 /** The session's latest turn, oldest event first. */

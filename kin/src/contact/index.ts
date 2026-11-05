@@ -29,6 +29,8 @@ declare module '@deepseek-ai/cordis' {
 
 /** What the KIN preset's per-session half asks of her conversations. */
 export interface ContactService {
+  /** Output is queued or waiting for a platform receipt, even if the model has finished. */
+  readonly sending: boolean
   /** A turn began or ended in one of her sessions. */
   status(sessionId: string, running: boolean): void
   /** Something was written in one of her sessions. */
@@ -50,7 +52,7 @@ export interface ContactService {
 /** What the host itself tells the owner when something of hers did not go through (owner-notice.mjs). Never her words. */
 const NOTICES = {
   stopped: '刚才这条回复没能完成，原消息还在，不用重复发。',
-  unknown: '刚才那条的结果还没确认，先别重复发。',
+  unknown: '刚才有一条回复核对并重试了几次，仍未确认送达。你可以看一下有没有收到。',
   partial: '刚才只送达了一部分，已送达的不会重发。',
 }
 const HOUR = 3_600_000
@@ -122,8 +124,8 @@ export function contact(host: Host) {
       }
     }
     if (delivery.kind === 'reply' && delivery.recipient === OWNER && delivery.transport !== 'app') {
-      if (delivery.state === 'unknown') notice(delivery, 'unknown')
-      if (delivery.state === 'needs-review' && accepted.length) notice(delivery, 'partial')
+      if (delivery.state === 'needs-review') notice(delivery, accepted.length ? 'partial' : 'unknown')
+      if (delivery.state === 'cancelled') notice(delivery, 'stopped')
     }
     deliveries.mark(delivery.id, { remembered: true })
   }
@@ -170,6 +172,7 @@ export function contact(host: Host) {
   const find = (to: string) => everyone().find((entry) => entry.id === to || nameOf(entry) === to.trim())
 
   host.ctx.provide('kinContact', {
+    get sending() { return conversations.pending || deliveries.sending },
     status: (sessionId, running) => conversations.typing(sessionId, running),
     event(session, event) {
       const scope = host.ctx.get('kin')!.scopeOf(session.id)

@@ -92,7 +92,7 @@ export async function fakeFeishu() {
 
 /** iLink as far as KIN uses it: QR login, long poll, CDN with AES-128-ECB, uploads, sends, typing. */
 export async function fakeWeChat() {
-  const state = { scanned: false, queue: [], cdn: new Map(), sent: [], typing: [], cursor: 0 }
+  const state = { loseNextAnswer: false, scanned: false, queue: [], cdn: new Map(), sent: [], typing: [], cursor: 0 }
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://fake')
     const path = url.pathname
@@ -122,6 +122,7 @@ export async function fakeWeChat() {
     if (path === '/ilink/bot/getuploadurl') return json(response, { ret: 0, upload_param: 'up-' + asked.filekey })
     if (path === '/ilink/bot/sendmessage') {
       state.sent.push(asked.msg)
+      if (state.loseNextAnswer) return (state.loseNextAnswer = false, json(response, 'bad gateway', 502))
       // A 64-bit id, beyond what a JS number holds.
       return json(response, `{"ret":0,"message_id":${7234567890123456789n + BigInt(state.sent.length)}}`)
     }

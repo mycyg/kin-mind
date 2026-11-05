@@ -241,6 +241,8 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
   report.appSticker = await until(async () => (await events(ctx, app)).find((e) => e.source === 'kin-said' && e.media), 30_000)
 
   // Her other conversations, looked at from the owner's desktop chat and from 小明's: who said what there, and when.
+  // The tool returns the latest 12 lines; keep this assertion's source recent even on slower runners.
+  await say(ctx, app, '今天下班好累')
   await say(ctx, app, '看看小明那边在聊什么')
   arrive({ chat: 'wx-ming', sender: 'wx-ming', text: '你和小光聊了什么' })
   report.looks = await until(() => (chat.looks?.length >= 2 ? chat.looks : undefined), 60_000)

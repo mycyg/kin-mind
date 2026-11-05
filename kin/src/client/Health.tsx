@@ -14,7 +14,7 @@ interface View {
   resolved: { title: string; since: string; until: string }[]
   checked: { watch?: string; self?: string; daily?: string }
   days: { at: string; ok: boolean; problems: string[]; reviews: Record<string, number> }[]
-  now: { replying: boolean; rounds: { lane: string; name: string; since: string }[]; lastMinute: string | null }
+  now: { replying: boolean; delivering: boolean; rounds: { lane: string; name: string; since: string }[]; lastMinute: string | null }
 }
 
 const ROUTE = 'api/kin/health'
@@ -40,7 +40,7 @@ export function Health() {
   const [latest] = days
   const streak = days.findIndex((d) => d.ok)
   const misses = streak === -1 ? days.length : streak
-  const doing = [now.replying ? '回你的话' : '', ...now.rounds.map((round) => `${round.name}（${minutes(round.since)}）`)].filter(Boolean)
+  const doing = [now.replying ? '回你的话' : '', now.delivering ? '发送消息、等待回执' : '', ...now.rounds.map((round) => `${round.name}（${minutes(round.since)}）`)].filter(Boolean)
 
   return (
     <section className="kin-card kin-health" data-level={errors ? 'error' : problems.length ? 'warn' : 'fine'}>
