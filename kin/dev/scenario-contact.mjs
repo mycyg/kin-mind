@@ -69,7 +69,7 @@ class Chat extends LlmAdapter {
     if (!answered && said.includes('把报告发我')) return yield* call('kin_send_file', { path: this.report, asked: true })
     if (!answered && said.includes('发个表情')) return yield* call('kin_sticker', { meaning: '开心得转圈' })
     if (!answered && said.includes('用语音说')) return yield* call('kin_voice', { text: '晚安呀，早点睡', style: '轻声' })
-    return yield* words(answered ? '好，我跟他说啦' : '收到啦～')
+    return yield* words('💭 Private test reasoning.\n\n' + (answered ? '好，我跟他说啦' : '收到啦～'))
   }
 }
 

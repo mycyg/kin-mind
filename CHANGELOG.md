@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-07 — Relay thought-paragraph privacy fix
+
+- Decode the relay’s `💭 ` thought paragraph before streaming, delivery, memory ingestion, or assistant-history replay, alongside the existing brain/razor envelope.
+- Keep incomplete private paragraphs hidden and preserve ordinary inline emoji and tool blocks.
+- Add synthetic regressions for every stream split, one-character chunks, unfinished envelopes, and reused block indices.
+
 ## 2026-11-05 — Kin on DSH 0.2.2-rc.1
 
 - Move the active product to `core/` and the `kin/` DSH bundle; retire the prior standalone host/UI layout from the working tree (history remains in Git).

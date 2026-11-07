@@ -83,6 +83,8 @@ if (report.error) {
 
 const unknownPart = report.mingUnknown?.id + ':0'
 const checks = {
+  'relay thought paragraphs never reach WeChat or cross-conversation history': report.mingSends.some((s) => s.text === '收到啦～')
+    && !JSON.stringify([report.mingSends, report.groupMentioned.sent, report.looks]).includes('Private test reasoning'),
   '小明 twice within 20 s is one message to her, named': report.ming?.turns.length === 1 && report.ming.turns[0].text === '小明：在吗\n小明：我今天看到星星了',
   'her reply to 小明 went back on WeChat, typing while she wrote': report.ming !== null && report.typing.some((t) => t.on) && report.typing.at(-1)?.on === false,
   'plain group talk is heard, not answered': report.groupQuiet.turns.length === 0 && report.groupQuiet.sent === 0,
