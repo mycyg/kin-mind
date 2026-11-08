@@ -28,6 +28,8 @@ export interface Delivery {
   sent: Sent[]
   state: State
   at: string
+  /** When the platform first confirmed a part; settlement retries keep this timestamp. */
+  acceptedAt?: string
   /** Waits until then: quiet hours. */
   notBefore?: string
   /** An unknown outcome is asked about again then. */
@@ -40,6 +42,8 @@ export interface Delivery {
   reason?: string
   /** Settled with Core (a contact attempt) or in her memory (what she sent). */
   remembered?: boolean
+  /** Delivery succeeded or stopped, but recording its result still needs a retry. */
+  settlementError?: string
   /** Its first words, for her page. */
   excerpt?: string
 }
@@ -56,6 +60,7 @@ export const partId = (delivery: Delivery, index: number) => `${delivery.id}:${i
 export class Deliveries {
   private readonly all: Record<string, Delivery>
   private readonly busy = new Map<string, Promise<Delivery>>()
+  private readonly remembering = new Map<string, Promise<void>>()
 
   constructor(
     private readonly host: Host,
@@ -103,7 +108,7 @@ export class Deliveries {
     for (const delivery of Object.values(this.all)) {
       if (delivery.state === 'unknown' && delivery.checkAt! <= now) await this.check(delivery, () => may(delivery))
       else if (delivery.state === 'pending' && !this.busy.has(delivery.id)) await this.send(delivery.id, () => may(delivery))
-      else if (delivery.state !== 'pending' && !delivery.remembered) await this.settled(delivery)
+      else if (delivery.state !== 'pending' && !delivery.remembered) await this.remember(delivery)
     }
   }
 
@@ -129,6 +134,7 @@ export class Deliveries {
         return this.finish(delivery, delivery.sent.length ? 'needs-review' : 'cancelled')
       }
       delivery.sent.push(sent)
+      if (sent.state === 'accepted') delivery.acceptedAt ??= new Date().toISOString()
       delivery.tries = 0
       if (sent.state === 'unknown') {
         delivery.checks = 0
@@ -164,7 +170,10 @@ export class Deliveries {
       return this.save()
     }
     delete delivery.retries
-    if (answer.state === 'accepted') delivery.sent[index] = answer
+    if (answer.state === 'accepted') {
+      delivery.sent[index] = answer
+      delivery.acceptedAt ??= new Date().toISOString()
+    }
     else delivery.sent.pop()
     delivery.state = 'pending'
     delivery.remembered = false
@@ -177,8 +186,23 @@ export class Deliveries {
     delivery.remembered = false
     if (state === 'accepted' || state === 'cancelled' || state === 'needs-review') delete delivery.checkAt
     this.save()
-    await this.settled(delivery)
+    await this.remember(delivery)
     return delivery
+  }
+
+  /** A missing conversation must not block other deliveries or turn an accepted send into a retry. */
+  private remember(delivery: Delivery): Promise<void> {
+    const running = this.remembering.get(delivery.id)
+    if (running) return running
+    const run = Promise.resolve().then(() => this.settled(delivery)).then(() => {
+      if (delivery.settlementError && this.all[delivery.id]) this.mark(delivery.id, { settlementError: undefined })
+    }, (error: Error) => {
+      const reason = error.message || String(error)
+      if (delivery.settlementError !== reason) this.host.log(`contact: recording ${delivery.id}: ${reason}`)
+      this.mark(delivery.id, { settlementError: reason })
+    }).finally(() => this.remembering.delete(delivery.id))
+    this.remembering.set(delivery.id, run)
+    return run
   }
 
   private save() {

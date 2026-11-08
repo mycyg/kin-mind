@@ -18,7 +18,7 @@ import { Deliveries, type Delivery } from './deliveries.js'
 import { look } from './look.js'
 import { EMPTY, isGroup, nameOf, OWNER, revise, type People } from './people.js'
 import { Reaching } from './proactive.js'
-import { corePolicy, DEFAULT_RULES, quiet, quietEnds, reviseRules, type Activity, type Rules } from './rules.js'
+import { corePolicy, DEFAULT_RULES, quiet, quietEnds, reached, reviseRules, type Activity, type Rules } from './rules.js'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -31,6 +31,8 @@ declare module '@deepseek-ai/cordis' {
 export interface ContactService {
   /** Output is queued or waiting for a platform receipt, even if the model has finished. */
   readonly sending: boolean
+  /** Result-recording failures stay visible while other conversations continue normally. */
+  settlementFailures(): { id: string; reason: string }[]
   /** A turn began or ended in one of her sessions. */
   status(sessionId: string, running: boolean): void
   /** Something was written in one of her sessions. */
@@ -105,10 +107,13 @@ export function contact(host: Host) {
       })
     }
     if (told && delivery.kind !== 'notice') {
-      if (delivery.kind === 'reply' || delivery.kind === 'reminder') note(delivery.recipient, { answered: new Date().toISOString() })
+      if (delivery.kind === 'reply' || delivery.kind === 'reminder') {
+        const at = delivery.acceptedAt ?? delivery.at
+        if (at > (activity(delivery.recipient).answered ?? '')) note(delivery.recipient, { answered: at })
+      }
       else {
-        const reached = [...(activity(delivery.recipient).reached ?? []), new Date().toISOString()].slice(-24)
-        note(delivery.recipient, { reached })
+        const change = reached(activity(delivery.recipient), delivery.id, delivery.acceptedAt ?? delivery.at)
+        if (change) note(delivery.recipient, change)
         // Her words are hers in memory, and the conversation they went to knows she said them.
         await host.mind.call('runtime-event', {
           id: delivery.id, kind: 'delivery', at: delivery.at, text: words, state: 'accepted', message_id: ids[0], message_ids: ids,
@@ -173,6 +178,8 @@ export function contact(host: Host) {
 
   host.ctx.provide('kinContact', {
     get sending() { return conversations.pending || deliveries.sending },
+    settlementFailures: () => deliveries.list().flatMap((delivery) =>
+      delivery.settlementError ? [{ id: delivery.id, reason: delivery.settlementError }] : []),
     status: (sessionId, running) => conversations.typing(sessionId, running),
     event(session, event) {
       const scope = host.ctx.get('kin')!.scopeOf(session.id)

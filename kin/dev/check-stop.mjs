@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const output = root + '/kin/.stop-check'
-await build({ entryPoints: [root + '/kin/src/contact/conversations.ts', root + '/kin/src/contact/deliveries.ts'], outdir: output, bundle: true, platform: 'node', format: 'esm', packages: 'external' })
+await build({ entryPoints: [root + '/kin/src/contact/conversations.ts', root + '/kin/src/contact/deliveries.ts', root + '/kin/src/contact/rules.ts', root + '/kin/src/contact/proactive.ts'], outdir: output, bundle: true, platform: 'node', format: 'esm', packages: 'external' })
 try {
   const { Conversations } = await import(output + '/conversations.js')
   const stopped = []
@@ -96,6 +96,82 @@ try {
   assert.equal(attempts.filter(x => x.id === 'recover:0').length, 2)
   assert.equal(attempts.filter(x => x.id === 'recover:1').length, 1)
   console.log('PASS: unknown receipts retry the same part three times; confirmed parts do not repeat; recovery continues the remainder')
+  const { reached } = await import(output + '/rules.js')
+  const { Reaching } = await import(output + '/proactive.js')
+  const receiptAt = new Date(Date.now() - 3_600_000).toISOString()
+  const recorded = {}, failures = []
+  let repaired = false, sentCount = 0, candidateChecks = 0
+  const recoveryHost = {
+    ...host, log: text => failures.push(text), conversations: () => ({}),
+    mind: { call: async action => { if (action === 'candidate') { candidateChecks++; return { eligible: false, reason: 'nothing-ready' } } return {} } },
+    load: (name, empty) => structuredClone(recorded[name] ?? empty),
+    save: (name, value) => { recorded[name] = structuredClone(value) },
+  }
+  const activity = () => recorded['activity.json'] ?? {}
+  let recovery
+  const restored = () => new Deliveries(recoveryHost, () => ({ send: async () => { sentCount++; return { state: 'accepted', platformId: 'safe-receipt' } } }), async delivery => {
+    const change = reached(activity(), delivery.id, delivery.acceptedAt ?? delivery.at)
+    if (change) recoveryHost.save('activity.json', { ...activity(), ...change })
+    if (delivery.id === 'broken-session' && !repaired) throw new Error('conversation cannot be opened')
+    recovery.mark(delivery.id, { remembered: true })
+  })
+  recovery = restored()
+  for (const id of ['broken-session', 'other-person']) {
+    recovery.open({ id, kind: 'contact', key: id, recipient: 'person:person_a', transport: 'test', to: {}, parts: [{ text: 'synthetic message' }] })
+    recovery.mark(id, { state: 'accepted', at: receiptAt, acceptedAt: receiptAt, sent: [{ state: 'accepted', platformId: id }], remembered: false })
+  }
+  await recovery.tick(() => true)
+  assert.equal(recovery.get('broken-session').state, 'accepted')
+  assert.equal(recovery.get('broken-session').remembered, false)
+  assert.equal(recovery.get('broken-session').settlementError, 'conversation cannot be opened')
+  assert.equal(recovery.get('other-person').remembered, true, 'one failed settlement must not block the next person')
+  assert.equal(activity().reached.length, 2, 'distinct delivery ids count separately even at the same timestamp')
+  recovery = restored()
+  await recovery.tick(() => true)
+  assert.equal(activity().reached.length, 2, 'a restarted result retry cannot count the same contact again')
+  assert.deepEqual(activity().reached, [receiptAt, receiptAt], 'old receipts must not look like contacts made now')
+  assert.equal(failures.length, 1, 'an unchanged error remains visible without logging every minute')
+  const reaching = new Reaching(recoveryHost,
+    () => ({ people: [{ id: 'person:person_a', proactive: true }], groups: [] }),
+    () => ({ enabled: true, quietStart: 0, quietEnd: 0, minGapMinutes: 0, maxPerDay: 3, waitForReply: false, timeZone: 'UTC' }),
+    () => ({ heard: receiptAt }), () => {}, recovery, {})
+  assert.equal((await reaching.round()).reason, 'nothing-ready')
+  assert.equal(candidateChecks, 1, 'a failed receipt writeback must not skip the owner contact decision')
+  repaired = true
+  await recovery.tick(() => true)
+  assert.equal(recovery.get('broken-session').remembered, true)
+  assert.equal(recovery.get('broken-session').settlementError, undefined)
+  assert.equal(activity().reached.length, 2)
+  assert.equal(sentCount, 0, 'accepted platform messages must never be resent while repairing their records')
+  let liveSends = 0
+  const liveFailure = new Deliveries({ ...host, load: (_name, empty) => empty }, () => ({
+    send: async () => { liveSends++; return { state: 'accepted', platformId: 'live-once' } },
+  }), async () => { throw new Error('recording unavailable') })
+  liveFailure.open({ id: 'live-failure', kind: 'contact', key: 'owner-chat', recipient: 'person:person_a', transport: 'test', to: {}, parts: [{ text: 'synthetic send' }] })
+  const acceptedDespiteRecording = await liveFailure.send('live-failure')
+  assert.equal(acceptedDespiteRecording.state, 'accepted')
+  assert.equal(acceptedDespiteRecording.settlementError, 'recording unavailable')
+  const acceptedAt = acceptedDespiteRecording.acceptedAt
+  await liveFailure.tick(() => true)
+  assert.equal(liveFailure.get('live-failure').acceptedAt, acceptedAt)
+  assert.equal(liveSends, 1)
+  let releaseRecording, beganRecording
+  const startedRecording = new Promise(resolve => { beganRecording = resolve })
+  const recordingDone = new Promise(resolve => { releaseRecording = resolve })
+  let recordings = 0
+  const concurrent = new Deliveries(recoveryHost, () => ({ send: async () => ({ state: 'accepted', platformId: 'once' }) }), async delivery => {
+    recordings++; beganRecording(); await recordingDone
+    concurrent.mark(delivery.id, { remembered: true })
+  })
+  concurrent.open({ id: 'concurrent', kind: 'contact', key: 'owner-chat', recipient: 'person:person_a', transport: 'test', to: {}, parts: [{ text: 'hello' }] })
+  const outgoing = concurrent.send('concurrent')
+  await startedRecording
+  const minute = concurrent.tick(() => true)
+  releaseRecording()
+  await Promise.all([outgoing, minute])
+  assert.equal(recordings, 1, 'a minute during receipt recording must join the in-flight settlement')
+  assert.ok(concurrent.get('concurrent').acceptedAt)
+  console.log('PASS: failed recording is isolated, retries count each delivery once across restart, owner decisions continue, and accepted messages never resend')
   let finishArrival, flushed = 0
   conversations.arrivals = new Promise(resolve => { finishArrival = resolve })
   conversations.flush = async () => { flushed++ }

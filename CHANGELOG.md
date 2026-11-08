@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-08 — Isolate contact receipt recovery
+
+- Keep each delivery's result-recording failure separate, so one unavailable conversation does not block other proactive contacts.
+- Count confirmed contacts once by delivery id and retain their original receipt time across retries and restarts; never resend accepted messages to repair their records.
+- Expose pending result-recording errors in health checks and retain the actual session recovery error message.
+- Defer background receipt notices until a native system head exists, preventing late-system-head logs that DSH cannot reopen.
+- Retry persistence without appending another receipt after a failed flush, including retries beyond the recent-event window.
+- Add synthetic regressions for failure isolation, restart-safe counting, concurrent settlement, accepted-send preservation, and strict session restoration.
+- Verification: 1385 Core tests (1 skipped), 10 Node checks, 108 integration checks, typechecking and all three targeted regression scripts passed.
+
 ## 2026-11-07 — Relay thought-paragraph privacy fix
 
 - Decode the relay’s `💭 ` thought paragraph before streaming, delivery, memory ingestion, or assistant-history replay, alongside the existing brain/razor envelope.

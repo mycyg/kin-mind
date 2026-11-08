@@ -65,6 +65,12 @@ export async function watch(host: Host): Promise<Finding[]> {
     if (due?.state === 'paused') found.push(paused(due.reason, config.dataDir))
   }
   found.push(...transports(ctx.get('kinTransports')))
+  const unsettled = ctx.get('kinContact')?.settlementFailures() ?? []
+  if (unsettled.length) found.push({
+    key: 'delivery-settlement', level: 'warn', title: `${unsettled.length} 条投递结果尚未完成记账`,
+    detail: unsettled.map(({ id, reason }) => `${id}: ${reason}`).join('；'),
+    todo: '会继续记账，不会重发已确认送出的消息，也不挡住其他联系；看 DSH 日志里的会话错误',
+  })
   return found
 }
 

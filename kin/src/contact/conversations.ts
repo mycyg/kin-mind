@@ -20,6 +20,7 @@ import type { Address, Inbound, Part, Transport } from '../channels/transport.js
 import type { Conversation, Host } from '../index.js'
 import { PART_WORDS, type Deliveries } from './deliveries.js'
 import { isGroup, nameOf, OWNER, placeOf, type People } from './people.js'
+import { assertReceiptSurfaceReady, ReceiptSurfaceNotReadyError } from './session-head.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -274,23 +275,33 @@ export class Conversations {
   async say(sessionId: string, id: string, text: string, note: string, media?: { kind: 'image' | 'voice'; file: string }): Promise<string> {
     const agent = await this.agentOf(sessionId)
     const session = agent.session
-    for (let seq = Number(session.seq) - 1; seq >= Math.max(0, Number(session.seq) - 200); seq--) {
+    for (let seq = Number(session.seq) - 1; seq >= 0; seq--) {
       const event = session.eventAt(SessionSeq(seq))
-      if (event?.type === 'user/message' && event.data.source.kind === 'kin-said' && event.data.source.id === id) return String(seq)
+      if (event?.type === 'user/message' && event.data.source.kind === 'kin-said' && event.data.source.id === id) {
+        await this.host.ctx.get('sessions')?.flush(session)
+        return String(seq)
+      }
     }
     const message = createUserMessage({
       content: [{ type: 'text', text: `（${note}）\n${text}` }], source: { kind: 'kin-said', id, text, ...(media ? { media } : {}) },
     })
     for (let tries = 0; ; tries++) {
       await agent.whenIdle()
+      let seq: string
       try {
-        const event = await agent.runMaintenance(async () => session.append('user/message', message, { surfaceOp: 'append' }))
-        await this.host.ctx.get('sessions')?.flush(session)
-        return String(event.seq)
+        const event = await agent.runMaintenance(async () => {
+          assertReceiptSurfaceReady(session)
+          return session.append('user/message', message, { surfaceOp: 'append' })
+        })
+        seq = String(event.seq)
       } catch (error) {
         // A turn began between the idle and the append: tell it after that turn.
-        if (tries >= 3) throw error
+        if (error instanceof ReceiptSurfaceNotReadyError || tries >= 3) throw error
+        continue
       }
+      // Once appended, a failed disk flush must retry persistence, never append the same notice again.
+      await this.host.ctx.get('sessions')?.flush(session)
+      return seq
     }
   }
 
@@ -303,7 +314,12 @@ export class Conversations {
     send: async (_to: Address, part: Part, id: string) => {
       const { sessionId } = await this.host.conversation('app', { channel: 'app', title: '和 KIN 的聊天' })
       const text = 'text' in part ? part.text : part.file
-      return { state: 'accepted', platformId: await this.say(sessionId, id, text, '你主动发给主人的消息') }
+      try {
+        return { state: 'accepted', platformId: await this.say(sessionId, id, text, '你主动发给主人的消息') }
+      } catch (error) {
+        if (error instanceof ReceiptSurfaceNotReadyError) return { state: 'failed', reason: error.message }
+        throw error
+      }
     },
   }
 
@@ -314,7 +330,7 @@ export class Conversations {
 
   private async agentOf(sessionId: string) {
     const resolved = await this.host.ctx.get('sessionController')!.resolveAgent(sessionId as never)
-    if ('error' in resolved) throw new Error('her session is not open: ' + JSON.stringify(resolved.error))
+    if ('error' in resolved) throw new Error('her session is not open: ' + (resolved.error.message || JSON.stringify(resolved.error)))
     return resolved.agent
   }
 

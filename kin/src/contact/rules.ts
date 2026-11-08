@@ -32,8 +32,19 @@ export interface Activity {
   answered?: string
   /** When she reached out on her own, most recent last (a day's worth is enough). */
   reached?: string[]
+  /** Delivery ids counted above, saved together so retrying a result never counts it again. */
+  reachedDeliveries?: Record<string, string>
   /** Technical failures in a row reaching them, and the latest. */
   failures?: { count: number; at: string }
+}
+
+/** Count a confirmed contact once, at its original receipt time, even after a restart or a later failure. */
+export function reached(activity: Activity, id: string, at: string): Partial<Activity> | undefined {
+  if (activity.reachedDeliveries?.[id]) return
+  return {
+    reached: [...(activity.reached ?? []), at].sort().slice(-24),
+    reachedDeliveries: { ...activity.reachedDeliveries, [id]: at },
+  }
 }
 
 /** Why she may not reach out now, or nothing when she may. */

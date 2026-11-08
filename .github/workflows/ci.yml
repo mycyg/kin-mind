@@ -28,7 +28,7 @@ jobs:
       - run: node --test core/tests/business/*.test.mjs
       - run: npm ci && npm run typecheck && npm run build
         working-directory: kin
-      - run: npm run e2e:all && node dev/check-stop.mjs && node dev/check-runtime.mjs
+      - run: npm run e2e:all && node dev/check-stop.mjs && node dev/check-runtime.mjs && node dev/check-session-head.mjs
         working-directory: kin
       - uses: actions/upload-artifact@v4
         if: always()
