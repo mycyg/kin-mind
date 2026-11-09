@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-09 — Complete per-person review targets
+
+- Give per-person reviews the same validated recipient routes and agendas as the main heartbeat, while retaining the original person and conversation.
+- Allow a friend-origin review to create a wish or create/update a plan for another bound recipient; continue rejecting unbound targets.
+- Keep one shared memory, original queue ownership, owner-only intimacy context and existing delivery controls unchanged.
+- Add red/green real-host regressions for both review entry points, cross-recipient wishes and plans, refusal boundaries and follow-up ownership.
+- Verification: 1411 Core tests (1 skipped), 10 Node checks, 113 integration checks across nine suites, typechecking and all three targeted regression scripts passed.
+
 ## 2026-11-09 — Preserve judgments and complete review evidence
 
 - Let a concern reinterpret its existing valid evidence without requiring a new source; keep new-outcome and owner-participation checks, true no-op detection, and freely changing subjective concerns.

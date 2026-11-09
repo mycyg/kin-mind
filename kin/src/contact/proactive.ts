@@ -185,7 +185,7 @@ export class Reaching {
     return { state: sent.state === 'accepted' ? 'complete' : sent.state }
   }
 
-  /** The heartbeat of someone other than the owner: what they said is taken in by a review in their own view, one a minute. */
+  /** Review one other person’s pending evidence in its origin, with the same bound agendas as the main heartbeat. */
   private async othersReview() {
     for (const person of this.directory().people) {
       const key = this.activity(person.id).via
@@ -193,7 +193,7 @@ export class Reaching {
       const scope = { recipient_person_id: person.id, conversation_key: key }
       const due = await this.host.mind.call('review-due', scope)
       if (due.action !== true) continue
-      this.status['review:' + person.id] = { ...(await this.host.mind.run<Answer>('review', scope)), at: new Date().toISOString() }
+      this.status['review:' + person.id] = { ...(await this.host.mind.run<Answer>('review', { ...scope, unified_targets: await this.reviewTargets() })), at: new Date().toISOString() }
       return
     }
   }
