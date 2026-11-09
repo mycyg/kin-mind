@@ -11,7 +11,7 @@ import { SessionSeq } from '@deepseek-ai/dsh-session'
 export const name = 'kin-e2e-contact'
 export const inject = ['kin', 'llm', 'sessionController', 'sessions']
 
-/** WeChat as a list: what she sent (one entry per part id), typing, and the checks of unknown outcomes. */
+/** Transport send attempts, typing and receipt checks. Attempts are not deduplicated: this scenario must not resend a confirmed part. */
 class FakeWechat {
   id = 'wechat'
   sent = []
@@ -192,9 +192,11 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
 
   // Once the conversations have been quiet a while, her reviews (the owner's, and 小明's in his own view) leave her
   // wanting to reach out: to the owner at the desk, to 小明 on WeChat, where the first part's outcome is unknown.
-  report.ownerContact = await until(async () => (await events(ctx, app)).find((e) => e.source === 'kin-said' && e.text.includes('想你啦')), 480_000)
+  // Observe the uncertain friend delivery first. The shared review may reach the friend before the owner;
+  // waiting for the owner's independent draft here could cross a retry deadline on a busy runner.
   report.mingUnknown = await until(() => deliveries().find((d) => d.kind === 'contact' && d.recipient !== 'person:person_a' && d.state === 'unknown'), 240_000)
   wechat.known = true
+  report.ownerContact = await until(async () => (await events(ctx, app)).find((e) => e.source === 'kin-said' && e.text.includes('想你啦')), 480_000)
   report.drafts = chat.drafts.map((d) => ({ who: /对方是(\S+?)。/.exec(d.user)?.[1], intimate: d.user.includes('色色值') }))
 
   // In the owner's view her intimate side shows; in 小明's it does not.
@@ -204,7 +206,8 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
   report.ownerView = (await view('person:person_a')).includes('flirtation')
   report.mingView = (await view(report.ming?.conversation.recipient)).includes('flirtation')
 
-  // The unknown part is asked about by its own id (five minutes on, then doubling), then the rest of that message goes.
+  // The unknown part is asked about by its own id after a minute, then the rest of that message goes.
+  // Unknown-check retries are covered separately in check-stop.mjs; here the first check can confirm it.
   report.reconciled = await until(() => {
     const delivery = deliveries().find((d) => d.id === report.mingUnknown?.id)
     return delivery?.state === 'accepted' ? delivery : undefined

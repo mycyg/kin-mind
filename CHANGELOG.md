@@ -6,6 +6,7 @@
 - Keep every source edge of a recalled aggregate through assessment and revalidation, while continuing to reject unseen or stale evidence.
 - Repair only invalid structured fields and retain valid judgment text, values and actions. Keep technical follow-up reasons in diagnostics rather than the public thought or dimension reasons.
 - Pass bound people and group agendas through the main heartbeat's supported host entry point without changing other-person review scope.
+- Observe an uncertain delivery before waiting for an unrelated contact in the integration scenario, so a slow runner does not turn the receipt-confirmation case into a retry case. Keep the strict single-send assertion and separate bounded-retry coverage.
 - Explain missing-evidence and exhausted-retry digest failures accurately; count uncharged foreground-priority deferrals as waiting rather than failed assessments.
 - Add synthetic boundary, two-round isolation, real-host routing and audited reason-only recovery regressions. Recovery never rewrites historical events or restores outdated intentions.
 - Verification: 1411 Core tests (1 skipped), 10 Node checks, 113 integration checks across nine suites, typechecking and all three targeted regression scripts passed.

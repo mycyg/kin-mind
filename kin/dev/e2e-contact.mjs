@@ -1,7 +1,7 @@
 // Offline check of her conversations and reaching out: a real headless DSH with dsh-kin, her real mind on a fresh
 // synthetic store, scripted model lanes, and dev/scenario-contact.mjs with a fake WeChat. The owner (小光), a friend
 // (小明) and a family group. A few minutes at the dev pace; at her real pace (KIN_PACE=1) about a quarter of an hour:
-// her reviews wait three minutes after a conversation, and an unknown send is first asked about five minutes on.
+// her reviews wait three minutes after a conversation, and an unknown send is first asked about one minute on.
 // Usage: node dev/e2e-contact.mjs (after `npm run build`).
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
