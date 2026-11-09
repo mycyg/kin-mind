@@ -59,6 +59,26 @@ export class Reaching {
     return conversation?.address && { key: key!, channel: conversation.channel, address: conversation.address }
   }
 
+  /** Only known people with a matching, still-bound conversation can receive cross-person wishes. */
+  async reviewTargets(): Promise<Record<string, unknown>> {
+    const { people, groups } = this.directory()
+    const routes = Object.fromEntries([...people, ...groups].flatMap((target) => {
+      const place = this.placeOf(target.id)
+      if (!place) return []
+      if (place.key === 'app') {
+        if (target.id !== OWNER) return []
+      } else {
+        const conversation = this.host.conversations()[place.key]
+        const bindings = isGroup(target.id) ? (target as Group).chats : (target as Person).accounts
+        if (conversation?.recipient !== target.id || !bindings[place.channel]
+          || (isGroup(target.id) && bindings[place.channel] !== place.address.chat)) return []
+      }
+      return [[target.id, { person_id: target.id, conversation_key: place.key, channel: place.channel }]]
+    }))
+    // Companion agenda expansion uses Core's one-shot host entry, not its resident action set.
+    return this.host.mind.run('companion-targets', { routes })
+  }
+
   /** Whether one of her own messages may go out now; a reply may always. */
   may(delivery: Delivery): boolean {
     const rules = this.rules()

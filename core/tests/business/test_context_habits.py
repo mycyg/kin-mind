@@ -494,7 +494,7 @@ def test_a_fork_that_read_the_habits_may_cite_their_message_only_as_they_were_se
     ids, receipt = fork_read()
     assert [entry for entry in ids if entry["id"] == record] == [{"id": record, "revision": revision}]
     for cited in (record, directions):
-        assert set(jobs._tool_fetched(citing(cited), receipt, {}, started)) == {record}, cited
+        assert {r["record_id"] for r in jobs._tool_fetched(citing(cited), receipt, {}, started).values()} == {record}, cited
 
     mind.engine.revise(record, RevisionInput(expected_revision=revision, command_id="correct-directions", action="correct",
                                              content="以后多去看看天文台的夜观", reason="她改了一下说法"))
@@ -506,7 +506,7 @@ def test_a_fork_that_read_the_habits_may_cite_their_message_only_as_they_were_se
         assert jobs._tool_fetched(citing(cited), receipt, {}, started) == {}, cited
     bare = [{**entry, "revision": None} if entry["id"] == record else entry for entry in ids]
     bare = {"native_receipt": {"channel": "fork", "tool_calls": [{"name": f"memorypalace.{tool}", "ok": True, "ids": bare}]}}
-    assert set(jobs._tool_fetched(citing(record), bare, {}, started)) == {record}
+    assert {r["record_id"] for r in jobs._tool_fetched(citing(record), bare, {}, started).values()} == {record}
 
 
 def test_an_update_of_the_habits_expects_the_revision_the_state_read_shows(system):

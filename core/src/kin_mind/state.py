@@ -1245,7 +1245,7 @@ class Mind(Continuity):
             lambda conn, state, eid: self._apply_event(conn, state, request, eid),
         )
 
-    def _apply_event(self, conn, state, request, event_id, continuity_sources=None):
+    def _apply_event(self, conn, state, request, event_id, continuity_sources=None, *, publish_reason=True):
         refs = self._evidence(conn, request.evidence_ids)
         # A release that adds dimensions migrates at start-up (extend_dimensions); an event committed
         # before that, on a state without them, adds them here rather than refusing their scores.
@@ -1271,7 +1271,7 @@ class Mind(Continuity):
                 "at": self.clock(),
                 "basis": "subjective" if request.subjective else "event_inferred",
                 "evidence": refs,
-                "reason": request.reason,
+                "reason": request.reason if publish_reason else "",
                 "event_id": event_id,
                 "agent_version": request.agent_version,
             }
@@ -1299,7 +1299,7 @@ class Mind(Continuity):
         # 余韵: a change this large against what was projected a moment ago is felt for a while after.
         note_echo(state, previous_values, self.clock())
         state.pop("last_evidence_key", None)
-        self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources)
+        self._apply_continuity(conn, state, request, event_id, refs, previous_values, continuity_sources, publish_reason=publish_reason)
         self._retarget(conn, state, self.clock())
 
     def _desire(self, conn, state, identifier):

@@ -664,7 +664,14 @@ class EventLifecycle:
             days = max(0, (timestamp(self.mind.clock()) - timestamp(started)).total_seconds() / 86400) if started else 0
             observed = observation_days(conn, self.scope.key(), started, self.mind.clock())
             backfill = conn.execute("SELECT cursor,state,processed,updated_at FROM mind_lifecycle_backfill WHERE scope=?", (self.scope.key(),)).fetchone()
+            failures = {"missing_evidence": 0, "retryable": 0, "exhausted": 0}
+            for row in conn.execute("SELECT data FROM mind_event_digests WHERE scope=? AND state='failed'", (self.scope.key(),)):
+                data = json.loads(row[0])
+                category = ("missing_evidence" if data.get("last_error") == "Event has no currently valid evidence"
+                            else "exhausted" if data.get("failed_retries", 0) >= DIGEST_RETRY_LIMIT else "retryable")
+                failures[category] += 1
             return {"digests": dict(conn.execute("SELECT state,COUNT(*) FROM mind_event_digests WHERE scope=? GROUP BY state", (self.scope.key(),))),
+                    "digest_failures": failures,
                     "temperature": dict(conn.execute("SELECT tier,COUNT(*) FROM mind_memory_temperature WHERE scope=? GROUP BY tier", (self.scope.key(),))),
                     "shadow_days": round(days, 3), "observed_days": observed,
                     "cooling_eligible": days >= 7 and observed >= 7,

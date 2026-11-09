@@ -117,6 +117,7 @@ export function HealthNote() {
 function reviewsOf(reviews: Record<string, number>): string {
   const done = (reviews.committed ?? 0) + (reviews.reused ?? 0) + (reviews.revalidated ?? 0)
   const missed = (reviews.failed ?? 0) + (reviews.quarantined ?? 0) + (reviews.abandoned ?? 0)
-  if (!done && !missed) return '过去一天没有要想的事'
-  return `过去一天想完 ${done} 件事${missed ? `，${missed} 次没想成` : ''}`
+  const waiting = reviews.waiting ?? 0
+  if (!done && !missed) return waiting ? `过去一天有 ${waiting} 次评估在等聊天结束` : '过去一天没有要想的事'
+  return `过去一天想完 ${done} 件事${missed ? `，${missed} 次没想成` : ''}${waiting ? `，${waiting} 次等待` : ''}`
 }

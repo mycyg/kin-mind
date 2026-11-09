@@ -163,7 +163,8 @@ export function apply(ctx: Context, config: Config) {
   const bridge = startBridge(ctx, log)
   ctx.effect(() => () => bridge.close(), 'kin model bridge')
   const replying = new Set<string>()
-  const heartbeat = new Heartbeat(mind, () => replying.size > 0, log, config.pace)
+  const heartbeat = new Heartbeat(mind, () => replying.size > 0, log, config.pace,
+    async () => ctx.get('kinContact')?.reviewTargets() ?? {})
   ctx.effect(() => () => heartbeat.close(), 'kin heartbeat')
 
   // Who she knows goes with her persona, so each of her models -- her replies, her reviews -- reads the ids

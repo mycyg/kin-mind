@@ -527,16 +527,32 @@ class Continuity:
         cid = (("concern_" + digest([self.scope.key(), change.key])[:32])
                if change.action == "create" else change.concern_id)
         current = concerns.get(cid)
-        subjective = subjective_concern(change, current)
+        if change.action != "create" and not current:
+            raise Missing("Concern belongs to another scope or is missing")
+        subjective = subjective_concern(change, current) and (
+            not current or subjective_concern(None, current))
+        fields = ("content", "topic", "kind", "target", "intensity", "basis", "confidence")
+        changed = {name for name in fields if getattr(change, name) is not None
+                   and (not current or getattr(change, name) != current.get(name))}
+        # Reconsidering attention does not manufacture another external observation. Keep the
+        # existing provenance when only Kin's intensity, timing or reason changes.
+        attention_only = (current and change.action in {"update", "ease", "archive"}
+                          and not changed - {"intensity"} and not change.owner_request)
+        inherited = current.get("evidence", []) if attention_only and not subjective and not change.evidence_ids else []
+        if inherited:
+            # Stored provenance may omit authority and metadata. Validate its original revision
+            # before rebuilding the live fields needed by the participation checks below.
+            if not self._fresh(conn, inherited):
+                raise Conflict("Continuity proposal requires current source evidence")
+            inherited = [self._reference(conn, ref["source_id"], ref["record_id"]) for ref in inherited]
         refs = list(
             {
                 evidence_key(r): r
                 for r in (self._subjective_refs(conn, change.evidence_ids, allowed) if subjective
-                          else self._proposal_refs(conn, change.evidence_ids, fallback or [], allowed))
+                          else self._proposal_refs(conn, change.evidence_ids,
+                                                   inherited or fallback or [], allowed))
             }.values()
         )
-        if change.action != "create" and not current:
-            raise Missing("Concern belongs to another scope or is missing")
         new_refs = [
             r
             for r in refs
@@ -551,18 +567,28 @@ class Continuity:
             if enabled(conn, self.scope.key(), "timed_concerns"):
                 from .plans import local_time
                 timing = {name: local_time(getattr(change, name)) for name in TIMED_FIELDS if getattr(change, name, None)}
-        # When to bring a concern up again is Kin's own judgment too, like easing it: an update that
-        # only moves its window needs no new source (`timed_concerns`).
         retimed = change.action == "update" and bool(current) and any(current.get(k) != v for k, v in timing.items())
         settles = {"ease": "easing", "archive": "archived"}.get(change.action)
-        if current and not subjective and not new_refs and not retimed and not change.owner_request and (not settles or current["status"] == settles):
-            # Easing or archiving is Kin's own judgment about a concern and needs no new source
-            # (K3-18); it is a replay only when the concern already stands that way.
-            return {
-                "concern_id": cid,
-                "concern_revision": current["revision"],
-                "replayed": True,
-            }
+        # Reusing a current source can correct its interpretation; it is not an outcome or an
+        # owner response. Check those transitions before considering idempotency.
+        if current and not subjective and not new_refs:
+            if change.action == "resolve":
+                raise Conflict("Resolution requires a new outcome or correction source")
+            if change.action == "reopen":
+                return {"concern_id": cid, "concern_revision": current["revision"], "replayed": True}
+            if change.basis == "internal_thought" and current.get("basis") != "internal_thought":
+                raise Conflict("A source-backed concern cannot be relabelled as an internal thought")
+            if change.kind == "shared_plan" and current.get("kind") != "shared_plan":
+                raise Conflict("A shared plan requires a new source")
+        reason_changed = ("reason" in change.model_fields_set and change.reason != (current or {}).get("reason", ""))
+        # Repeating a settled transition, or a disabled timing-only request, remains a no-op.
+        ignored_reason = ((settles and current and current["status"] == settles)
+                          or (any(getattr(change, name, None) for name in TIMED_FIELDS) and not timing))
+        status_changed = bool(current) and (settles is not None and current["status"] != settles)
+        if (current and not new_refs and not changed and not retimed and not change.owner_request
+                and not status_changed and (not reason_changed or ignored_reason)
+                and change.action in {"create", "update", "ease", "archive"}):
+            return {"concern_id": cid, "concern_revision": current["revision"], "replayed": True}
         if (
             current
             and current["status"] in {"resolved", "archived"}
@@ -648,7 +674,7 @@ class Continuity:
             assessed_at=at,
             updated_at=at,
             evidence=refs,
-            reason=change.reason,
+            reason=change.reason if "reason" in change.model_fields_set else entry.get("reason", ""),
             event_id=event_id,
             agent_version=version,
             config_version=state["continuity"]["version"],
@@ -697,7 +723,7 @@ class Continuity:
         return True
 
     def _apply_continuity(
-        self, conn, state, request, event_id, refs, previous, allowed=None
+        self, conn, state, request, event_id, refs, previous, allowed=None, *, publish_reason=True
     ):
         flags = self._continuity_flags(conn, state)
         allowed = allowed or (
@@ -739,7 +765,7 @@ class Continuity:
                 state["dimensions"][key]["interpretation_unverified"] = low_confidence(
                     summary["understanding"]
                 )
-        if flags["interpretation"]:
+        if flags["interpretation"] and publish_reason:
             state["last_assessment"] = summary
         if flags["rhythm"] and request.rhythm:
             proposal = request.rhythm

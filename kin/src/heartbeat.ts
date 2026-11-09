@@ -75,6 +75,8 @@ export class Heartbeat {
     private readonly log: (message: string) => void,
     /** Dev pace (index.ts `pace`): the minute passes this many times as long. */
     private readonly pace: number,
+    /** Bound destinations and shared-memory agendas for the main review only. */
+    private readonly reviewTargets: () => Promise<Record<string, unknown>> = async () => ({}),
   ) {}
 
   /** After start-up recovery: what a previous run left half done is settled before anything new runs. */
@@ -174,7 +176,7 @@ export class Heartbeat {
         const due = await this.mind.call<Due>('review-due', {})
         if (due.action !== true) return this.quiet('review', due)
         this.note('review', { state: 'running' })
-        const answer = await this.mind.run<Answer>('review')
+        const answer = await this.mind.run<Answer>('review', { unified_targets: await this.reviewTargets() })
         this.note('review', answer)
         if (answer.state !== 'complete') break
         if (!answer.result?.already_integrated) {

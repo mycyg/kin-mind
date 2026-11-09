@@ -85,9 +85,16 @@ export async function selfCheck({ mind }: Host): Promise<Finding[]> {
   if (expired) found.push({ key: 'executions', level: 'warn', title: `${expired} 个计划步骤过了期限还标着在跑`, todo: RESTART_TODO + '，启动时会收拾好' })
   try {
     // A process of its own, as her reviews, diary and dreams run: if this one cannot start, neither can they.
-    const lifecycle = await mind.run<{ digests: Record<string, number> }>('lifecycle-status')
+    const lifecycle = await mind.run<{ digests: Record<string, number>; digest_failures?: Record<string, number> }>('lifecycle-status')
     const failed = lifecycle.digests.failed ?? 0
-    if (failed) found.push({ key: 'digests', level: 'warn', title: `${failed} 段经历的摘要没写成`, todo: '会自己重试；一直不减就看做事线能不能接上模型' })
+    const missing = lifecycle.digest_failures?.missing_evidence ?? 0
+    const exhausted = lifecycle.digest_failures?.exhausted ?? 0
+    if (missing) found.push({ key: 'digests-evidence', level: 'warn', title: `${missing} 段经历缺少有效依据，摘要未生成`,
+      todo: '需要检查这些经历的原始记录是否仍然有效；反复重试或换模型不能补回依据' })
+    if (exhausted) found.push({ key: 'digests-exhausted', level: 'warn', title: `${exhausted} 段经历的摘要已用完自动重试`,
+      todo: '查看摘要任务的具体错误，排除原因后再重试' })
+    if (failed > missing + exhausted) found.push({ key: 'digests', level: 'warn', title: `${failed - missing - exhausted} 段经历的摘要没写成`,
+      todo: '尚在自动重试范围内；持续失败时查看摘要任务的具体错误和模型路线' })
   } catch (error) {
     found.push({
       key: 'mind-run', level: 'error', title: '她的后台进程起不来', detail: (error as Error).message,
@@ -114,15 +121,18 @@ export async function daily({ mind, config }: Host): Promise<{ found: Finding[];
     found.push({ key: 'data-dir', level: 'error', title: '她的数据目录写不进去', detail: config.dataDir, todo: '检查这个目录的权限' })
   }
   // A process of its own; one that cannot start is the self-check's to say.
-  const attempts = await mind.run<{ attempts: { outcome: string; finished_at?: string | null }[] }>('appraisal-attempts', { limit: 200 })
+  const attempts = await mind.run<{ attempts: { outcome: string; charged?: boolean; finished_at?: string | null; error?: string; error_detail?: { code?: string }; waiting_reason?: string }[] }>('appraisal-attempts', { limit: 200 })
     .then((answer) => answer.attempts, () => [])
   const since = Date.now() - 24 * HOUR
   const reviews: Record<string, number> = {}
-  for (const { outcome, finished_at } of attempts) {
+  for (const attempt of attempts) {
+    const { finished_at } = attempt
+    const outcome = [attempt.error, attempt.error_detail?.code, attempt.waiting_reason].includes('deepseek-foreground-priority')
+      && attempt.outcome === 'failed' && attempt.charged !== true ? 'waiting' : attempt.outcome
     if (Date.parse(finished_at ?? '') >= since) reviews[outcome] = (reviews[outcome] ?? 0) + 1
   }
   const failed = (reviews.failed ?? 0) + (reviews.quarantined ?? 0) + (reviews.abandoned ?? 0)
-  if (failed && failed === Object.values(reviews).reduce((sum, n) => sum + n, 0)) {
+  if (failed && failed === Object.entries(reviews).reduce((sum, [outcome, n]) => sum + (outcome === 'waiting' ? 0 : n), 0)) {
     found.push({ key: 'reviews', level: 'error', title: '这一天她一次评估也没做成', detail: `试了 ${failed} 次`, todo: '先看做事线能不能接上模型' })
   }
   return { found, reviews }

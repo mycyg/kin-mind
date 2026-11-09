@@ -746,7 +746,7 @@ def resume(jobs, provider, row, data, context, stored, *, manifest, semantic_ref
     mind, scope = jobs.mind, jobs.mind.scope.key()
     with mind.engine.db.connect() as conn:
         stale = [ref for ref in stored.sources if not mind._fresh(conn, [ref])]
-    fresh = {ref["record_id"]: ref for ref in stored.sources if ref not in stale}
+    fresh = {(ref["record_id"], ref["source_id"]): ref for ref in stored.sources if ref not in stale}
     try:
         proposal = Appraisal.model_validate(stored.proposal)
     except ValidationError:
@@ -790,7 +790,7 @@ def resume(jobs, provider, row, data, context, stored, *, manifest, semantic_ref
         receipt["reuse"].update(revalidation=call_receipt, verdicts=verdicts)
     # What the rebuilt context holds wins; what only the stored proposal was given is added beside it.
     semantic_refs.update({key: ref for key, ref in fresh.items() if key not in semantic_refs})
-    continuity_refs.update({key: ref for key, ref in fresh.items() if key in set(stored.continuity) and key not in continuity_refs})
+    continuity_refs.update({key: ref for key, ref in fresh.items() if ref["record_id"] in set(stored.continuity) and key not in continuity_refs})
     return Light(proposal, receipt, decision.tier, stored.origin, stored.n, stored.manifest_digest, stored.deferred_memory, stored.conflict)
 
 

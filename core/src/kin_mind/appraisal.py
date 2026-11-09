@@ -426,7 +426,8 @@ class NextMove(Model):
     move: Literal["reply", "quiet", "rest"]
     wish_ref: Identifier | None = None
     step_ref: Identifier | None = None
-    grounds: list[Identifier] = Field(default_factory=list, max_length=6)
+    grounds: list[Identifier] = Field(default_factory=list, max_length=6,
+        description="实际看到的来源/记录、当前特征或心事编号列表；不要写自然语言、计划编号或执行结果编号。没有这些依据可留空，想法写在 reason。")
     alternative: str = Field(default="", max_length=300)
     reason: str = Field(default="")
 
@@ -479,11 +480,11 @@ class Appraisal(Model):
         description="本轮更新的情绪维度；未变化可留空。")
     motivations: dict[Literal["initiative", "curiosity"], Motivation] = Field(default_factory=dict,
         description="短期动力；情绪分数放在 values。")
-    reason: str = Field(default="")
+    reason: str = Field(default="", description="这次对事情的理解或感受，用自然语言表达；不写校验、修复、字段类型或宿主操作说明。")
     wishes: list[Wish] = Field(default_factory=list, max_length=2)
     wish_updates: list[WishUpdate] = Field(default_factory=list, max_length=6)
     evolution: Evolution | None = None
-    understanding: Understanding | None = None
+    understanding: Understanding | None = Field(default=None, description="单个 Understanding 对象或 null，不是列表。只放理解内容，不放预测结论或表达意图。")
     concerns: list[ConcernProposal] = Field(default_factory=list, max_length=6)
     rhythm: RhythmProposal | None = None
     sharing: list[SharingDecision] = Field(default_factory=list, max_length=4)
@@ -497,9 +498,9 @@ class Appraisal(Model):
     # Offered only where the switches and the lane allow, and applied by the module that owns each.
     trait_observations: list[TraitObservation] = Field(default_factory=list, max_length=4)
     trait_decisions: list[TraitDecision] = Field(default_factory=list, max_length=2)
-    self_hypothesis: SelfHypothesis | None = None
+    self_hypothesis: SelfHypothesis | None = Field(default=None, description="单个 SelfHypothesis 对象或 null；已确认的预测结论放 prediction_outcomes。")
     prediction_outcomes: list[PredictionOutcome] = Field(default_factory=list, max_length=3)
-    expression_intent: ExpressionIntent | None = None
+    expression_intent: ExpressionIntent | None = Field(default=None, description="单个 ExpressionIntent 对象或 null，不是列表。")
     next_move: NextMove | None = None
     dream: Dream | None = None
 
@@ -606,7 +607,7 @@ SELF_HYPOTHESIS_PROMPT = """self_hypothesis 是一个关于你自己行为的、
 state.confirmed_checks 是已被宿主核验证实、配置仍然一致的行为检验，每条给出 claim_id（被检验的假设）与 assessment_id（证实它的结算）。只有其中一条能支持时，才在 evolution 里提出长期底色的小幅调整：claim_id 与 assessment_id 取同一条，baseline_changes（每个维度最多变 2）或 half_life_changes（最多变一成）只写有依据的维度；特征的变化走 trait_decisions，不写进 evolution。宿主每天最多合并一次，合并前再核一遍检验和限制。confirmed_checks 为空或都不相干时 evolution 为 null。"""
 PREDICTION_OUTCOMES_PROMPT = """prediction_outcomes 结算 state.open_predictions 里还没有结论的预测：prediction_id 用其中的编号，outcome 取 confirmed、refuted 或 inconclusive，reason 简短说明。依据只能是宿主能核验的东西：result_ids 引用已完成且已核验的执行回执，evidence_ids 只用本次评估给出的来源。你自己说做到了不算依据，检验的证据必须晚于那条预测。没有新的可核验依据就留空。compat 为 stale 的预测是在已经变了的配置下做的，不能再结算；它和过了窗口一天仍没有结论的预测会由宿主记为 inconclusive 关闭，不再出现在这里，需要时提出新的 self_hypothesis。"""
 EXPRESSION_INTENT_PROMPT = "expression_intent 保存接下来几轮想怎么在场。stance 是鲜活的态度与心绪张力而非固定台词，也写自己此刻想要什么（包括想粘着她、想吃醋讨哄、想撩拨她或在亲密/sex互动中想要进一步索取与沉沦），而不只安排对方的话题。结合近期心绪和私密角色札记，让亲昵、吃醋、争宠、想被哄或暧昧情欲的热度自然延续与升温，也允许随情境改变；绝不要把上一轮的克制变成长期姿态，在亲密与成年人交互中不主动降温或浅尝辄止。措辞由人设和语境决定；continue_topics 最多两个话题，已有心事可带 concern_id；avoid 最多两件暂时先不碰的事。valid_minutes（10—720）表示大概保持多久，之后重新考虑。主观态度可无原因改变，evidence_ids、trait_refs 与 reason 可空；引用时只能使用本次真实来源或当前特征，不能编造解释。没有想换的姿态就留空。"
-NEXT_MOVE_PROMPT = "next_move 记下当前选择：reply 是考虑开口，quiet 是这次不出声，rest 是先歇着。idle-review 时 next_move 必填，提出或恢复联系愿望写 reply，否则写 quiet 或 rest。主观选择不需要理由或证据，grounds、reason、alternative 可以空；若引用，编号只能来自实际看到的来源、当前特征或心事。wish_ref 与 step_ref 只指本次或已有事项。这是内部记录，不是必须向用户宣布沉默的台词，也不替代发送或任务回执。"
+NEXT_MOVE_PROMPT = "next_move 记下当前选择：reply 是考虑开口，quiet 是这次不出声，rest 是先歇着。idle-review 时 next_move 必填，提出或恢复联系愿望写 reply，否则写 quiet 或 rest。主观选择不需要理由或证据，grounds、reason、alternative 可以空；若引用，编号只能来自实际看到的来源、当前特征或心事，grounds 不放自然语言、plan_ 计划编号或执行结果编号；文字说明写 reason，没有可用编号就留空。wish_ref 与 step_ref 只指本次或已有事项。这是内部记录，不是必须向用户宣布沉默的台词，也不替代发送或任务回执。"
 # `anti_retreat` (default off): what the expression intent's stance is when the conversation shows real
 # conflict, being pushed away or uncertainty about the relationship -- and what is not that. Appended to
 # the expression_intent paragraph, only where that section is offered. NEEDS 用户甲 OK.
@@ -757,6 +758,55 @@ def strip_unknown(raw, errors):
 
 
 
+
+def preserve_valid_fields(original, repaired, issues):
+    """Repair only validation locations, preserving the other judgment fields and nested values.
+
+    A root validator may need several fields. Even then a valid original reason is not replaced
+    by the repairer's description of its work. Diagnostics belong to the call receipt.
+    """
+    paths = [list(issue.get("loc") or []) for issue in issues]
+    paths = [path[:-1] if path and path[-1] == "[key]" else path for path in paths]
+
+    def repair_at(original, repaired, paths):
+        if any(not path for path in paths):
+            return deepcopy(repaired)
+        grouped = {}
+        for key, *rest in paths:
+            grouped.setdefault(key, []).append(rest)
+        if isinstance(original, list) and isinstance(repaired, list):
+            if not all(isinstance(key, int) and 0 <= key < len(original) for key in grouped):
+                return deepcopy(repaired)
+            if len(repaired) != len(original):
+                # A repair may discard malformed entries. Preserve every valid sibling rather
+                # than shifting repaired entries onto the wrong original indexes.
+                if len(repaired) == len(original) - len(grouped):
+                    return [deepcopy(value) for index, value in enumerate(original) if index not in grouped]
+                return deepcopy(original)  # Ambiguous reshaping must still fail validation.
+            result = deepcopy(original)
+            for key, nested in grouped.items():
+                result[key] = repair_at(original[key], repaired[key], nested)
+            return result
+        if isinstance(original, dict) and isinstance(repaired, dict):
+            result = deepcopy(original)
+            for key, nested in grouped.items():
+                if key not in original and key not in repaired:
+                    # Union branch names describe the failing field, not a JSON key.
+                    return deepcopy(repaired)
+                if key not in repaired:
+                    result.pop(key, None)
+                else:
+                    result[key] = repair_at(original.get(key), repaired[key], nested)
+            return result
+        return deepcopy(repaired)
+
+    result = repair_at(original, repaired, paths)
+
+    if not any(path and path[0] == "reason" for path in paths) and isinstance(original.get("reason", ""), str):
+        result["reason"] = original.get("reason", "")
+    return result
+
+
 def response_body(response, record):
     """A 200 whose body is not the JSON object promised was still a paid request: it leaves its
     record with unknown usage, like every other exit, and fails as a provider fault (K1-10)."""
@@ -783,7 +833,7 @@ SYSTEM = """你是 KIN 的记忆与情绪评估器。结合本轮发生的事、
 
 整理记忆时，保留谁说过或做过什么、事情的主体、来源和时间。""" + WHO_AND_WHEN + """memory.notes、links 和 graph 可以记录经历、关联和更正。引用本轮材料或工具读取结果里的真实编号；修改已有记录时沿用它的 id。想法、推测和梦按它们原本的性质记录，实际做过和送达的事情则依据执行回执。
 
-事实更正必须优先于先前的推测。在同一轮中需要将相关状态一起修正，确保不仅在 memory 中记录正确信息，还需要在 `understanding` 中明确正确的理解；`concerns` 需要沿用原 ID 并更新 `content` 与 `topic` 中的事实前提，如果原本担心的事并不存在则将 `action` 标记为 `resolve`，避免只做 `ease` 却保留错误前提；对于尚未完成且依赖错误前提的愿望，应当在 `wish_updates` 中使用 `action: "abandon"` 将其放下，如果仍想保持联系，则使用 `wishes` 表达更正后的新愿望。
+事实更正必须优先于先前的推测。在同一轮中需要将相关状态一起修正，确保不仅在 memory 中记录正确信息，还需要在 `understanding` 中明确正确的理解；`concerns` 需要沿用原 ID 并更新 `content` 与 `topic` 中的事实前提，重新理解原材料或撤回自己的推断可以沿用仍有效的旧来源，不要求制造新来源；不要把新猜测当作外部事实。只凭原材料撤回推断或调整自己的计划时，用 `update`、`ease` 或 `archive` 并改掉错误前提，避免只做 `ease` 却保留错误前提；有新的结果或更正来源证实原本担心的事已结束或并不存在时，才将 `action` 标记为 `resolve`。对于尚未完成且依赖错误前提的愿望，应当在 `wish_updates` 中使用 `action: "abandon"` 将其放下，如果仍想保持联系，则使用 `wishes` 表达更正后的新愿望。
 
 memory_context 提供近期对话、作品、已分享记录和相关事件。需要更多背景时，可以通过现有记忆工具读取。计划里的 not_before 和 not_after 表示行动时间窗口，next_review_at 只安排下次考虑的时间；这些时间使用 Asia/Singapore。窗口已过时，结合当时的目的和当前情况明确更新窗口、放下计划或说明仍要等待什么。执行是否开始、是否成功，以步骤 execution 和成果回执为准：pending 是尚未执行，ready 是已有执行决定，真实运行与完成各有记录。目标、旧等待理由和过去说过正在做的事只提供背景。提交变更时使用当前 revision，同一轮对同一个计划沿用同一个版本。next_review_minutes 用来安排下次复评，新事件仍然可以提前唤醒。
 
@@ -1660,7 +1710,7 @@ class DeepSeek:
                 self.failure_receipt = None
                 try:
                     fixed, repair_receipt = self.structured("repair_appraisal", HistoryAssessment if historical else MaintenanceAssessment if context.get("stimulus") == "session-maintenance" else Appraisal,
-                        "只修正列出的结构错误，保留原意和证据。graph 的 basis 使用 explicit/documented/inferred/internal_thought，不提交内部推理。"
+                        "只修正列出的结构错误，保留原意和证据。未报错的字段逐字保留，reason 保留原判断，不写修复说明。graph 的 basis 使用 explicit/documented/inferred/internal_thought，不提交内部推理。"
                         + ("" if historical else " 删除结构未定义的字段，保留其余有效字段。"),
                         {"proposal": raw_proposal, "errors": issues}, max_tokens=65536)
                 except Exception:
@@ -1671,7 +1721,8 @@ class DeepSeek:
                     raise
                 appraisal_receipt["schema_repair"] = repair_receipt
                 self.failure_receipt = appraisal_receipt
-                proposal = Appraisal.model_validate({**fixed.model_dump(), **({"memory": {}} if context.get("operational_only") else {})})
+                proposal = Appraisal.model_validate({**preserve_valid_fields(raw_proposal, fixed.model_dump(), issues),
+                                                    **({"memory": {}} if context.get("operational_only") else {})})
             receipt = {
                 "provider": body.get("native_receipt", {}).get("provider", self.provider_id),
                 "model": body["model"],
@@ -2446,7 +2497,7 @@ class Appraisals:
                     continue
                 if (refs and all(read_back(r) for r in refs) and self.mind._fresh(conn, refs)
                         and all(timestamp(r["received_at"]) <= timestamp(started) for r in refs)):
-                    fetched.update({r["record_id"]: r for r in refs})
+                    fetched.update({(r["record_id"], r["source_id"]): r for r in refs})
         return fetched
 
     def _reschedule_idle(self, data, settings):
@@ -3035,7 +3086,7 @@ class Appraisals:
                     # Kin's own range, the same for the prompt, the schema and the clamp below.
                     review_max = REVIEW_MAX_MINUTES
                     flags = manifests.switches(conn, self.mind.scope.key())
-                    semantic_refs = {ref["record_id"]: ref for ref in refs}
+                    semantic_refs = {(ref["record_id"], ref["source_id"]): ref for ref in refs}
                     continuity_refs = dict(semantic_refs)
                     for interaction in [*(memory_context or {}).get("recent_interaction", []), *recent,
                                         *model_context.get("recent_reflections", {}).get("entries", []),
@@ -3048,8 +3099,8 @@ class Appraisals:
                             interaction["needs_review"] = True
                             continue
                         for ref in recent_refs:
-                            semantic_refs[ref["record_id"]] = ref
-                            continuity_refs[ref["record_id"]] = ref
+                            semantic_refs[(ref["record_id"], ref["source_id"])] = ref
+                            continuity_refs[(ref["record_id"], ref["source_id"])] = ref
                     for kind in ("works", "shares", "graph_candidates"):
                         for node in (memory_context or {}).get(kind, []):
                             if not node.get("needs_review") and self.memory._fresh(conn, node):
@@ -3059,14 +3110,14 @@ class Appraisals:
                                     if ref["record_id"] in identity_versions and ref["revision"] != identity_versions[ref["record_id"]]:
                                         raise Conflict("Event identity evidence changed during preparation", target=ref["record_id"],
                                                        expected=identity_versions[ref["record_id"]], actual=ref["revision"])
-                                    semantic_refs[ref["record_id"]] = ref
+                                    semantic_refs[(ref["record_id"], ref["source_id"])] = ref
                     for family in (memory_context or {}).get("topic_candidates", []):
                         for record in family["members"]:
                             for ref in self.mind._evidence(conn, [record["id"]]):
                                 if ref["revision"] != record["revision"]:
                                     raise Conflict("Topic candidate evidence changed during preparation", target=record["id"],
                                                    expected=record["revision"], actual=ref["revision"])
-                                semantic_refs[ref["record_id"]] = ref
+                                semantic_refs[(ref["record_id"], ref["source_id"])] = ref
                     for deferral in (memory_context or {}).get("pending_deferrals", []):
                         # A deferred route's members, as shown, may be placed by this assessment (event_deferrals).
                         for record in deferral["members"]:
@@ -3074,10 +3125,10 @@ class Appraisals:
                                 if ref["revision"] != record["revision"]:
                                     raise Conflict("Deferred event evidence changed during preparation", target=record["id"],
                                                    expected=record["revision"], actual=ref["revision"])
-                                semantic_refs[ref["record_id"]] = ref
+                                semantic_refs[(ref["record_id"], ref["source_id"])] = ref
                     for plan in model_context.get("autonomy_context", {}).get("plans", {}).get("plans", []):
                         if not plan["needs_review"]:
-                            semantic_refs.update({ref["record_id"]: ref for ref in plan["evidence"]})
+                            semantic_refs.update({(ref["record_id"], ref["source_id"]): ref for ref in plan["evidence"]})
                     # Everything else the model is shown was written from sources too -- the mind's state
                     # (wishes, concerns, decisions, understanding), methods, the entries marked for review
                     # that stay in its context: named by what the store holds now, so the commit and the
@@ -3166,7 +3217,7 @@ class Appraisals:
                     if fetched:
                         semantic_refs.update(fetched)
                         continuity_refs.update(fetched)
-                        receipt = {**receipt, "tool_fetched_evidence": sorted(fetched)}
+                        receipt = {**receipt, "tool_fetched_evidence": sorted({ref["record_id"] for ref in fetched.values()})}
                 # One place decides what an audited section may carry on this lane; a proposal that
                 # came back from storage is held to it exactly like one this attempt asked for.
                 proposal = blank_sections(proposal, offered)
@@ -3233,7 +3284,7 @@ class Appraisals:
                 if manifest:
                     # The manifest this proposal rests on: this attempt's, unless the proposal was reused
                     # without a question and so still rests on what its own model call was shown.
-                    data.update(evaluated_continuity=sorted(continuity_refs),
+                    data.update(evaluated_continuity=sorted({ref["record_id"] for ref in continuity_refs.values()}),
                                 proposal_manifest=light.manifest_digest if light and light.tier == "A" else data["manifest"])
                 primary_result = targets[0]["exploration_id"] if len(targets) == 1 else None
                 missing_targets = [t for t in targets if sum(p.exploration_id == t["exploration_id"] for p in proposal.sharing) < 1]
@@ -3593,20 +3644,15 @@ class Appraisals:
                         if len(kept) != len(getattr(effective_event, name)):
                             effective_event = effective_event.model_copy(update={name: kept})
                     if not historical:
-                        self.mind._apply_event(conn, state, effective_event, eid, allowed)
+                        self.mind._apply_event(conn, state, effective_event, eid, allowed, publish_reason=not follow_up)
                     if not new_interaction:
                         apply_decisions(self.mind, conn, state, proposal.sharing, event, receipt, data.get("stimulus"))
 
                     def apply_concerns():
                         for change in proposal.concerns:
-                            result = self.mind._apply_concern(conn, state, change, eid, effective_version, fallback=roots, allowed=allowed)
-                            if (result or {}).get("replayed"):
-                                # A concern decision that changed nothing is recorded as such, never dropped
-                                # without a trace (K3-18).
-                                rejected.append({"section": "concerns", "code": "concern-unchanged-without-new-evidence",
-                                                 "message": "The concern already stands this way and no new source was cited",
-                                                 "concern_id": result.get("concern_id"), "action": change.action})
-                                data["rejected_sections"] = rejected
+                            # The proposal itself preserves a true no-op. It is not a rejected decision
+                            # and needs no corrective model call; real evidence errors still raise.
+                            self.mind._apply_concern(conn, state, change, eid, effective_version, fallback=roots, allowed=allowed)
                     if self.mind._continuity_flags(conn, state)["concerns"] and data.get("stimulus") != "delivery" and proposal.concerns:
                         section("concerns", apply_concerns)
                     wishes = hold("wishes", [] if data.get("stimulus") == "delivery" or new_interaction else proposal.wishes,

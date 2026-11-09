@@ -62,6 +62,8 @@ REGISTRY = {
     "Event source was deleted": ("semantic", "evidence-erased", "section"),
     "Share source was deleted": ("semantic", "evidence-erased", "section"),
     "Share reference must name a saved finding": ("semantic", "share-reference-invalid", "section"),
+    "A source-backed concern cannot be relabelled as an internal thought": ("semantic", "concern-basis-change-needs-evidence", "section"),
+    "A shared plan requires a new source": ("semantic", "shared-plan-needs-evidence", "section"),
     "A closed concern requires an explicit reopen": ("semantic", "concern-reopen-required", "section"),
     # --- appraisal.py: the evaluation's own preparation and commit guards ---
     "Migration requires current owner evidence": ("semantic", "migration-needs-owner-evidence", "block"),

@@ -49,6 +49,8 @@ export interface ContactService {
   look(sessionId: string, who?: string): Promise<string>
   /** The people and groups she can tell things to. */
   names(): string[]
+  /** Bound destinations and agendas for her main heartbeat review. */
+  reviewTargets(): Promise<Record<string, unknown>>
 }
 
 /** What the host itself tells the owner when something of hers did not go through (owner-notice.mjs). Never her words. */
@@ -177,6 +179,7 @@ export function contact(host: Host) {
   const find = (to: string) => everyone().find((entry) => entry.id === to || nameOf(entry) === to.trim())
 
   host.ctx.provide('kinContact', {
+    reviewTargets: () => reaching.reviewTargets(),
     get sending() { return conversations.pending || deliveries.sending },
     settlementFailures: () => deliveries.list().flatMap((delivery) =>
       delivery.settlementError ? [{ id: delivery.id, reason: delivery.settlementError }] : []),

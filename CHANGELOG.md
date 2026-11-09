@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-09 — Preserve judgments and complete review evidence
+
+- Let a concern reinterpret its existing valid evidence without requiring a new source; keep new-outcome and owner-participation checks, true no-op detection, and freely changing subjective concerns.
+- Keep every source edge of a recalled aggregate through assessment and revalidation, while continuing to reject unseen or stale evidence.
+- Repair only invalid structured fields and retain valid judgment text, values and actions. Keep technical follow-up reasons in diagnostics rather than the public thought or dimension reasons.
+- Pass bound people and group agendas through the main heartbeat's supported host entry point without changing other-person review scope.
+- Explain missing-evidence and exhausted-retry digest failures accurately; count uncharged foreground-priority deferrals as waiting rather than failed assessments.
+- Add synthetic boundary, two-round isolation, real-host routing and audited reason-only recovery regressions. Recovery never rewrites historical events or restores outdated intentions.
+- Verification: 1411 Core tests (1 skipped), 10 Node checks, 113 integration checks across nine suites, typechecking and all three targeted regression scripts passed.
+
 ## 2026-11-08 — Isolate contact receipt recovery
 
 - Keep each delivery's result-recording failure separate, so one unavailable conversation does not block other proactive contacts.
