@@ -1,0 +1,147 @@
+/* Her chat box: pictures and files in the composer and in bubbles, the microphone, and a picture opened large (Chat.tsx). */
+
+/* The composer: a clip beside the words, and what was picked resting above them until it is sent */
+.kin-chat { position: relative; }
+.kin-composer-box { flex-wrap: wrap; padding-left: 6px; }
+.kin-composer-box textarea { min-width: 0; }
+.kin-attach {
+  flex: none; width: 36px; height: 36px; display: grid; place-items: center; padding: 0; border: 0; cursor: pointer;
+  border-radius: 50%; corner-shape: round; background: none; color: var(--kin-ink-2);
+  transition: transform .45s var(--kin-spring), background .2s, color .2s;
+}
+.kin-attach:hover { background: var(--kin-fill-2); color: var(--kin-rose); transform: rotate(-14deg) scale(1.06); }
+.kin-attach:active { transform: scale(.9); }
+.kin-drafts {
+  flex: 0 0 100%; box-sizing: border-box; min-width: 0; display: flex; gap: 8px; overflow-x: auto;
+  padding: 4px 22px 8px 4px; margin-bottom: -6px;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+}
+.kin-draft { position: relative; flex: none; height: 56px; border-radius: 16px; animation: kin-rise .45s var(--kin-spring) both; }
+.kin-draft img {
+  display: block; width: 56px; height: 56px; border-radius: inherit; object-fit: cover;
+  box-shadow: 0 4px 10px -6px rgb(80 40 90 / .55);
+}
+/* A rim of light over each one, as on the rest of her glass */
+.kin-draft::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .6), inset 0 0 0 1px rgb(255 255 255 / .2);
+}
+.kin-draft-remove {
+  position: absolute; top: 4px; right: 4px; z-index: 1; width: 18px; height: 18px; display: grid; place-items: center; padding: 0;
+  border: 0; cursor: pointer; border-radius: 50%; corner-shape: round; color: #fff; background: rgb(56 39 68 / .6);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  transition: opacity .2s, transform .45s var(--kin-spring);
+}
+.kin-draft-remove:hover { transform: scale(1.12); }
+.kin-draft-remove:active { transform: scale(.88); }
+@media (hover: hover) {
+  .kin-draft-remove { opacity: 0; }
+  .kin-draft:hover .kin-draft-remove, .kin-draft-remove:focus-visible { opacity: 1; }
+}
+
+/* A file: a small card with its name, in a bubble or waiting above the words */
+.kin-file {
+  display: flex; align-items: center; gap: 9px; box-sizing: border-box; min-width: 0; max-width: 240px; padding: 7px 14px 7px 7px;
+  border-radius: 15px; white-space: nowrap; background: rgb(255 255 255 / .2); box-shadow: inset 0 1px 0 rgb(255 255 255 / .3);
+}
+.kin-file i { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; background: rgb(255 255 255 / .28); }
+.kin-file span { min-width: 0; display: flex; flex-direction: column; line-height: 1.35; }
+.kin-file b { overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
+.kin-file small { font-size: 11px; opacity: .72; }
+.kin-draft .kin-file {
+  height: 100%; padding-right: 30px; border-radius: inherit;
+  background-color: color-mix(in srgb, var(--kin-lilac) 18%, var(--kin-fill-2)); box-shadow: inset 0 0 0 1px var(--kin-hairline);
+}
+.kin-draft .kin-file i {
+  color: #fff; background: linear-gradient(140deg, var(--kin-lilac), var(--kin-sakura)); box-shadow: inset 0 1px 0 rgb(255 255 255 / .45);
+}
+/* The microphone, beside the heart: a pill that counts the seconds while it listens, with a soft halo breathing out */
+.kin-mic {
+  flex: none; height: 36px; min-width: 36px; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 0; border: 0; cursor: pointer; border-radius: 999px; background: none; color: var(--kin-ink-2);
+  font: inherit; font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  transition: transform .45s var(--kin-spring), background-color .2s, color .2s, opacity .2s;
+}
+.kin-mic:not([data-phase]):hover { background-color: var(--kin-fill-2); color: var(--kin-rose); transform: scale(1.06); }
+.kin-mic:active { transform: scale(.9); }
+.kin-mic:disabled { cursor: default; }
+.kin-mic[data-phase="asking"] { opacity: .5; }
+.kin-mic[data-phase="recording"] {
+  padding: 0 14px 0 12px; color: #fff; background: var(--kin-me);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .4), 0 8px 16px -8px rgb(226 119 159 / .95);
+  animation: kin-listen 2s ease-in-out infinite;
+}
+.kin-mic[data-phase="recording"] i {
+  width: 7px; height: 7px; border-radius: 50%; corner-shape: round; background: #fff; box-shadow: 0 0 6px rgb(255 255 255 / .8);
+  animation: kin-glow 1.2s ease-in-out infinite;
+}
+@keyframes kin-listen {
+  50% { box-shadow: inset 0 1px 0 rgb(255 255 255 / .4), 0 8px 16px -8px rgb(226 119 159 / .95), 0 0 0 7px rgb(226 119 159 / .16); }
+}
+@keyframes kin-glow { 50% { opacity: .4; transform: scale(.7); } }
+/* While her host writes out what was said, the pill turns to quiet glass and the light sweeps across it */
+.kin-mic[data-phase="hearing"] { padding: 0 14px; background-color: var(--kin-fill-2); box-shadow: inset 0 1px 0 var(--kin-rim-2); }
+
+/* On its way (a file to the host, a picture's bytes to the bubble, spoken words to the box): light sweeps across until it has arrived */
+.kin-draft[data-staging] .kin-file, i.kin-picture:empty, .kin-mic[data-phase="hearing"] {
+  background-image: linear-gradient(100deg, transparent 30%, var(--kin-shine) 50%, transparent 70%);
+  background-size: 240% 100%; animation: kin-sweep 1.5s linear infinite;
+}
+@keyframes kin-sweep { from { background-position: 130% 0; } to { background-position: -130% 0; } }
+
+/* A person's pictures and files in their bubble: the bubble becomes a thin frame around them */
+.kin-bubble[data-attached] { padding: 5px; }
+.kin-bubble[data-attached] .kin-via { margin: 2px 9px 4px; }
+.kin-caption { display: block; padding: 5px 9px 4px; }
+.kin-pictures { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px; }
+.kin-picture { display: block; max-width: 100%; height: auto; border-radius: 15px; object-fit: cover; background-color: rgb(255 255 255 / .22); }
+.kin-pictures:not([data-many]) .kin-picture { max-width: min(100%, 260px); max-height: 300px; }
+.kin-pictures[data-many] .kin-picture { width: 116px; height: 116px; }
+/* Before its bytes arrive, or when they never do */
+i.kin-picture { display: grid; place-items: center; font-style: normal; font-size: 11px; white-space: nowrap; }
+/* One that has arrived opens large */
+.kin-picture-open {
+  display: block; min-width: 0; max-width: 100%; padding: 0; border: 0; border-radius: 15px; background: none; cursor: zoom-in;
+  transition: transform .45s var(--kin-spring), filter .2s;
+}
+.kin-picture-open:hover { filter: brightness(1.05); }
+.kin-picture-open:active { transform: scale(.97); }
+.kin-pictures + .kin-file, .kin-file + .kin-file { margin-top: 4px; }
+
+/* Something dragged over the chat, or a picture opened large: the glass thickens over it */
+.kin-drop, .kin-viewer {
+  position: absolute; inset: 0; z-index: 4; display: grid; place-items: center;
+  background: linear-gradient(170deg, color-mix(in srgb, var(--kin-lilac) 22%, var(--kin-fill-2)), color-mix(in srgb, var(--kin-sakura) 34%, var(--kin-fill-2)));
+  -webkit-backdrop-filter: blur(14px) saturate(170%); backdrop-filter: blur(14px) saturate(170%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 32px); mask-image: linear-gradient(to bottom, transparent, #000 32px);
+  animation: kin-veil .3s var(--kin-ease) both;
+}
+.kin-drop > * { pointer-events: none; }
+.kin-drop span {
+  display: inline-flex; align-items: center; gap: 10px; padding: 8px 20px 8px 8px; border-radius: 999px; font-size: 14px; letter-spacing: .04em;
+  background: var(--kin-fill-3); box-shadow: inset 0 1px 0 var(--kin-rim), 0 18px 34px -18px rgb(80 40 90 / .7), var(--kin-ring);
+  animation: kin-rise .5s var(--kin-spring) both;
+}
+.kin-drop i {
+  width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; corner-shape: round; color: #fff;
+  background: var(--kin-me); box-shadow: inset 0 1px 0 rgb(255 255 255 / .4), 0 8px 16px -8px rgb(226 119 159 / .95);
+}
+@keyframes kin-veil { from { opacity: 0; } }
+
+/* The picture rises out of its bubble to fill what room there is, never past its own size; a click anywhere puts it back */
+.kin-viewer { grid-template: minmax(0, 1fr) / minmax(0, 1fr); box-sizing: border-box; padding: 40px 22px 22px; cursor: zoom-out; }
+.kin-viewer img {
+  display: block; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; border-radius: 18px;
+  box-shadow: 0 0 0 1px var(--kin-rim-2), 0 30px 60px -30px rgb(70 30 60 / .8), 0 2px 10px -4px rgb(70 30 60 / .3);
+  animation: kin-zoom .45s var(--kin-spring) both;
+}
+@keyframes kin-zoom { from { opacity: 0; transform: scale(.9); } }
+.kin-viewer-close {
+  position: absolute; top: 34px; right: 16px; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 0;
+  cursor: pointer; border-radius: 50%; corner-shape: round; color: var(--kin-ink); background: var(--kin-fill-3);
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 var(--kin-rim), 0 10px 20px -12px rgb(80 40 90 / .7);
+  transition: transform .45s var(--kin-spring);
+}
+.kin-viewer-close:hover { transform: scale(1.08); }
+.kin-viewer-close:active { transform: scale(.9); }

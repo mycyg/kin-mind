@@ -2,9 +2,9 @@
  * 此刻: whom she reaches out to and why not, in words. Each person and group with what held her back this
  * minute (her own choice, or the owner's rules), what has gone quiet too long, and what she sent lately.
  */
-import { useApi } from './api.js'
+import { api, useApi } from './api.js'
 import { OWNER, type Rules } from './People.js'
-import { ago, clock, soon } from './time.js'
+import { ago, clock, day, soon } from './time.js'
 
 interface Reach { state: string; reason?: string; at: string }
 interface Delivery {
@@ -13,7 +13,7 @@ interface Delivery {
 interface Contact {
   rules: Rules
   status: Record<string, Reach>
-  activity: Record<string, { reached?: string[] }>
+  activity: Record<string, { reached?: string[]; quietUntil?: string }>
   alerts: string[]
   deliveries: Delivery[]
   people: Record<string, { name: string; group: boolean }>
@@ -25,6 +25,7 @@ const WHY: Record<string, string> = {
   'proactive-off': '没让她主动找',
   'not-acquainted': '还没在哪儿说过话',
   'quiet-hours': '安静时段，她不出声',
+  'asked-to-wait': '对方让她先别找',
   'waiting-for-reply': '在等回上一条',
   'just-talked': '刚聊过不久',
   'enough-today': '今天找得够多了',
@@ -42,7 +43,7 @@ const KINDS: Record<string, string> = { reply: '回复', contact: '主动', chim
 const STATES: Record<string, string> = { pending: '等着发', accepted: '送到了', unknown: '待确认', cancelled: '没发出', 'needs-review': '只发出一部分' }
 
 export function Contact() {
-  const { data } = useApi<Contact>('api/kin/contact', 30_000)
+  const { data, reload } = useApi<Contact>('api/kin/contact', 30_000)
   if (!data) return null
   const targets = Object.entries(data.people)
   const sent = data.deliveries.filter((delivery) => delivery.kind !== 'reply').slice(0, 6)
@@ -54,6 +55,9 @@ export function Contact() {
         {targets.map(([id, { name, group }]) => {
           const status = data.status[id]
           const last = data.activity[id]?.reached?.at(-1)
+          // A wait they asked of her themselves (kin_quiet); the owner can take it back here.
+          const until = data.activity[id]?.quietUntil
+          const wait = until && Date.parse(until) > Date.now() ? until : undefined
           const note = !status ? '还没轮到她想'
             : status.state === 'complete' ? '刚刚找过'
             : status.state === 'failed' ? `出了点问题：${status.reason ?? ''}`
@@ -62,7 +66,10 @@ export function Contact() {
           return (
             <li key={id} className="kin-reach-row">
               <span className="kin-reach-name">{name}{group ? <span className="kin-tag">群</span> : id === OWNER ? <span className="kin-tag">你</span> : null}</span>
-              <span className="kin-dim" title={status?.reason}>{note}</span>
+              <span className="kin-dim" title={status?.reason}>
+                {wait ? `${id === OWNER ? '你' : '对方'}说了先别找，到${day(wait) === '今天' ? '' : day(wait)} ${clock(wait)}` : note}
+                {wait ? <> · <button type="button" className="kin-link" onClick={() => void api('api/kin/contact/wait', { id }).then(reload)}>不用等了</button></> : null}
+              </span>
               <span className="kin-dim">{last ? `上次 ${ago(last)}` : ''}</span>
             </li>
           )

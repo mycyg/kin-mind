@@ -53,7 +53,8 @@ export class Feishu implements Transport {
   private timer?: NodeJS.Timeout
   private catchingUp = false
   /** Arrivals are taken in one at a time, in order: a photo still downloading is not overtaken by the words after it. */
-  private intake: Promise<void> = Promise.resolve()
+  /** Messages being taken in, by chat: each chat in its own order, so one chat's download holds up no other. */
+  private readonly intake = new Map<string, Promise<void>>()
   private closed = false
   private problem?: string
   private current: ReturnType<Transport['status']> = { state: 'stopped' }
@@ -80,6 +81,10 @@ export class Feishu implements Transport {
     clearInterval(this.timer)
     this.socket?.close()
     this.current = { state: 'stopped' }
+    // It hands over and writes nothing more, so it cannot undo what the connection opened next keeps. A message
+    // it was still taking in was never marked seen: that one is given to the next connection again (a push left
+    // unanswered is sent again, and catch-up lists the rest).
+    this.store.close()
   }
 
   status() {
@@ -171,6 +176,7 @@ export class Feishu implements Transport {
         do {
           const data = await this.api('GET', `/open-apis/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(chat)}`
             + `&start_time=${Math.floor(from / 1000)}&sort_type=ByCreateTimeAsc&page_size=50${page && '&page_token=' + encodeURIComponent(page)}`)
+          if (this.closed) return
           for (const item of data.items ?? []) {
             if (item.deleted || item.upper_message_id) continue
             await this.enqueue({
@@ -194,14 +200,16 @@ export class Feishu implements Transport {
   }
 
   private enqueue(message: Message) {
-    const taken = this.intake.then(() => this.take(message))
-    this.intake = taken.catch(() => {})
+    const taken = (this.intake.get(message.chat) ?? Promise.resolve()).then(() => this.take(message))
+    const settled = taken.catch(() => {}).finally(() => { if (this.intake.get(message.chat) === settled) this.intake.delete(message.chat) })
+    this.intake.set(message.chat, settled)
     return taken
   }
 
   private async take(message: Message) {
+    if (this.closed) return
     this.store.value.chats[message.chat] ??= { kind: message.kind, covered: message.at || Date.now() }
-    if (message.fromBot || !this.store.fresh(message.id)) return
+    if (message.fromBot || this.store.value.seen[message.id]) return
     const { text, resources, mentioned } = await this.read(message)
     const files: NonNullable<Inbound['files']> = []
     const notes: string[] = []
@@ -219,6 +227,9 @@ export class Feishu implements Transport {
       }
     }
     const said = [text, ...notes].filter(Boolean).join('\n')
+    if (this.closed) return
+    // Seen once it is handed over, not while it downloads: another chat's save meanwhile must not mark it taken.
+    this.store.fresh(message.id)
     this.inbound({
       transport: this.id, id: message.id, chat: message.chat, kind: message.kind, sender: message.sender,
       ...(message.kind === 'group' ? { mentioned } : {}), ...(said ? { text: said } : {}), ...(files.length ? { files } : {}),

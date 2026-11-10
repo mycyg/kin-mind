@@ -61,12 +61,14 @@ export function Settings() {
   )
 }
 
-function Persona({ text: saved }: { text: string }) {
-  const [text, setText] = useState(saved)
+function Persona({ text: loaded }: { text: string }) {
+  // What her host has: the text the page loaded, then whatever was saved here since.
+  const [saved, setSaved] = useState(loaded)
+  const [text, setText] = useState(loaded)
   const [state, setState] = useState<'idle' | 'saved' | string>('idle')
-  useEffect(() => setText(saved), [saved])
+  useEffect(() => { setSaved(loaded); setText(loaded) }, [loaded])
   const save = () => api('api/kin/persona', { text })
-    .then(() => setState('saved'))
+    .then(() => { setSaved(text); setState('saved') })
     .catch((reason: Error) => setState(reason.message))
   return (
     <section className="kin-card">
@@ -163,8 +165,14 @@ function RouteLane({ lane, title, hint, answered, data, catalog, onSaved }: {
                 }}
                 onDragOver={(event) => {
                   event.preventDefault()
-                  if (from.current === null || from.current === index) return
-                  move(from.current, index)
+                  const at = from.current
+                  if (at === null || at === index) return
+                  // Only once the pointer is past this row's middle: the row that just gave way glides back
+                  // under the pointer, and must not trade places again on its way.
+                  const box = event.currentTarget.getBoundingClientRect()
+                  const middle = box.top + box.height / 2
+                  if (at < index ? event.clientY < middle : event.clientY > middle) return
+                  move(at, index)
                   from.current = index
                   setDragging(index)
                 }}

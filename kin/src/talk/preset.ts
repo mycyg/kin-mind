@@ -41,8 +41,9 @@ export async function apply(ctx: Context) {
     }))
   }
 
-  // Messages she chose to answer together with whatever is said next, with why.
-  const merging: { id: string; reason: string }[] = []
+  // Messages she chose to answer together with whatever is said next, with why, by conversation: this preset
+  // serves all of her sessions, and what waits in one is not another's to take.
+  const merging = new Map<string, { id: string; reason: string }[]>()
 
   // Whether, and when, to answer what was just said is hers: Core keeps the choice (habits.py) and says
   // whether the owner has left it to her. A reply held back ends her turn without words.
@@ -61,7 +62,7 @@ export async function apply(ctx: Context) {
       const inputs = heard(exec.agent!)
       const input = inputs.at(-1)
       if (!input || choice === 'merge') {
-        merging.push(...inputs.map(({ id }) => ({ id, reason })))
+        merging.set(session.id, [...(merging.get(session.id) ?? []), ...inputs.map(({ id }) => ({ id, reason }))])
         exec.concludeTurn()
         return input ? '好，等下一句。' : '好。'
       }
@@ -124,8 +125,10 @@ export async function apply(ctx: Context) {
       kin.mind.call('energy-activity', { kind: 'reply', activity_id: reply.data.message.id }).catch(warn('energy not counted'))
     }
     const next = heard(agent).at(-1)
-    if (!merging.length || !next || merging.some(({ id }) => id === next.id)) return
-    for (const { id, reason } of merging.splice(0)) {
+    const waiting = merging.get(agent.session.id)
+    if (!waiting?.length || !next || waiting.some(({ id }) => id === next.id)) return
+    merging.delete(agent.session.id)
+    for (const { id, reason } of waiting) {
       kin.mind.call('reply-choice', { input_id: id, action: 'merged', merged_into: next.id, reason }).catch(warn('merge not kept'))
     }
   })

@@ -15,7 +15,15 @@ interface View {
   checked: { watch?: string; self?: string; daily?: string }
   days: { at: string; ok: boolean; problems: string[]; reviews: Record<string, number> }[]
   now: { replying: boolean; delivering: boolean; rounds: { lane: string; name: string; since: string }[]; lastMinute: string | null }
+  /** Her latest replies and where their time went, in milliseconds (src/timeline.ts). */
+  replies: ({ key: string; at: string; total: number } & Partial<Record<Span, number>>)[]
 }
+
+/** The stretches of one reply, in order, as her page says them. */
+const SPANS = { gathered: '等连发说完', waited: '等她手头的事', recall: '回想', firstWord: '开口', sent: '送达' }
+type Span = keyof typeof SPANS
+const PLACES: Record<string, string> = { app: '桌面', wechat: '微信', feishu: '飞书' }
+const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} 秒`
 
 const ROUTE = 'api/kin/health'
 const when = (at: string) => `${day(at)} ${clock(at)}`
@@ -35,7 +43,7 @@ export function Health() {
       </section>
     )
   }
-  const { frozen, problems, resolved, checked, days, now } = data
+  const { frozen, problems, resolved, checked, days, now, replies } = data
   const errors = problems.filter((p) => p.level === 'error').length
   const [latest] = days
   const streak = days.findIndex((d) => d.ok)
@@ -91,6 +99,20 @@ export function Health() {
           每日检查 · {when(latest.at)} {latest.ok ? '通过' : '没通过'}{misses >= 2 ? `，已经连续 ${misses} 次` : ''}
           {' · '}{reviewsOf(latest.reviews)}
         </p>
+      ) : null}
+      {replies.length ? (
+        <details className="kin-health-past">
+          <summary>最近 {replies.length} 次回话花了多久</summary>
+          <ul className="kin-list">
+            {replies.map((reply) => (
+              <li key={reply.at + reply.key}>
+                {when(reply.at)} · {PLACES[reply.key.split(':')[0]!] ?? reply.key} · 共 {seconds(reply.total)}
+                <span className="kin-dim">　{(Object.keys(SPANS) as Span[]).filter((span) => (reply[span] ?? 0) >= 100)
+                  .map((span) => `${SPANS[span]} ${seconds(reply[span]!)}`).join(' · ')}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       ) : null}
       {resolved.length ? (
         <details className="kin-health-past">

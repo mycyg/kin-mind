@@ -259,7 +259,7 @@ def _dispatch(config, action, request):
             reason="KIN wakes with her whole inner life on, as the old KIN ran"))
         return {"initialized": True}
     # KIN's inner world as the DSH page reads it: her diary (and the owner's replies), her dreams,
-    # and the letters the owner seals for a later day. None of these calls a model.
+    # the letters the owner seals for a later day, and the anniversaries. None of these calls a model.
     if action == "diary":
         from . import diary
         return diary.read(mind, cursor=request.get("cursor", 0), limit=request.get("limit", 20))
@@ -281,6 +281,10 @@ def _dispatch(config, action, request):
     if action == "seal-letter":
         from . import sealed
         return sealed.seal_letter(mind, request.get("text"), request.get("unlock_at"), request.get("command_id"))
+    if action == "anniversaries":
+        # The calendar page's: the anniversaries of shared moments between two days (initiative.py).
+        from .initiative import anniversaries_between
+        return anniversaries_between(mind, request.get("from"), request.get("to"))
     if action == "operational-status":
         from .operational_status import operational_status
         return operational_status(mind, config)
@@ -881,7 +885,7 @@ RESIDENT_ACTIONS = frozenset({
     # The DSH plugin's per-turn context and its home page reads. The plugin asks for `mode: light`
     # context, which never calls a model, so these stay short like the rest of this set.
     "ensure-initialized", "memory-context", "state-overview", "autonomous-plans", "graph", "event-thread",
-    "persona-save", "work-history", "share-history", "diary", "diary-reply", "dreams", "explorations", "letters", "seal-letter", "configure-memory",
+    "persona-save", "work-history", "share-history", "diary", "diary-reply", "dreams", "explorations", "letters", "seal-letter", "anniversaries", "configure-memory",
     # Her chat tools (chat_tools: plans, store reads and writes, no model) and the owner's choices on her page.
     "chat-tools", "chat-tool", "owner-habit",
 })

@@ -11,19 +11,23 @@ export type Field = [number, bigint | Uint8Array]
 export function decode(bytes: Uint8Array): Field[] {
   const fields: Field[] = []
   let at = 0
+  // A frame cut short, or a number that never ends, is refused: read on, it would never return.
   const varint = () => {
     let value = 0n
-    for (let shift = 0n; ; shift += 7n) {
-      const byte = bytes[at++]
+    for (let shift = 0n; shift < 70n; shift += 7n) {
+      if (at >= bytes.length) break
+      const byte = bytes[at++]!
       value |= BigInt(byte & 0x7f) << shift
       if (byte < 0x80) return value
     }
+    throw new Error('malformed protobuf varint')
   }
   while (at < bytes.length) {
     const key = Number(varint())
     if ((key & 7) === 0) fields.push([key >> 3, varint()])
     else if ((key & 7) === 2) {
       const length = Number(varint())
+      if (length > bytes.length - at) throw new Error('protobuf field longer than its frame')
       fields.push([key >> 3, bytes.subarray(at, (at += length))])
     } else throw new Error('unexpected protobuf wire type ' + (key & 7))
   }
@@ -125,6 +129,8 @@ export function connect({ domain, appId, appSecret, onEvent, onState }: {
         })
         const answer = await response.json() as { code: number; msg?: string; data?: { URL: string; ClientConfig?: { PingInterval?: number } } }
         if (answer.code !== 0 || !answer.data) throw new Error(`飞书不给长连接：${answer.code} ${answer.msg ?? ''}`.trim())
+        // Closed while the address was being asked for: no connection is made after all.
+        if (closed) break
         const opened = Date.now()
         await session(answer.data.URL, (answer.data.ClientConfig?.PingInterval ?? 120) * 1000)
         failures = Date.now() - opened > 60_000 ? 0 : failures + 1

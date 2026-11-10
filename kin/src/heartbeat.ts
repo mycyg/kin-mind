@@ -8,7 +8,8 @@
  * - A completed appraisal leaves the day's review and the memory warm-up due.
  * - The enrichment lane (this stretch's note, memories of archived wishes, memory jobs) has its own minute.
  * - Her conversation comes first: nothing new starts while she is in the middle of a reply, and the
- *   end of a reply looks again at once.
+ *   end of a reply looks again at once. A lane that only keeps what she already sent (its receipts and
+ *   retries) says so and runs all the same.
  * - Frozen by the owner (her health controls), no lane starts a round and the memory worker rests;
  *   rounds already going finish. Thawed, the next minute starts at once.
  */
@@ -60,13 +61,15 @@ export class Heartbeat {
   readonly rounds = new Map<Lane, string>()
   /** When the minute last started its rounds. */
   lastMinute?: string
-  private readonly lanes = new Map<Lane, () => Promise<Answer | void>>()
+  private readonly lanes = new Map<Lane, { round: () => Promise<Answer | void>; whileReplying: boolean }>()
   private timer?: NodeJS.Timeout
+  private retry?: NodeJS.Timeout
   private closed = false
   private paused = false
   private preparationDue = false
   private dailyDue = false
   private dailyRetryAt = 0
+  private startFailures = 0
 
   constructor(
     private readonly mind: Mind,
@@ -79,10 +82,21 @@ export class Heartbeat {
     private readonly reviewTargets: () => Promise<Record<string, unknown>> = async () => ({}),
   ) {}
 
-  /** After start-up recovery: what a previous run left half done is settled before anything new runs. */
+  /**
+   * After start-up recovery: what a previous run left half done is settled before anything new runs. A recovery
+   * that fails is tried again, a minute later and then up to ten apart: her minute must not stay stopped for it.
+   */
   async start() {
-    await this.mind.run('recover')
-    await this.mind.run('plan-recover', { workers_stopped: true })
+    if (this.closed) return
+    try {
+      await this.mind.run('recover')
+      await this.mind.run('plan-recover', { workers_stopped: true })
+    } catch (error) {
+      this.note('review', { state: 'failed', reason: 'start-up recovery: ' + (error as Error).message })
+      const wait = Math.min(2 ** this.startFailures++, 10) * MINUTE * this.pace
+      if (!this.closed) (this.retry = setTimeout(() => void this.start().catch((again: Error) => this.log(`heartbeat did not start: ${again.message}`)), wait)).unref()
+      throw error
+    }
     if (this.closed) return
     if (!this.paused) this.mind.keepWorker()
     this.timer = setInterval(() => this.minute(), MINUTE * this.pace)
@@ -93,6 +107,7 @@ export class Heartbeat {
   close() {
     this.closed = true
     clearInterval(this.timer)
+    clearTimeout(this.retry)
   }
 
   get frozen() {
@@ -119,10 +134,11 @@ export class Heartbeat {
 
   /**
    * Another minute lane of hers (exploring, creating, reaching out…), kept like the others: one round at a
-   * time, none while she is replying, a failure noted rather than thrown. What the round returns is noted.
+   * time, none while she is replying (unless it thinks nothing new: `whileReplying`), a failure noted rather
+   * than thrown. What the round returns is noted.
    */
-  every(lane: Lane, round: () => Promise<Answer | void>) {
-    this.lanes.set(lane, round)
+  every(lane: Lane, round: () => Promise<Answer | void>, { whileReplying = false } = {}) {
+    this.lanes.set(lane, { round, whileReplying })
   }
 
   private minute() {
@@ -130,11 +146,11 @@ export class Heartbeat {
     this.lastMinute = new Date().toISOString()
     void this.review()
     void this.enrich()
-    for (const [lane, round] of this.lanes) {
+    for (const [lane, { round, whileReplying }] of this.lanes) {
       void this.lane(lane, async () => {
         const answer = await round()
         if (answer) this.note(lane, answer)
-      })
+      }, whileReplying)
     }
   }
 
@@ -156,8 +172,8 @@ export class Heartbeat {
   }
 
   /** One lane's round, never two at once and none while she is replying or frozen. */
-  private async lane(lane: Lane, round: () => Promise<void>) {
-    if (this.closed || this.paused || this.rounds.has(lane) || this.replying()) return
+  private async lane(lane: Lane, round: () => Promise<void>, whileReplying = false) {
+    if (this.closed || this.paused || this.rounds.has(lane) || (!whileReplying && this.replying())) return
     this.rounds.set(lane, new Date().toISOString())
     try {
       await round()
@@ -171,7 +187,8 @@ export class Heartbeat {
 
   private review() {
     return this.lane('review', async () => {
-      for (let round = 0; round < ROUNDS && !this.closed && !this.paused; round++) {
+      // Her conversation comes first between rounds too: one that began meanwhile is not kept waiting on the next.
+      for (let round = 0; round < ROUNDS && !this.closed && !this.paused && !(round && this.replying()); round++) {
         // The minute's bookkeeping happens in this call; the answer says whether a review is waiting.
         const due = await this.mind.call<Due>('review-due', {})
         if (due.action !== true) return this.quiet('review', due)
@@ -209,6 +226,8 @@ export class Heartbeat {
     if (!this.dailyDue) return
     return this.lane('daily', async () => {
       this.dailyDue = false
+      // A round that fails is asked again like one that waits; each known outcome below sets its own time.
+      this.dailyRetryAt = Date.now() + DAILY_RETRY_MS * this.pace
       const due = await this.mind.call<Due>('review-due', { tick: false })
       if (due.daily !== true && (due.state === 'paused' || typeof due.daily === 'boolean')) {
         this.dailyRetryAt = 0

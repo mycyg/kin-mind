@@ -70,13 +70,16 @@ lark.say(lark.message('om_4', 'oc_family', 'text', { text: '@_user_1 晚上吃�
   { kind: 'group', mentions: [{ key: '@_user_1', id: { open_id: 'ou_kin' }, name: 'KIN' }] }))
 await until('four pushed messages', () => fromFeishu.length >= 4)
 const [said, image, voice, group] = ['om_1', 'om_2', 'om_3', 'om_4'].map((id) => fromFeishu.find((message) => message.id === id))
-checks['feishu: pushed text, image and voice arrive in order, attachments saved in her data dir'] = fromFeishu.map((message) => message.id).join() === 'om_1,om_2,om_3,om_4'
+checks['feishu: pushed text, image and voice arrive in order, attachments saved in her data dir'] = fromFeishu.filter((message) => message.chat === 'oc_owner').map((message) => message.id).join() === 'om_1,om_2,om_3'
+  && fromFeishu.length === 4 && new Set(fromFeishu.map((message) => message.id)).size === 4
   && said.text === '下班啦' && said.kind === 'direct'
   && image.files?.[0]?.kind === 'image' && readFileSync(image.files[0].path).equals(PNG) && image.files[0].path.startsWith(join(root, 'data'))
   && voice.files?.[0]?.kind === 'voice' && readFileSync(voice.files[0].path).equals(OGG)
 checks['feishu: in a group, an @ to her is seen and taken out of the text'] = group.kind === 'group' && group.mentioned === true && group.text === '晚上吃什么'
 checks['feishu: every pushed event is answered 200'] = await until('acks', () => lark.state.frames.filter((frame) => headersOf(frame).biz_rt
   && JSON.parse(Buffer.from(frame.find(([n]) => n === 8)[1]).toString()).code === 200).length === 4)
+
+// Different conversations may overtake one another; the owner's own three arrivals remain ordered.
 
 // Said while the connection was down: only in the history. The catch-up (every 15 s) finds it, and nothing twice.
 lark.say(lark.message('om_5', 'oc_owner', 'text', { text: '刚才断网时说的' }), { missed: true })

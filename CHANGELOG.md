@@ -1,5 +1,59 @@
 # Changelog
 
+## 2026-11-10 — Validate and release the reviewed runtime
+
+- Keep the channel integration checks aligned with per-conversation ordering while retaining exact message counts, uniqueness and attachment checks. Supply the optional service lookup in the review-health host fixture.
+- Release validation: Core 1415 passed / 1 skipped, 10 Node checks, 113 integration checks across nine suites, 11 targeted checks, type checking and build passed. Four Core checks blocked by the local sandbox passed when rerun with loopback access; two integration fixtures were corrected and their suites rerun.
+- An isolated snapshot of the running installation's actual memory, persona and model configuration passed native recall/chat checks and structured tool calls through all four configured model routes. Private data and credentials remain outside version control. No test messages were sent to contacts.
+- Preserve the installation's existing provider definitions and runtime data; clean-export placeholder endpoints are not deployment configuration. A 32K context with 16K output and 16K compaction headroom still needs a smaller output reservation or a different chat model.
+
+## 2026-11-10 — Fixes from an independent review
+
+- A helper's approval answered in chat is the one the owner was told about, by its number: one already decided or stopped is never answered as another.
+- A platform arrival is kept as it came until her mind has taken it in, and tried again each minute for a day: a failed intake no longer loses a message the platform will not send twice.
+- Paragraphs sent as she wrote: a message written again takes back whatever of the old attempt had not gone, so nothing of it follows the final reply; only words a platform accepted are told to her as said; after a restart, a half that went out is told to her once.
+- Taking back a wait someone asked for releases the relays held for it at the next minute: the wait is read when a relay might go, not stored on it.
+- A held reply goes back to its conversation before its wish is settled, and stays held while the conversation cannot be reached.
+- Messages held to be answered with the next one are kept per conversation.
+- A resident Core process that exits answers only the requests asked of it; a timed-out request restarts only the process it was asked of.
+- Recall receipts are completed: a block of memories is taken up with Core before it is shown and acknowledged once the session has kept it, so the same memory is no longer offered every turn.
+- Frozen by the owner, her routines rest in DSH and resume on the thaw, and a turn of her own passes nothing on; a conversation still does.
+- Her heartbeat tries a failed start-up recovery again (a minute later, then up to ten apart) and a failed day's review after fifteen minutes; a review that finished while she began replying starts no further round.
+- Feishu: a connection closed while its address was being asked for is not opened afterwards; a cut or endless protobuf frame is refused instead of read for ever; each chat is taken in its own order, so one chat's download holds up no other.
+- A voice request that timed out lets go of its worker at once: the next request starts its own and is answered only by it.
+- Recall as she reads it: her standing state besides her mood is shown (the owner's habits with her, her traits, the owner's corrections), said once like her mood and again when it changes; an item of a shape not read here gives its words instead of nothing; a dream is marked as one; when Core could not fit everything related she is told this is not all of it.
+- Deletion reaches the recall blocks already in her conversations: each block records the memories and sources it rests on, Core is asked as a turn starts which of them are gone, and her lanes leave such a block out of every request, summaries included.
+- A finished compaction is told to Core at once and the next recall waits for it; a recall receipt is given again in log order when the turn settles, so one that failed is not lost.
+- Her lanes report the output their routes reserve, and her presets set compaction's headroom to 16,384 tokens, so a 32K or 64K model can compact instead of being refused.
+- Her page: the chat box keeps what was typed until a message is actually taken; a slower earlier request no longer overwrites a newer page; each form submits once at a time and clears only the draft it sent (reminders, marked days, diary replies, sealing a letter, memory corrections); a saved persona becomes the baseline to compare against; a reply already committed is not drawn again from its live rows while a tool runs.
+- Edges of the fixes above: when the owner changes someone's account or a group's chat, the conversation held under the old one keeps its history and is a place to send nothing (a reply, a reminder, a relay, a contact), what waited to go there is cancelled and settled, and it is a place again once someone the directory knows speaks there; a burst her mind has is tried again each minute until her session takes it, and a burst or held reply her session took is given to her once however often keeping it on disk fails; her routines follow the freeze as it stands, one change at a time, so a thaw close behind a freeze leaves them running; closing the plugin ends the heartbeat's start retry and the conversations' retries; of words sent mid-writing that never became a message, only those a platform accepted join her memory as said, and an unsure one is told to her as unsure.
+- A later pass of the same review: a summary DSH wrote of a conversation rests on what the recall blocks it replaced did (read from the session log), and one written before a deletion among them was learned of is no longer sent to a model, while one written afterwards is; what was learned deleted, and when, is kept in `erased.json`, and Core is asked before a step's compaction rather than after it. Her standing state counts as shown once the session has kept its block, so a turn stopped early shows it again. A closed Feishu or WeChat connection hands over and writes nothing more, and Feishu marks a message seen when it is handed over rather than when its download starts. A helper's ending that could not reach her memory or the conversation that asked stays owed on the work and is tried again each minute, for a day. A chat message turned down after newer words were typed comes back above them. An incomplete recall says so even when none of it was shown, and stopping no longer waits on a model's facts that never come.
+- Verification: type checking, the plugin build and the three targeted regression scripts (11 checks: stray words and restart recovery joined the paragraph check, kept arrivals are new) passed. Each of the 43 reviewed cases was exercised on the real sources with synthetic platforms, processes and timers; the recall receipts against a real Core. Core is unchanged in this entry. The DSH end-to-end suites were not run.
+
+## 2026-11-10 — Dated wakes, days and routines on her calendar, approvals in chat, paragraph sends, a wait when asked
+
+- Core: a sealed letter or diary that opened, a concern whose time to come up again arrived, and a day that is an anniversary of a shared moment each wake her idle review once, only with their settings on; whether to say anything stays hers. Add the read-only resident action `anniversaries` for a range of days.
+- Her calendar: a stretch of days can be marked by the owner on the page or by her with `kin_calendar_mark` (a trip, an exam week), lies across its days, and is told to her at the start of each turn while it lasts; `kin_routine` gives her repeating things of her own, run in her own conversation; anniversaries show on their dates; any item can be taken into the chat box.
+- A helper's waiting approval can be answered by the owner in the conversation in his own words: she answers for him with `kin_work_answer`, only on a turn whose latest words are the owner's, one approval at a time, the one she was told about; DSH's prompt still works and whichever answers first withdraws the other.
+- `kin_quiet`: someone who asks her to leave them be until a time hears nothing she starts or passes on until then; replies go as usual, and a reminder still starts its turn with that fact in view. The owner can take the wait back on her page.
+- On WeChat and Feishu a reply goes out paragraph by paragraph as she writes it, still one delivery per message; a message written again after a broken attempt sends only what differs, and words that went out without becoming a message are told to her as said.
+- Receipts and retries of what she already sent run every minute even while she is replying, each behind whatever waits to go in its conversation.
+- Desktop chat box: voice input through her local transcription (`/api/kin/hear`), pictures open large, and the calendar can prefill a line.
+- Verification: type checking, the plugin build and the three targeted regression scripts (10 checks, one new for paragraph sends) passed. Core: the 4 new tests passed; the one full run gave 1395 passed, 1 skipped and 20 failed, all 20 in compression and token-budget tests that need the token encoding in the test cache and fail the same on the unchanged source in the borrowed environment. The DSH end-to-end suites were not run for this entry.
+
+## 2026-11-10 — Mid-turn messages, her calendar, chat attachments and helper teams
+
+- Deliver what is said while Kin is busy at her next step instead of after the whole turn: channel bursts and the desktop chat box use DSH steering, as the old host did, and recall and intake follow such a step. The owner's 20-second burst wait is unchanged.
+- Queue platform arrivals per chat, so one voice transcription no longer holds up other chats; run another person's review in a lane of its own, so receipts and retries do not wait behind it.
+- Give a chat route that has a fallback 20 seconds to start answering; a route that just failed waits five minutes behind the others and stays shown as failed.
+- Add a reply timeline to her health card: burst wait, wait for her turn, recall, first word and platform arrival of her latest replies.
+- Add her calendar page and the `kin_calendar` tool over one gathering: reminders, held replies, quiet-hour deliveries, letters, timed plan steps, open plans, wishes, helper work and agreed things, and what past days held. A reminder the owner leaves on the page joins her memory as the owner's words; her reviews see the next two days of it.
+- Let the desktop chat box send pictures and files, and name them in her memory.
+- Tell her when a helper has waited for the owner's approval; brief her on handed-out work as each turn starts; add `kin_delegate` `team` over DSH Agent Teams. The `kin-crew` preset ships disabled until tried on a running DSH.
+- For a turn nobody started (a reminder, word of her helpers), tell her when and where the person last spoke and whether her page is open; `kin_tell` may name the place (`via`), and no longer waits on its own turn when aimed at the conversation she is in.
+- Stop model routes jittering while dragged; nudge her review after a diary reply; name platforms in Chinese in her context.
+- Verification: type checking, the plugin build and the three targeted regression scripts (9 checks) passed. Core is unchanged. Core tests and the DSH end-to-end suites were not run for this entry.
+
 ## 2026-11-09 — Complete per-person review targets
 
 - Give per-person reviews the same validated recipient routes and agendas as the main heartbeat, while retaining the original person and conversation.

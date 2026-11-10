@@ -111,6 +111,8 @@ export function health(host: Host) {
       lastMinute: heartbeat.lastMinute ?? null,
     },
     worker: mind.memoryWorker,
+    // Where the time of her latest replies went (timeline.ts).
+    replies: host.timeline.list(),
   })
 
   host.route('/api/kin/health', { GET: async () => view() })
@@ -128,6 +130,8 @@ export function health(host: Host) {
         state.frozen = frozen ? { since: new Date().toISOString() } : null
         heartbeat.freeze(frozen)
         host.save('health.json', state)
+        // The routines she set herself are DSH's to start, not her heartbeat's: they rest and resume with it.
+        void host.ctx.get('kinCalendar')?.rest()
         host.log(frozen ? 'frozen by the owner: her heartbeat and memory worker rest' : 'thawed by the owner')
       }
       return view()

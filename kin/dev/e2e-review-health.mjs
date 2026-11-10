@@ -35,7 +35,7 @@ const mind = {
   async run(action, args) { if (action === 'companion-targets') return realMind.run(action, args); if (action === 'review') { reviewArgs = args; reviewDue = false; return { state: 'waiting' } } return {} },
   keepWorker() {},
 }
-const reaching = new Reaching({ mind, conversations: () => conversations }, () => directory, () => ({}), (id) => activities[id] ?? {}, () => {}, {}, {})
+const reaching = new Reaching({ ctx: { get: () => undefined }, mind, conversations: () => conversations }, () => directory, () => ({}), (id) => activities[id] ?? {}, () => {}, {}, {})
 const beat = new Heartbeat(mind, () => false, () => {}, 1, () => reaching.reviewTargets())
 try {
   await assert.rejects(realMind.call('companion-targets', { routes: {} }), /not-a-resident-action/)
@@ -43,7 +43,7 @@ try {
   for (let i = 0; i < 1000 && !reviewArgs && beat.beats.review?.state !== 'failed'; i++) await new Promise((r) => setTimeout(r, 10))
   assert.notEqual(beat.beats.review?.state, 'failed', beat.beats.review?.reason)
   assert(reviewArgs, 'main review reached after real host agenda expansion')
-  const own = new Reaching({ mind: {
+  const own = new Reaching({ ctx: { get: () => undefined }, mind: {
     call: async () => ({ action: true }),
     run: async (action, args) => {
       if (action === 'companion-targets') return realMind.run(action, args)

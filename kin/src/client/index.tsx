@@ -1,7 +1,9 @@
 /** Browser half: KIN's sidebar entry and her page (chat, little world, settings). */
 import type { Context } from '@deepseek-ai/cordis'
 import healthCss from './health.css'
+import calendarCss from './calendar.css'
 import channelsCss from './channels.css'
+import chatCss from './chat.css'
 import contactCss from './contact.css'
 import css from './kin.css'
 import stewardCss from './steward.css'
@@ -9,7 +11,7 @@ import talkCss from './talk.css'
 import { createPage } from './Page.js'
 
 /** Her stylesheets: the page's own, then one per feature (each feature imports its own .css and adds it here). */
-const STYLES = [css, healthCss, channelsCss, talkCss, stewardCss, contactCss]
+const STYLES = [css, healthCss, channelsCss, talkCss, stewardCss, contactCss, chatCss, calendarCss]
 
 export const name = 'kin-client'
 export const inject = ['slots', 'sessions']

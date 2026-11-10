@@ -3,7 +3,9 @@
  * - `kin/chat`: her replies in conversation, where feeling matters.
  * - `kin/task`: everything else she does — helpers, exploration, reviews and background work.
  * A call tries its lane's routes in order and moves on while a route has not started answering:
- * an error, or no first chunk within a minute. Once a route answers it keeps the turn.
+ * an error, or no first chunk in time (a minute; twenty seconds for a chat route with another behind it,
+ * since someone is waiting). Once a route answers it keeps the turn. A route that just failed is tried
+ * after the others for a few minutes, so a route that is down does not cost every reply its wait.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
 import { answerText, modelOutput } from './model-output.js'
@@ -12,12 +14,15 @@ import {
   LlmAdapter, ReasoningEffortId, type GenerateOptions, type LlmFailure, type LlmResolvedModelInfo, type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
+import type {} from '@deepseek-ai/dsh-compaction'
 
 export const PROVIDER = 'kin'
 export const LANES = ['chat', 'task'] as const
 export type Lane = (typeof LANES)[number]
 const NAMES: Record<Lane, string> = { chat: 'KIN 聊天', task: 'KIN 做事' }
 const FIRST_CHUNK_MS = 60_000
+const CHAT_FIRST_CHUNK_MS = 20_000
+const COOL_MS = 5 * 60_000
 
 export interface Route {
   provider: string
@@ -38,6 +43,20 @@ const laneOf = (model: string): Lane => (model === 'task' ? 'task' : 'chat')
 export class KinModel extends LlmAdapter {
   readonly last: Partial<Record<Lane, LastCall>> = {}
   private readonly light = new Map<string, Promise<string | undefined>>()
+  /** Routes that failed lately: why, and until when they wait behind the others. */
+  private readonly cooling = new Map<string, { until: number; reason: string }>()
+  /**
+   * Memories and sources deleted since she was shown them, and when that was learned (preset.ts asks Core as each
+   * turn starts; index.ts keeps the list): a block of her context that rests on one is not sent to a model again,
+   * in a reply or in a summary of the conversation.
+   */
+  readonly erased = new Map<string, number>()
+  /**
+   * What each summary of a conversation (a DSH compaction, by its id) rests on, and when its writing began
+   * (preset.ts reads both from the session log). One written before a deletion among these was learned of
+   * carries the deleted words and is not sent again either; one written after was made without them.
+   */
+  readonly summaries = new Map<string, { at: number; rests: Set<string> }>()
 
   constructor(private readonly ctx: Context, private readonly configured: (lane: Lane) => Route[]) {
     super()
@@ -81,12 +100,16 @@ export class KinModel extends LlmAdapter {
     const lane = laneOf(model)
     const settled = await Promise.allSettled(this.routes(lane).map((route) => this.ctx.llm.resolveModelInfo(route.provider, route.model, signal)))
     const infos = settled.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []))
-    const windows = infos.flatMap((info) => (info.context ? [info.context.contextWindow] : []))
+    const sized = infos.flatMap((info) => (info.context ? [{ window: info.context.contextWindow, output: info.defaultMaxTokens ?? 0 }] : []))
     const images = infos.length > 0 && infos.every((info) => info.inputModalities?.includes('image'))
+    // What a request leaves for the conversation is its route's window less the output that route reserves:
+    // the lane says the smallest window and, as its own reservation, what makes the smallest such room.
+    const window = Math.min(...sized.map((route) => route.window))
+    const reserved = window - Math.min(...sized.map((route) => route.window - route.output))
     return {
       provider: PROVIDER, id: lane, name: NAMES[lane],
       inputModalities: images ? ['text', 'image'] : ['text'],
-      ...(windows.length ? { context: { contextWindow: Math.min(...windows) } } : {}),
+      ...(sized.length ? { context: { contextWindow: window }, ...(reserved > 0 ? { defaultMaxTokens: reserved } : {}) } : {}),
     }
   }
 
@@ -94,6 +117,14 @@ export class KinModel extends LlmAdapter {
     const lane = laneOf(options.model)
     // Older sessions can already contain the relay envelope. Do not feed it back as spoken dialogue.
     const messages = options.messages.map((message) => {
+      // A block of her context that rests on something deleted since: its words are not sent again.
+      if (message.role === 'user' && message.source?.kind === 'kin-context' && message.source.rests?.some((id) => this.erased.has(id))) {
+        return { ...message, content: [{ type: 'text' as const, text: '（这里原来有一段你想起来的事，其中有后来被删掉的内容，已经撤下。）' }] }
+      }
+      const summary = message.role === 'user' && message.source?.kind === 'compact-checkpoint' ? this.summaries.get(message.source.compactionId) : undefined
+      if (summary && [...summary.rests].some((id) => (this.erased.get(id) ?? 0) >= summary.at)) {
+        return { ...message, content: [{ type: 'text' as const, text: '（这里原来是前面对话的摘要，其中有后来被删掉的内容，已经撤下；前面说过的事，需要时用 kin_recall 找。）' }] }
+      }
       if (message.role !== 'assistant') return message
       const content = message.content.map((block) => block.type === 'text' ? { ...block, text: answerText(block.text) } : block)
       if (content.every((block, i) => block.type !== 'text' || block.text === (message.content[i] as { text: string }).text)) return message
@@ -101,16 +132,25 @@ export class KinModel extends LlmAdapter {
     })
     const failed: LastCall['failed'] = []
     let failure: LlmFailure | undefined
-    for (const route of this.routes(lane)) {
+    const key = (route: Route) => route.provider + '/' + route.model
+    const cool = (route: Route) => (this.cooling.get(key(route))?.until ?? 0) > Date.now()
+    const routes = this.routes(lane)
+    const order = [...routes.filter((route) => !cool(route)), ...routes.filter(cool)]
+    for (const [index, route] of order.entries()) {
       if (options.signal?.aborted) return
       const attempt = new AbortController()
       const stop = () => attempt.abort()
       options.signal?.addEventListener('abort', stop, { once: true })
-      const timer = setTimeout(stop, FIRST_CHUNK_MS)
+      const patience = lane === 'chat' && index < order.length - 1 ? CHAT_FIRST_CHUNK_MS : FIRST_CHUNK_MS
+      const timer = setTimeout(stop, patience)
       const held: StreamChunk[] = []
       let answering = false
       failure = undefined
-      const effort = await this.effortOf(lane, route)
+      // A model's own facts that never come are not waited on past a stop or this route's patience.
+      const effort = await Promise.race([
+        this.effortOf(lane, route),
+        new Promise<undefined>((resolve) => attempt.signal.addEventListener('abort', () => resolve(undefined), { once: true })),
+      ])
       try {
         for await (const chunk of modelOutput(this.ctx.llm.stream({
           ...options, messages, provider: route.provider, model: route.model, signal: attempt.signal,
@@ -149,10 +189,15 @@ export class KinModel extends LlmAdapter {
         return
       }
       if (!failure) {
-        this.last[lane] = { at: new Date().toISOString(), answered: route, failed }
+        this.cooling.delete(key(route))
+        // A route still waiting its minutes out was not tried this time; her page keeps saying why.
+        const resting = order.slice(index + 1).filter(cool).map((route) => ({ route, reason: this.cooling.get(key(route))!.reason }))
+        this.last[lane] = { at: new Date().toISOString(), answered: route, failed: [...failed, ...resting] }
         return
       }
-      failed.push({ route, reason: attempt.signal.aborted ? '一分钟没有回应' : describe(failure) })
+      const reason = attempt.signal.aborted ? `${patience / 1000} 秒没有回应` : describe(failure)
+      this.cooling.set(key(route), { until: Date.now() + COOL_MS, reason })
+      failed.push({ route, reason })
     }
     this.last[lane] = { at: new Date().toISOString(), answered: null, failed }
     yield {

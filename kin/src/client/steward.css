@@ -10,6 +10,27 @@
 .kin-work[data-state="running"] .kin-tag { background: var(--kin-accent); color: #fff; }
 .kin-work .kin-btn { flex: none; }
 
+/* A team at work: its members as small glass pills, its task board as a quiet checklist. */
+.kin-crew { margin-top: 8px; }
+.kin-crew-members { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+.kin-crew-member {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 10px 2px 8px; border-radius: 999px;
+  color: var(--kin-ink-2); background: var(--kin-fill-2); box-shadow: inset 0 1px 0 var(--kin-rim);
+}
+.kin-crew-member i { width: 6px; height: 6px; border-radius: 50%; background: var(--kin-ink-3); }
+.kin-crew-member[data-status="running"] { color: var(--kin-ink); }
+.kin-crew-member[data-status="running"] i { background: var(--kin-rose); animation: kin-crew-beat 1.8s var(--kin-ease) infinite; }
+.kin-crew-member[data-status="provisioning"] i { background: var(--kin-lilac); }
+.kin-crew-member[data-status="failed"] { text-decoration: line-through; }
+.kin-crew-tasks { list-style: none; margin: 8px 0 0; padding: 0; }
+.kin .kin-crew-tasks li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; border: 0; font-size: 12.5px; line-height: 1.6; color: var(--kin-ink-2); }
+.kin-crew-tasks li::before { content: ""; flex: none; align-self: center; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--kin-ink-3); }
+.kin-crew-tasks li[data-status="in_progress"]::before { border-color: var(--kin-rose); background: radial-gradient(circle, var(--kin-rose) 0 2px, transparent 2.5px); }
+.kin-crew-tasks li[data-status="completed"]::before { border-color: transparent; background: var(--kin-accent); }
+.kin-crew-tasks li[data-status="completed"] .kin-crew-task { color: var(--kin-ink-3); text-decoration: line-through; }
+.kin-crew-task { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kin-crew-tasks .kin-dim { flex: none; }
+
 .kin-outing { display: flex; align-items: center; gap: 14px; }
 .kin-outing-main { flex: 1; min-width: 0; }
 .kin-outing-main p { margin: 0; }
@@ -24,11 +45,12 @@
   0% { box-shadow: 0 0 0 0 rgb(226 119 159 / .5); }
   70%, 100% { box-shadow: 0 0 0 10px rgb(226 119 159 / 0); }
 }
+@keyframes kin-crew-beat { 50% { opacity: .3; } }
 @container kin-right (max-width: 430px) {
   .kin-work, .kin-outing { flex-wrap: wrap; }
   .kin-work .kin-btn, .kin-outing .kin-btn { margin-left: auto; }
 }
-@media (prefers-reduced-motion: reduce) { .kin-outing-dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .kin-outing-dot, .kin-crew-member i { animation: none; } }
 
 /* 帮手的权限: a row per mode, the chosen one's dot filled like a switch that is on. */
 .kin-choice { width: 100%; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer; }

@@ -38,6 +38,8 @@ export interface Held {
   reason: string
   at: string
   due: string
+  /** Its conversation already has it back; only Core's wish is left to settle. */
+  handed?: true
 }
 
 export interface Talk {
@@ -57,16 +59,11 @@ export function talk(host: Host) {
   const { ctx, mind } = host
   const held = host.load<Held[]>('replies.json', [])
 
-  // A note to her, read with the next thing said to her in that conversation (or, with `now`, at once).
-  const tell = async (sessionId: string, text: string, now = false) => {
+  /** One of her conversations' agents; a conversation that cannot be reached throws. */
+  const agentOf = async (sessionId: string) => {
     const resolved = await ctx.get('sessionController')!.resolveAgent(sessionId as SessionId)
-    if (!('agent' in resolved)) return host.log(`cannot reach conversation ${sessionId}: ${JSON.stringify(resolved.error)}`)
-    const message = createUserMessage({
-      content: [{ type: 'text', text }],
-      source: { kind: 'kin-context', form: 'snapshot', sections: [{ name: 'kin-context', text }] },
-    })
-    if (now) resolved.agent.followup(message)
-    else resolved.agent.inject(message)
+    if (!('agent' in resolved)) throw new Error(`cannot reach conversation ${sessionId}: ${JSON.stringify(resolved.error)}`)
+    return resolved.agent
   }
 
   ctx.provide('kinTalk', {
@@ -83,6 +80,8 @@ export function talk(host: Host) {
 
   // When a held reply's time comes, it goes back into its conversation, unless she has since let the wish go
   // (or a contact attempt took it up). Core's wish for it is then fulfilled, so nothing sends it a second time.
+  // The conversation has it first: one that cannot be reached leaves the reply held and the wish open, and is
+  // tried again next minute; `handed`, noted the moment the conversation has it, keeps a second try from putting it there twice.
   host.heartbeat.every('replies', async () => {
     // At the dev pace (index.ts `pace`) the wait Core set passes faster too.
     const due = held.filter((reply) => Date.parse(reply.at) + host.ms(Date.parse(reply.due) - Date.parse(reply.at)) <= Date.now())
@@ -91,13 +90,23 @@ export function talk(host: Host) {
     for (const reply of due) {
       const wish = (state.desires as { id: string; status: string }[]).find((desire) => desire.id === reply.desireId)
       if (wish && ['wanted', 'waiting'].includes(wish.status)) {
+        const agent = await agentOf(reply.sessionId)
+        if (!reply.handed) {
+          const text = `（${stamp(reply.at)}，你想晚点再回这条：「${reply.text}」——当时想的是：${reply.reason}。`
+            + '现在可以接着回了；已经不必回的话，用 kin_reply 选不回。）'
+          agent.followup(createUserMessage({
+            content: [{ type: 'text', text }], source: { kind: 'kin-context', form: 'snapshot', sections: [{ name: 'kin-context', text }] },
+          }))
+          reply.handed = true
+          host.save('replies.json', held)
+        }
+        // Kept by its session before the wish is settled: a failure here is tried again without handing it twice.
+        await ctx.get('sessions')?.flush(agent.session)
         const done = await mind.call('chat-tool', { name: 'manage_desire', arguments: { request: {
           command_id: 'reply-later:' + reply.inputId, agent_version: state.agent_version, expected_revision: state.revision,
           action: 'complete', desire_id: reply.desireId, evidence_ids: [reply.sourceId], reason: '回到原来的对话里接着回',
         } } })
         if (done.isError) throw new Error(done.content[0].text)
-        await tell(reply.sessionId, `（${stamp(reply.at)}，你想晚点再回这条：「${reply.text}」——当时想的是：${reply.reason}。`
-          + '现在可以接着回了；已经不必回的话，用 kin_reply 选不回。）', true)
       }
       held.splice(held.indexOf(reply), 1)
       host.save('replies.json', held)

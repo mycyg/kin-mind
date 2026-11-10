@@ -1,18 +1,19 @@
 /**
  * 此刻: how she is right now. Up top the feeling that stands out most, in a big number; the rest of
  * her heart at a glance; what she last made of things, in her own words, and when she means to
- * think again; what is on her mind and what she wants.
+ * think again; what is left of today on her calendar; what is on her mind and what she wants.
  */
 import { useState } from 'react'
 import { activeWish, openConcern, type Beat, type Dimension, type Home } from './api.js'
+import { Today } from './Calendar.js'
 import { Contact } from './Contact.js'
 import { HealthNote } from './Health.js'
 import { Waves } from './icons.js'
 import { ago, soon } from './time.js'
-import { CONCERN_KINDS, Wishes } from './World.js'
+import { CONCERN_KINDS, Wishes, type Place } from './World.js'
 import { Work } from './steward/Work.js'
 
-export function Now({ home, error }: { home: Home | undefined; error?: string }) {
+export function Now({ home, error, go }: { home: Home | undefined; error?: string; go: (place: Place) => void }) {
   const [all, setAll] = useState(false)
   if (!home) {
     return <div className="kin-scroll"><p className="kin-quiet kin-center">{error ? `她的心智还没醒来：${error}` : '正在看她此刻的样子…'}</p></div>
@@ -67,6 +68,7 @@ export function Now({ home, error }: { home: Home | undefined; error?: string })
         </article>
       ) : null}
 
+      <Today open={() => go('calendar')} />
       <section className="kin-card">
         <h3 className="kin-card-title">心事</h3>
         {concerns.length ? (

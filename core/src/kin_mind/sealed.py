@@ -27,7 +27,8 @@ opened entry is a source like any other and goes as one.
 **On its day** the entry becomes the source it would have been: a letter as the owner's own explicit
 words (extracted and indexed then), a diary as the kin-reflection it would have been, resting on what
 it was written from (`derived_from`). The row keeps its dates and the source id, and nothing else.
-`opened` tells an assessment, as a fact, which entries opened lately; whether to mention one is Kin's.
+`opened` tells an assessment, as a fact, which entries opened lately, and each one opened wakes one
+review that reads it (actions._due_reviews); whether to mention one is Kin's.
 
 `sealed_entries` (memory setting, off by default) decides whether anything can be sealed and whether
 an assessment is told about sealed entries. An entry already sealed opens on its day whatever it says.

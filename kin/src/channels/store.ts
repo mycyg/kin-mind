@@ -26,11 +26,18 @@ export interface State {
 /** A transport's own state file in her data dir, written whole (a temporary file, then a rename). */
 export class Store<T extends State> {
   readonly value: T
+  private closed = false
   constructor(private readonly file: string, empty: T) {
     this.value = existsSync(file) ? { ...empty, ...JSON.parse(readFileSync(file, 'utf8')) } : empty
   }
 
+  /** Its transport was closed: it writes nothing more. The transport opened after it reads this file and owns it. */
+  close() {
+    this.closed = true
+  }
+
   save() {
+    if (this.closed) return
     const now = Date.now()
     // Nothing comes back after two days (Feishu's catch-up reaches one day back); receipts are kept a week.
     for (const [id, at] of Object.entries(this.value.seen)) if (now - at > 2 * DAY) delete this.value.seen[id]

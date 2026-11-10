@@ -10,6 +10,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startBridge, writeModelFile, type Bridge } from './bridge.js'
+import { calendar } from './calendar.js'
 import { channels } from './channels/index.js'
 import type { Address } from './channels/transport.js'
 import { contact } from './contact/index.js'
@@ -22,6 +23,7 @@ import { KIN, memoriesOf, RECALL, type Dimension } from './render.js'
 import { DEFAULT_PERSONA, personaText } from './persona.js'
 import { steward } from './steward/index.js'
 import { talk } from './talk/index.js'
+import { Timeline } from './timeline.js'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -51,6 +53,16 @@ export interface Kin {
   replying(sessionId: string, running: boolean): void
   /** Something new was said: the heartbeat looks again now rather than at its next minute. */
   nudge(): void
+  /** Where the time of her replies goes, for her health page. */
+  readonly timeline: Timeline
+  /** When the owner last had her page open and in front (it asks for her state only then); 0 when not yet in this run. */
+  seen(): number
+  /** Memories and sources found deleted since she was shown them, and when: her lanes leave out the context blocks that rest on them. */
+  readonly erased: ReadonlyMap<string, number>
+  /** Core says these are deleted: kept with the moment it was learned, across restarts. */
+  forgot(ids: readonly string[]): void
+  /** What each summary of a conversation rests on and when its writing began (models.ts `summaries`). */
+  readonly summaries: Map<string, { at: number; rests: Set<string> }>
 }
 
 /**
@@ -70,10 +82,17 @@ export interface Host {
   readonly ready: Promise<void>
   /** Whether one of her conversations is in the middle of a reply. */
   replying(): boolean
+  /** Where the time of her replies goes, for her health page. */
+  readonly timeline: Timeline
   /** The DSH session of one of her conversations ('app', 'wechat:<chat>', …), opened on first use. */
   conversation(key: string, options: Omit<Conversation, 'sessionId'> & { title: string }): Promise<Conversation>
   /** Her conversations so far, by key. */
   conversations(): Readonly<Record<string, Conversation>>
+  /**
+   * A platform chat that is no longer whose it was (the owner changed that account or chat): it keeps its
+   * session and what was said, and is a place to reach no one until someone the directory knows speaks there again.
+   */
+  leave(key: string): void
   /** Her persona as the model reads it; saving one applies from her next reply, Core's copy included. */
   persona(): string
   savePersona(text: string): Promise<void>
@@ -110,7 +129,7 @@ export interface Scope {
 type Handler = (request: Request) => Promise<unknown>
 
 /** Her feature modules, each applied once with the host. */
-const MODULES: ((host: Host) => void)[] = [channels, health, talk, steward, contact]
+const MODULES: ((host: Host) => void)[] = [channels, health, talk, steward, contact, calendar]
 
 export interface Config {
   dataDir: string
@@ -157,12 +176,16 @@ export function apply(ctx: Context, config: Config) {
   // KIN's conversations ask for `kin/chat` (preset.ts) and her helpers for `kin/task` (cordis.patch.yml);
   // this is where each walks its own route list.
   const model = new KinModel(ctx, (lane) => routes[lane] ?? [])
+  // Deletions learned in an earlier run still hold: when each was learned says which summaries were written before it.
+  for (const [id, at] of Object.entries(load<Record<string, number>>('erased.json', {}))) model.erased.set(id, at)
   ctx.llm.registerAdapter([PROVIDER], model)
 
   // Core's own model calls (reviews, diary, dreams, memory work) come back to the task lane through here.
   const bridge = startBridge(ctx, log)
   ctx.effect(() => () => bridge.close(), 'kin model bridge')
   const replying = new Set<string>()
+  const timeline = new Timeline()
+  let seen = 0
   const heartbeat = new Heartbeat(mind, () => replying.size > 0, log, config.pace,
     async () => ctx.get('kinContact')?.reviewTargets() ?? {})
   ctx.effect(() => () => heartbeat.close(), 'kin heartbeat')
@@ -187,8 +210,8 @@ export function apply(ctx: Context, config: Config) {
   const opening = new Map<string, Promise<Conversation>>()
   const conversation: Host['conversation'] = (key, { title, ...entry }) => {
     if (sessions[key]) {
-      // Whose chat it is follows the owner's directory, which may change.
-      if (entry.recipient !== sessions[key].recipient) {
+      // Whose chat it is follows the owner's directory, which may change; a chat that was left is one again once someone it knows speaks there.
+      if (entry.recipient !== sessions[key].recipient || (entry.address && !sessions[key].address)) {
         sessions[key] = { ...sessions[key], ...entry }
         save('sessions.json', sessions)
       }
@@ -253,6 +276,15 @@ export function apply(ctx: Context, config: Config) {
       else replying.delete(sessionId)
     },
     nudge: () => heartbeat.nudge(),
+    timeline,
+    seen: () => seen,
+    erased: model.erased,
+    forgot(ids) {
+      if (!ids.length) return
+      for (const id of ids) model.erased.set(id, Date.now())
+      save('erased.json', Object.fromEntries(model.erased))
+    },
+    summaries: model.summaries,
   } satisfies Kin)
 
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
@@ -276,6 +308,8 @@ export function apply(ctx: Context, config: Config) {
   // 此刻: how she is, what is on her mind, what she wants, and the conversation with her.
   route('/api/kin/home', {
     GET: async () => {
+      // Her page asks only while it is open and in front (client/api.ts), so asking is the owner being there.
+      seen = Date.now()
       const [overview, read, liveness, plans] = await Promise.all([
         mind.call('state-overview', { query: '' }), mind.call('read'), mind.call('liveness-facts'), mind.call('autonomous-plans', { status: 'active' }),
       ])
@@ -295,7 +329,10 @@ export function apply(ctx: Context, config: Config) {
   route('/api/kin/diary/reply', {
     POST: async (request) => {
       const { reflection_id, text } = await body<{ reflection_id: string; text: string }>(request)
-      return mind.call('diary-reply', { reflection_id, text, command_id: randomUUID() })
+      const answer = await mind.call('diary-reply', { reflection_id, text, command_id: randomUUID() })
+      // What the owner wrote under her diary is hers to read now, not at the next minute.
+      heartbeat.nudge()
+      return answer
     },
   })
   route('/api/kin/dreams', { GET: () => mind.call('dreams', { limit: 30 }) })
@@ -401,7 +438,13 @@ export function apply(ctx: Context, config: Config) {
   })
 
   const host: Host = {
-    ctx, config, mind, heartbeat, model, bridge, ready, replying: () => replying.size > 0, conversation, conversations: () => sessions,
+    ctx, config, mind, heartbeat, model, bridge, ready, replying: () => replying.size > 0, timeline, conversation, conversations: () => sessions,
+    leave(key) {
+      if (!sessions[key]?.address) return
+      const { address: _left, ...kept } = sessions[key]
+      sessions[key] = kept
+      save('sessions.json', sessions)
+    },
     persona: () => personaText(persona), savePersona, route, body, file, load, save, log, ms: (duration) => duration * config.pace,
     introduce(next) {
       people = next

@@ -34,6 +34,8 @@ export function createPage(ctx: Context) {
     const [section, setSection] = useState<Section>('chat')
     const [place, setPlace] = useState<Place>()
     const [chatId, setChatId] = useState<string>()
+    // A line for her composer to start with (the calendar's 和她说说); a new id each time, so the same line can come again.
+    const [seed, setSeed] = useState<{ text: string; id: number }>()
     useSheen(root)
     const active = useWindowActive()
 
@@ -50,6 +52,13 @@ export function createPage(ctx: Context) {
     // Side by side, the chat is always there and the dock picks what sits beside it.
     const shown: Section = !narrow && section === 'chat' ? 'now' : section
     const open = (next: Section) => glide(() => { setSection(next); setPlace(undefined) })
+    // 此刻 leads into a place of her little world.
+    const visit = (next: Place) => glide(() => { setSection('world'); setPlace(next) })
+    // Into her chat with a line begun; on a narrow pane the chat is a place of its own, so it comes to the front.
+    const talk = (text: string) => {
+      setSeed((last) => ({ text, id: (last?.id ?? 0) + 1 }))
+      if (narrow) glide(() => setSection('chat'))
+    }
     const dock = <Dock sections={narrow ? SECTIONS : SECTIONS.slice(1)} current={shown} onPick={open} />
 
     return (
@@ -64,12 +73,12 @@ export function createPage(ctx: Context) {
                 <span>{status}</span>
               </div>
             </header>
-            <Chat sessionId={chatId} warmth={warmth} />
+            <Chat sessionId={chatId} warmth={warmth} seed={seed} />
           </section>
           <main className="kin-right">
             {shown === 'settings' ? <Settings />
-              : shown === 'world' ? <World home={home.data} place={place} go={(next) => glide(() => setPlace(next))} openSettings={() => open('settings')} />
-              : <Now home={home.data} error={home.error} />}
+              : shown === 'world' ? <World home={home.data} place={place} go={(next) => glide(() => setPlace(next))} openSettings={() => open('settings')} talk={talk} />
+              : <Now home={home.data} error={home.error} go={visit} />}
             {narrow ? null : dock}
           </main>
         </div>

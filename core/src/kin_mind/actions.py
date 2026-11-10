@@ -10,6 +10,10 @@ from .state import project
 from . import recipient
 from .model_runtime import verified_decision
 
+# Whether a store's local day has anniversaries, read once a day by this process: the moments are
+# read from every affect event, which is too much for each minute of the day (initiative.moments).
+_ANNIVERSARY_DAY = {}
+
 
 class ActionEvents:
     def __init__(self, mind):
@@ -164,6 +168,36 @@ class ActionEvents:
                     "phase": rhythm.get("phase"), "ended_at": ends.isoformat(),
                     "reason": "The rhythm phase Kin gave has passed its half-life",
                     "evidence_ids": [r["record_id"] for r in rhythm.get("evidence", [])], "agent_version": state["agent_version"]}))
+        # Three dated things wake the idle review a boredom wake is (play.wake), each once, keyed by
+        # what came due, and only with its setting on: a sealed letter or diary that opened, a concern
+        # whose time to come up again arrived, a day that is an anniversary of a shared moment. They
+        # let Kin notice it; whether to say anything stays hers.
+        if settings.get("sealed_entries") is True:
+            from . import sealed
+            for entry in sealed.opened(conn, self.mind.scope.key(), now):
+                queued.append(self.emit(conn, "idle-review", ["sealed", entry["source_id"]], {
+                    "sealed_kind": entry["kind"], "reason": "A sealed " + entry["kind"] + " opened on its day",
+                    "evidence_ids": [entry["record_id"]], "agent_version": state["agent_version"]}))
+        timed = {cid: c for cid, c in (state.get("concerns") or {}).items() if c.get("surface_after")}
+        if timed and settings.get("timed_concerns") is True and self.mind._continuity_flags(conn, state)["concerns"]:
+            from .continuity import low_confidence, timed_entering
+            shown = [{**c, "needs_review": low_confidence(c) or not self.mind._concern_fresh(conn, c)} for c in timed.values()]
+            for cid in timed_entering(conn, self.mind.scope.key(), shown, now):
+                after = timed[cid]["surface_after"]
+                queued.append(self.emit(conn, "idle-review", ["concern", cid, after], {
+                    "concern_id": cid, "surface_after": after,
+                    "reason": "The time Kin gave this concern to come up again has come; whether to raise it stays Kin's",
+                    "evidence_ids": [r["record_id"] for r in timed[cid]["evidence"]], "agent_version": state["agent_version"]}))
+        policy = (state.get("action_policy") or {}).get("evidence") or []
+        if settings.get("anniversaries") is True and policy and self.mind._fresh(conn, policy):
+            from .initiative import anniversaries_today, local_day
+            day, store = local_day(now).isoformat(), (str(self.mind.engine.db.root), self.mind.scope.key())
+            if _ANNIVERSARY_DAY.get(store, (None,))[0] != day:
+                _ANNIVERSARY_DAY[store] = (day, bool(anniversaries_today(conn, self.mind, now)))
+            if _ANNIVERSARY_DAY[store][1]:
+                queued.append(self.emit(conn, "idle-review", ["anniversary", day], {
+                    "day": day, "reason": "Today is an anniversary of a shared moment: a fact of the date, not a reminder, task or reason to contact",
+                    "evidence_ids": [r["record_id"] for r in policy], "agent_version": state["agent_version"]}))
         return queued
 
     def drain(self, jobs):

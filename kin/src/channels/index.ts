@@ -5,8 +5,9 @@
  * received media under `<dataDir>/channels/<id>/`.
  */
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { promisify } from 'node:util'
-import { chmodSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Host } from '../index.js'
 import { Feishu, type FeishuAccount } from './feishu.js'
@@ -89,7 +90,7 @@ export function channels(host: Host) {
     for (const transport of running.values()) void transport.close()
   }, 'kin channels')
 
-  host.ctx.provide('kinTransports', {
+  const transports = {
     get: (id) => running.get(id as Id),
     onInbound(listener) {
       listeners.add(listener)
@@ -116,7 +117,42 @@ export function channels(host: Host) {
     },
     stickers: (words) => stickers(host.file('memes'), words),
     usedSticker: (id) => markUsed(host.file('memes'), id),
-  } satisfies Transports)
+  } satisfies Transports
+  host.ctx.provide('kinTransports', transports)
+
+  // Her chat box's microphone (client/Chat.tsx): whether she can hear here, and one recording heard the way a voice
+  // message is. It waits in <dataDir>/hearing/ only while it is being heard.
+  host.route('/api/kin/hear', {
+    GET: async () => ({ hearing: Boolean(accounts.hearing) }),
+    POST: async (request) => {
+      const bytes = Buffer.from(await request.arrayBuffer())
+      const dir = host.file('hearing')
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const file = join(dir, randomUUID())
+      writeFileSync(file, bytes, { mode: 0o600 })
+      try {
+        // Ogg Opus, WAV and FLAC are read as they are; what else a browser records (WebM, MP4) goes through her voice's ffmpeg first.
+        let heard = file
+        if (!['OggS', 'RIFF', 'fLaC'].includes(bytes.toString('latin1', 0, 4))) {
+          if (!accounts.voice?.ffmpeg) throw new Error('录下的声音得先用 ffmpeg 转一下，可还没设 ffmpeg（在设置的「她的声音」里填）')
+          heard = file + '.wav'
+          await promisify(execFile)(accounts.voice.ffmpeg, ['-nostdin', '-loglevel', 'error', '-i', file, '-ac', '1', '-ar', '16000', heard], { timeout: 60_000 })
+            .catch((error: Error) => {
+              host.log(`a dictation was not converted: ${error.message}`)
+              throw new Error('ffmpeg 没能把这段录音转过来')
+            })
+        }
+        const text = await transports.hear(heard).catch((error: Error) => {
+          host.log(`a dictation was not heard: ${error.message}`)
+          throw new Error('本地听写出了错，再试一次吧')
+        })
+        return { text: text ?? '' }
+      } finally {
+        rmSync(file, { force: true })
+        rmSync(file + '.wav', { force: true })
+      }
+    },
+  })
 
   // Her page: each account's status, never its secret.
   const view = () => {

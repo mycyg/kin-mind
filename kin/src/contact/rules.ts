@@ -36,6 +36,14 @@ export interface Activity {
   reachedDeliveries?: Record<string, string>
   /** Technical failures in a row reaching them, and the latest. */
   failures?: { count: number; at: string }
+  /** They asked her not to come to them until then (kin_quiet): their word, not a rule of the owner's. */
+  quietUntil?: string
+}
+
+/** Until when someone asked her to leave them be, while that still holds. */
+export function asked(activity: Activity | undefined, at = new Date()): Date | undefined {
+  const until = activity?.quietUntil ? new Date(activity.quietUntil) : undefined
+  return until && until > at ? until : undefined
 }
 
 /** Count a confirmed contact once, at its original receipt time, even after a restart or a later failure. */
@@ -48,7 +56,7 @@ export function reached(activity: Activity, id: string, at: string): Partial<Act
 }
 
 /** Why she may not reach out now, or nothing when she may. */
-export type Hold = 'off' | 'proactive-off' | 'not-acquainted' | 'quiet-hours' | 'waiting-for-reply' | 'just-talked' | 'enough-today'
+export type Hold = 'off' | 'proactive-off' | 'not-acquainted' | 'quiet-hours' | 'asked-to-wait' | 'waiting-for-reply' | 'just-talked' | 'enough-today'
 
 /**
  * The rules between one contact and the next; quiet hours and the switch hold everything. Chiming into a
@@ -58,6 +66,7 @@ export function hold(rules: Rules, activity: Activity | undefined, now = new Dat
   if (!rules.enabled) return 'off'
   if (!activity?.heard) return 'not-acquainted'
   if (quiet(rules, now)) return 'quiet-hours'
+  if (asked(activity, now)) return 'asked-to-wait'
   const reached = activity.reached ?? []
   const last = reached.at(-1)
   if (rules.waitForReply && !chime && last && last > activity.heard) return 'waiting-for-reply'

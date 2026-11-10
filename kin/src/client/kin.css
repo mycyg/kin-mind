@@ -333,6 +333,7 @@ body[data-ds-dark-theme] .kin-sky-stars { opacity: .75; }
 }
 .kin-seal-btn:hover { transform: rotate(-8deg) scale(1.05); }
 .kin-seal-btn:active { transform: scale(.88); }
+.kin-seal-btn:disabled { opacity: .55; cursor: default; transform: none; }
 .kin-envelope {
   display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-radius: 18px; color: var(--kin-paper-ink);
   background: var(--kin-grain), linear-gradient(168deg, var(--kin-paper), var(--kin-paper-2));

@@ -1,0 +1,269 @@
+/* Her calendar: the days ahead and the days behind (Calendar.tsx). */
+
+/* A mark: a small light in one of three of her colours, hollow once its thing has passed. */
+.kin-cal-dot {
+  --kin-cal-tint: var(--kin-rose);
+  flex: none; display: block; width: 6px; height: 6px; box-sizing: border-box; border-radius: 50%; corner-shape: round;
+  background: var(--kin-cal-tint); box-shadow: 0 0 7px color-mix(in srgb, var(--kin-cal-tint) 70%, transparent);
+}
+.kin-cal-dot[data-mark^="peach"] { --kin-cal-tint: color-mix(in srgb, var(--kin-peach) 84%, var(--kin-ink)); }
+.kin-cal-dot[data-mark^="lilac"] { --kin-cal-tint: color-mix(in srgb, var(--kin-lilac) 86%, var(--kin-ink)); }
+.kin-cal-dot[data-mark$="past"] {
+  background: color-mix(in srgb, var(--kin-cal-tint) 24%, transparent); border: 1px solid var(--kin-cal-tint); box-shadow: none;
+}
+.kin-cal-dot[data-mark="none"] { visibility: hidden; }
+/* A stretch of days on a day's thread: a short upright band; hers lean lilac. */
+.kin-cal-entry > .kin-cal-dot[data-mark^="band"] {
+  --kin-cal-tint: color-mix(in srgb, var(--kin-peach) 70%, var(--kin-rose));
+  height: 14px; margin-top: 4px; border-radius: 3px;
+}
+.kin-cal-dot[data-mark^="band"][data-by="kin"] { --kin-cal-tint: var(--kin-lilac); }
+.kin-cal-dot[data-mark="band"] { background: linear-gradient(180deg, var(--kin-peach), var(--kin-sakura)); }
+.kin-cal-dot[data-mark="band"][data-by="kin"] { background: linear-gradient(180deg, var(--kin-lilac), var(--kin-sakura)); }
+.kin-cal-swatch {
+  display: block; width: 16px; height: 8px; border-radius: 999px;
+  background: linear-gradient(90deg, rgb(246 195 164 / .75), rgb(242 167 195 / .65));
+}
+body[data-ds-dark-theme] .kin-cal-swatch { background: linear-gradient(90deg, rgb(246 195 164 / .32), rgb(226 119 159 / .38)); }
+
+/* An anniversary: a small rose-gold twinkle, at its numeral's shoulder on the month. */
+.kin-cal-spark {
+  display: inline-grid; place-items: center; color: color-mix(in srgb, var(--kin-rosegold) 80%, var(--kin-rose));
+  filter: drop-shadow(0 0 3px rgb(231 180 156 / .9)) drop-shadow(0 0 7px rgb(242 167 195 / .5));
+}
+.kin-cal-cell > .kin-cal-spark {
+  position: absolute; left: calc(50% + var(--kin-cal-h) * .22); top: calc(50% - 4.5px - var(--kin-cal-h) * .24);
+  translate: -50% -50%; animation: kin-cal-twinkle 3.6s ease-in-out infinite;
+}
+@keyframes kin-cal-twinkle { 50% { opacity: .6; scale: .78; rotate: 24deg; } }
+.kin-cal-entry > .kin-cal-spark { width: 12px; margin: 5px -3px 0; }
+@media (prefers-reduced-motion: reduce) { .kin-cal-cell > .kin-cal-spark { animation: none; } }
+
+/* The month: a Didot numeral beside its name in script, and a lens of thicker glass on the day you picked. */
+.kin-cal-month { padding: 16px 12px 12px; }
+.kin-cal-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 0 8px 12px; }
+.kin-cal-head > .kin-numeral {
+  font-size: 52px; line-height: .9; letter-spacing: -.02em;
+  background: linear-gradient(180deg, var(--kin-ink) 30%, color-mix(in srgb, var(--kin-ink) 50%, var(--kin-rose)));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(0 6px 16px rgb(226 119 159 / .28));
+}
+.kin-cal-head h3 { margin: 0; font-size: 28px; white-space: nowrap; }
+.kin-cal-head h3 + span { font-size: 12px; letter-spacing: .1em; color: var(--kin-ink-2); }
+.kin-cal-turns { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.kin-cal-turns .kin-chip { flex: none; white-space: nowrap; }
+.kin-cal-turn {
+  flex: none; width: 34px; height: 34px; display: grid; place-items: center; border: 0; cursor: pointer;
+  border-radius: 50%; corner-shape: round; color: var(--kin-ink);
+  background: var(--kin-fill-2); box-shadow: inset 0 1px 0 var(--kin-rim), 0 6px 14px -10px rgb(80 40 90 / .5);
+  transition: transform .45s var(--kin-spring), background .2s;
+}
+.kin-cal-turn:hover { background: var(--kin-fill-3); }
+.kin-cal-turn:active { transform: scale(.9); }
+.kin-cal-turn[data-next] .kin-icon { transform: scaleX(-1); }
+
+.kin-cal-names, .kin-cal-row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.kin-cal-row { position: relative; }
+.kin-cal-names { padding-bottom: 4px; font-size: 11px; text-align: center; color: var(--kin-ink-3); }
+.kin-cal-names span:nth-child(n + 6) { color: color-mix(in srgb, var(--kin-rose) 60%, var(--kin-ink-3)); }
+.kin-cal-weeks { --kin-cal-h: clamp(46px, 12cqw, 58px); position: relative; }
+.kin-cal-weeks[data-from="next"] { animation: kin-cal-next .5s var(--kin-ease); }
+.kin-cal-weeks[data-from="prev"] { animation: kin-cal-prev .5s var(--kin-ease); }
+@keyframes kin-cal-next { from { opacity: 0; transform: translateX(26px); } }
+@keyframes kin-cal-prev { from { opacity: 0; transform: translateX(-26px); } }
+/* The lens lies over the bands of marked days and under the days' numerals. */
+.kin-cal-lens {
+  position: absolute; z-index: 1; top: 0; left: 0; width: calc(100% / 7); height: var(--kin-cal-h); pointer-events: none;
+  transform: translate(calc(var(--kin-cal-col) * 100%), calc(var(--kin-cal-row) * 100%));
+  transition: transform .55s var(--kin-spring);
+}
+.kin-cal-lens::before {
+  content: ""; position: absolute; inset: 2px 3px; border-radius: 16px;
+  background: linear-gradient(160deg, var(--kin-fill-3), var(--kin-fill-2));
+  box-shadow: inset 0 1px 0 var(--kin-rim), inset 0 -1px 2px rgb(255 255 255 / .2), 0 8px 18px -10px rgb(110 58 120 / .55);
+}
+.kin-cal-cell {
+  position: relative; z-index: 1; height: var(--kin-cal-h); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  padding: 0; border: 0; border-radius: 16px; background: none; cursor: pointer; font: inherit; color: var(--kin-ink);
+  transition: transform .45s var(--kin-spring);
+}
+.kin-cal-cell:active { transform: scale(.92); }
+.kin-cal-cell[data-out] { color: var(--kin-ink-3); }
+.kin-cal-cell[data-out] .kin-cal-dots { opacity: .5; }
+.kin-cal-cell .kin-numeral, .kin-cal-strip .kin-numeral {
+  width: 1.55em; height: 1.55em; display: grid; place-items: center; border-radius: 50%; corner-shape: round;
+  font-size: clamp(18px, 4.6cqw, 23px); line-height: 1; transition: background .2s;
+}
+.kin-cal-cell:hover .kin-numeral { background: var(--kin-fill-2); }
+.kin-cal-cell[data-today] .kin-numeral, .kin-cal-strip [data-today] .kin-numeral {
+  color: #fff; background: var(--kin-me);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .35), 0 8px 16px -8px rgb(226 119 159 / .95);
+}
+.kin-cal-dots { display: flex; gap: 3px; height: 6px; }
+/* A stretch of days: a soft band of warm glass behind its numerals, round where it begins and ends, fading out
+   where it goes on into the next or last week. Hers lean lilac; one already over is quieter. */
+.kin-cal-band {
+  --kin-cal-w: calc(100% / 7); --kin-cal-bh: calc(var(--kin-cal-h) * .62);
+  --kin-cal-l: calc((var(--kin-cal-w) - var(--kin-cal-bh)) / 2); --kin-cal-r: var(--kin-cal-l);
+  --kin-cal-a: rgb(246 195 164 / .5); --kin-cal-b: rgb(242 167 195 / .42);
+  position: absolute; top: calc(50% - 4.5px); height: var(--kin-cal-bh); translate: 0 -50%; pointer-events: none;
+  left: calc(var(--kin-cal-from) * var(--kin-cal-w) + var(--kin-cal-l));
+  width: calc(var(--kin-cal-span) * var(--kin-cal-w) - var(--kin-cal-l) - var(--kin-cal-r));
+  border-radius: 999px; background: linear-gradient(90deg, var(--kin-cal-a), var(--kin-cal-b));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .6), inset 0 -1px 1px rgb(226 119 159 / .14);
+  mask-image: linear-gradient(90deg, var(--kin-cal-fade-l, #000), #000 22px, #000 calc(100% - 22px), var(--kin-cal-fade-r, #000));
+}
+.kin-cal-band[data-by="kin"] { --kin-cal-a: rgb(195 180 241 / .46); --kin-cal-b: rgb(242 167 195 / .34); }
+.kin-cal-band[data-before] { --kin-cal-l: 0px; --kin-cal-fade-l: transparent; border-start-start-radius: 0; border-end-start-radius: 0; }
+.kin-cal-band[data-after] { --kin-cal-r: 0px; --kin-cal-fade-r: transparent; border-start-end-radius: 0; border-end-end-radius: 0; }
+.kin-cal-band[data-done] { opacity: .5; }
+body[data-ds-dark-theme] .kin-cal-band { --kin-cal-a: rgb(246 195 164 / .2); --kin-cal-b: rgb(226 119 159 / .24); box-shadow: inset 0 1px 0 rgb(255 255 255 / .14); }
+body[data-ds-dark-theme] .kin-cal-band[data-by="kin"] { --kin-cal-a: rgb(195 180 241 / .22); --kin-cal-b: rgb(226 119 159 / .18); }
+.kin-cal-legend {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 14px; margin: 12px 0 0;
+  font-size: 11px; color: var(--kin-ink-3);
+}
+.kin-cal-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+
+/* A day: its things in order along a thread, what is behind a little quieter. The page's words rise in when a
+   day is picked; the glass under them stays still (a glass card that keeps a finished animation's fill paints faded). */
+.kin-cal-day > * { animation: kin-rise .45s var(--kin-spring); }
+.kin-cal-day-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.kin-cal-day-head .kin-numeral { font-size: 40px; line-height: 1; }
+.kin-cal-day-head h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; letter-spacing: .14em; }
+.kin-cal-day-head span { font-size: 12px; color: var(--kin-ink-2); }
+.kin-cal-line { --kin-cal-when: 3.1em; --kin-cal-gap: 10px; list-style: none; margin: 0; padding: 0; }
+.kin-cal-entry {
+  position: relative; display: grid; grid-template-columns: var(--kin-cal-when) 6px minmax(0, 1fr) auto;
+  column-gap: var(--kin-cal-gap); align-items: start; padding: 7px 0;
+}
+.kin-cal-entry::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: calc(var(--kin-cal-when) + var(--kin-cal-gap) + 2.5px);
+  width: 1px; background: var(--kin-hairline);
+}
+.kin-cal-entry:first-child::before { top: 18px; }
+.kin-cal-entry:last-child::before { bottom: auto; height: 18px; }
+.kin-cal-entry:only-child::before { display: none; }
+.kin-cal-entry > .kin-cal-dot { position: relative; margin-top: 8px; }
+.kin-cal-acts { display: flex; align-items: center; margin: -3px -4px 0 0; }
+/* 和她说说: a quiet bubble on each line, which says its name as you reach for it. */
+.kin-cal-talk { position: relative; opacity: .5; transition: opacity .2s, background .2s, color .2s; }
+.kin-cal-entry:hover .kin-cal-talk, .kin-cal-open li:hover .kin-cal-talk, .kin-cal-talk:focus-visible { opacity: 1; }
+.kin-cal-talk::after {
+  content: attr(data-label); position: absolute; right: calc(100% + 4px); top: 50%; translate: 6px -50%;
+  padding: 3px 10px; border-radius: 999px; white-space: nowrap; pointer-events: none;
+  font-size: 11.5px; line-height: 1.5; color: var(--kin-ink); background: var(--kin-fill-3);
+  box-shadow: inset 0 1px 0 var(--kin-rim), 0 8px 18px -10px rgb(110 58 120 / .55);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4); backdrop-filter: blur(12px) saturate(1.4);
+  opacity: 0; transition: opacity .2s, translate .45s var(--kin-spring);
+}
+.kin-cal-talk:hover::after, .kin-cal-talk:focus-visible::after { opacity: 1; translate: 0 -50%; }
+@media (hover: none) { .kin-cal-talk { opacity: .8; } }
+.kin-cal-when { font-size: 15px; line-height: 22px; text-align: right; color: var(--kin-ink-2); white-space: nowrap; }
+.kin-cal-what {
+  min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  line-height: 22px; text-align: left; overflow-wrap: anywhere;
+}
+.kin-cal-what[data-done]:not(.kin-cal-slip) .kin-cal-title { color: var(--kin-ink-2); }
+.kin-cal-where { max-width: 100%; font-size: 12px; color: var(--kin-ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A door: the line leads to its place in her little world. */
+.kin-cal-door {
+  position: relative; padding: 0 18px 0 0; border: 0; border-radius: 10px; cursor: pointer; font: inherit;
+  transition: transform .45s var(--kin-spring);
+}
+.kin-cal-door:not(.kin-cal-slip) { background: none; color: inherit; }
+.kin-cal-door::after {
+  content: ""; position: absolute; right: 4px; top: 8px; width: 5px; height: 5px; opacity: .4;
+  border: solid currentColor; border-width: 1.5px 1.5px 0 0; transform: rotate(45deg);
+  transition: transform .45s var(--kin-spring), opacity .2s;
+}
+.kin-cal-door:hover::after { opacity: .9; transform: translateX(2px) rotate(45deg); }
+.kin-cal-door:active { transform: scale(.98); }
+/* Her own words keep their material: a diary line on paper, a dream on night glass (kin.css). */
+.kin-cal-slip { width: 100%; box-sizing: border-box; padding: 9px 28px 10px 14px; border-radius: 16px; }
+.kin-cal-slip::after { right: 13px; top: 17px; }
+.kin-cal-slip .kin-cal-title {
+  font-family: var(--kin-voice); font-size: 14.5px; line-height: 1.75;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.kin-cal-slip.kin-paper .kin-tag { color: color-mix(in srgb, var(--kin-rose) 75%, var(--kin-paper-ink)); }
+.kin-cal-slip.kin-dream .kin-tag { background: rgb(255 255 255 / .14); color: rgb(246 238 247 / .88); }
+/* The newer kinds' tags in their families' colours; an anniversary's a little festive. */
+.kin-cal-what[data-kind="period"] .kin-tag { background: rgb(246 195 164 / .32); color: color-mix(in srgb, var(--kin-peach) 42%, var(--kin-ink)); }
+.kin-cal-what[data-kind="routine"] .kin-tag { background: rgb(195 180 241 / .28); color: color-mix(in srgb, var(--kin-lilac) 42%, var(--kin-ink)); }
+.kin-cal-what[data-kind="anniversary"] .kin-tag {
+  background: linear-gradient(100deg, rgb(231 180 156 / .36), rgb(242 167 195 / .3));
+  box-shadow: inset 0 0 0 1px rgb(231 180 156 / .4); color: color-mix(in srgb, var(--kin-rosegold) 40%, var(--kin-ink));
+}
+
+/* What the owner leaves on a day: a reminder for a time, or some days marked. */
+.kin-cal-leave { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--kin-hairline); }
+.kin-cal-modes {
+  display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px;
+  background: var(--kin-fill); box-shadow: inset 0 1px 2px rgb(80 40 90 / .1), inset 0 0 0 1px var(--kin-rim-2);
+}
+.kin-cal-modes button {
+  border: 0; padding: 4px 13px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 12px;
+  color: var(--kin-ink-2); background: none; transition: background .25s, color .2s, box-shadow .25s;
+}
+.kin-cal-modes button:hover { color: var(--kin-ink); }
+.kin-cal-modes button[aria-pressed="true"] {
+  color: var(--kin-ink); background: var(--kin-fill-3); box-shadow: inset 0 1px 0 var(--kin-rim), 0 4px 10px -6px rgb(110 58 120 / .5);
+}
+.kin-cal-leave .kin-inline-form { margin-top: 10px; }
+.kin-cal-remind { flex-wrap: wrap; }
+.kin-cal-remind .kin-cal-time { flex: none; width: 9.6em; }
+.kin-cal-remind input:not(.kin-cal-time, .kin-cal-date) { min-width: 9em; }
+.kin-cal-range { flex: none; display: inline-flex; align-items: center; gap: 6px; }
+.kin-cal-range > i { width: 10px; height: 1.5px; border-radius: 1px; background: var(--kin-ink-3); }
+.kin-cal-range .kin-cal-date { flex: none; width: 10.2em; }
+body[data-ds-dark-theme] .kin-cal-time, body[data-ds-dark-theme] .kin-cal-date { color-scheme: dark; }
+
+/* 还没做的: what is still open, under the month. */
+.kin-cal-open li { display: flex; align-items: flex-start; gap: 10px; }
+.kin-cal-open .kin-cal-what { flex: 1; }
+.kin-cal-open .kin-link { flex: none; line-height: 22px; }
+.kin-cal-open .kin-cal-talk { flex: none; margin: -3px -4px 0 -6px; }
+
+/* 小世界: this week on her collection's tile. */
+.kin-tile[data-tile="calendar"] {
+  grid-column: 1 / 5; grid-row: 5;
+  display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: 1fr auto auto;
+  column-gap: 14px; align-items: end; justify-items: start;
+}
+.kin-tile[data-tile="calendar"] .kin-tile-title { grid-area: 2 / 1; font-size: 30px; }
+.kin-tile[data-tile="calendar"] .kin-tile-note { grid-area: 3 / 1; }
+.kin-tile > .kin-cal-strip {
+  position: relative; grid-area: 1 / 2 / 4 / 3; align-self: center; justify-self: end; width: min(100%, 300px);
+  display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); font-style: normal;
+}
+.kin-cal-strip b { display: flex; flex-direction: column; align-items: center; gap: 3px; font-weight: 400; }
+.kin-cal-strip b[data-past] { opacity: .5; }
+.kin-cal-strip small { font-size: 10px; color: var(--kin-ink-3); }
+.kin-cal-strip .kin-numeral { font-size: clamp(15px, 4.2cqw, 19px); }
+::view-transition-group(kin-calendar) { animation-duration: .5s; animation-timing-function: var(--kin-ease, ease); }
+
+/* 此刻: what is left of today, in one quiet strip that opens the calendar. */
+.kin-cal-today {
+  --kin-r: 22px;
+  width: 100%; box-sizing: border-box; display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+  border: 0; cursor: pointer; font: inherit; color: var(--kin-ink); text-align: left;
+  transition: transform .5s var(--kin-spring);
+}
+.kin-cal-today:hover { transform: translateY(-2px); }
+.kin-cal-today:active { transform: scale(.98); }
+.kin-cal-today-date { flex: none; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.kin-cal-today-date .kin-numeral { font-size: 30px; line-height: 1; }
+.kin-cal-today-date small { font-size: 11px; letter-spacing: .2em; color: var(--kin-ink-2); }
+.kin-cal-today-lines {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding-left: 14px;
+  border-left: 1px solid var(--kin-hairline);
+}
+.kin-cal-today-lines > span { font-size: 13px; line-height: 1.65; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kin-cal-today-lines b { margin-right: 8px; font-size: 14px; font-weight: 400; }
+
+@container kin-right (max-width: 430px) {
+  .kin-tile[data-tile="calendar"] { grid-column: 1 / 3; grid-row: 7; }
+  .kin-cal-head > .kin-numeral { font-size: 42px; }
+  .kin-cal-head h3 { font-size: 22px; }
+}

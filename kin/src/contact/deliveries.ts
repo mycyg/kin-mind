@@ -6,7 +6,9 @@
  * - an unknown part is checked after a minute, then retried under its own id at most three times;
  *   confirmed parts never repeat, and only exhausted retries ask the owner to look;
  * - a delivery that began is finished: the parts after it go once the earlier ones are settled;
- * - one that never got a part out is cancelled after a few refused tries; one cut short half way needs review.
+ * - one that never got a part out is cancelled after a few refused tries; one cut short half way needs review;
+ * - a reply on a platform goes out paragraph by paragraph as she writes it: one delivery for the step she is
+ *   writing, each finished paragraph its next part (`extend`), and the finished message finds it by that step.
  */
 import type { Address, Part, Sent, Transport } from '../channels/transport.js'
 import type { Host } from '../index.js'
@@ -46,6 +48,13 @@ export interface Delivery {
   settlementError?: string
   /** Its first words, for her page. */
   excerpt?: string
+  /**
+   * The step of her turn it was written in, when it went out as she wrote it: how the finished message finds it.
+   * `known` once its words are in a message of hers, or were told to her as said.
+   */
+  written?: { session: string; turn: number; step: number; known?: true }
+  /** Taken back (her message was written again, or never finished): nothing of it that has not gone goes now. */
+  withdrawn?: true
 }
 
 const MINUTE = 60_000
@@ -61,6 +70,8 @@ export class Deliveries {
   private readonly all: Record<string, Delivery>
   private readonly busy = new Map<string, Promise<Delivery>>()
   private readonly remembering = new Map<string, Promise<void>>()
+  /** Opened, with something to settle before it may go (Core's record of the attempt): the minute leaves these alone. */
+  private readonly preparing = new Set<string>()
 
   constructor(
     private readonly host: Host,
@@ -84,13 +95,53 @@ export class Deliveries {
   }
 
   /** A delivery under its own id: made once, and the same one when asked again. Its words change only while none has gone out. */
-  open(given: Pick<Delivery, 'id' | 'kind' | 'key' | 'recipient' | 'transport' | 'to' | 'parts'> & { notBefore?: string }): Delivery {
+  open(given: Pick<Delivery, 'id' | 'kind' | 'key' | 'recipient' | 'transport' | 'to' | 'parts'> & Pick<Delivery, 'notBefore' | 'written'>): Delivery {
     const known = this.all[given.id]
     if (known && (known.sent.length || known.state !== 'pending')) return known
     const excerpt = given.parts.map((part) => ('text' in part ? part.text : `[${PART_WORDS[part.kind]}]`)).join(' ').slice(0, 80)
     this.all[given.id] = { ...given, sent: [], state: 'pending', at: known?.at ?? new Date().toISOString(), excerpt }
     this.save()
     return this.all[given.id]!
+  }
+
+  /** What must be settled between opening a delivery and sending it, kept from the minute's own sending meanwhile. */
+  async prepare<T>(id: string, work: () => Promise<T>): Promise<T> {
+    this.preparing.add(id)
+    try {
+      return await work()
+    } finally {
+      this.preparing.delete(id)
+    }
+  }
+
+  /** The delivery of what she wrote in one step of a turn, when it went out as she wrote it. */
+  written(session: string, turn: number, step: number): Delivery | undefined {
+    return Object.values(this.all).findLast(({ written }) => written?.session === session && written.turn === turn && written.step === step)
+  }
+
+  /**
+   * More of a message she is still writing: its next parts join the delivery, which goes on from where it was.
+   * One whose earlier part is uncertain goes on once that is confirmed; one that was stopped stays stopped.
+   */
+  extend(id: string, parts: Part[]): Delivery {
+    const delivery = this.all[id]!
+    if (!parts.length || delivery.withdrawn) return delivery
+    delivery.parts.push(...parts)
+    if (delivery.state === 'accepted') delivery.state = 'pending'
+    this.save()
+    return delivery
+  }
+
+  /**
+   * Takes back what has not gone to a platform: her message was written again, or never finished. A part on its
+   * way right now lands or not; one of unknown outcome is asked about, never sent again.
+   */
+  withdraw(id: string) {
+    const delivery = this.all[id]!
+    delivery.withdrawn = true
+    if (delivery.state === 'unknown') delivery.retries = TRIES
+    this.save()
+    if (delivery.state === 'pending') void this.send(id)
   }
 
   /** Sends what is left of it, part by part; `may` is asked before each part (her conversation's rules). One run per delivery at a time. */
@@ -102,12 +153,17 @@ export class Deliveries {
     return run
   }
 
-  /** What is due: unknown outcomes asked about again, and what waited (quiet hours, a channel that was down, a refusal) tried again. */
-  async tick(may: (delivery: Delivery) => boolean) {
+  /**
+   * What is due: unknown outcomes asked about again, and what waited (quiet hours, a channel that was down, a
+   * refusal) tried again. `line` takes each in its conversation's turn, behind what is already waiting to go there.
+   */
+  async tick(may: (delivery: Delivery) => boolean, line: (key: string, work: () => Promise<unknown>) => Promise<unknown> = (_key, work) => work()) {
     const now = new Date().toISOString()
     for (const delivery of Object.values(this.all)) {
-      if (delivery.state === 'unknown' && delivery.checkAt! <= now) await this.check(delivery, () => may(delivery))
-      else if (delivery.state === 'pending' && !this.busy.has(delivery.id)) await this.send(delivery.id, () => may(delivery))
+      if (this.preparing.has(delivery.id)) continue
+      if (delivery.state === 'unknown' && delivery.checkAt! <= now) {
+        await line(delivery.key, async () => { if (delivery.state === 'unknown') await this.check(delivery, () => may(delivery)) })
+      } else if (delivery.state === 'pending' && !this.busy.has(delivery.id)) await line(delivery.key, () => this.send(delivery.id, () => may(delivery)))
       else if (delivery.state !== 'pending' && !delivery.remembered) await this.remember(delivery)
     }
   }
@@ -119,15 +175,19 @@ export class Deliveries {
   }
 
   private async run(delivery: Delivery, may: () => boolean): Promise<Delivery> {
-    if (delivery.state !== 'pending' || (delivery.notBefore && delivery.notBefore > new Date().toISOString())) return delivery
+    if (delivery.state !== 'pending') return delivery
+    if (delivery.withdrawn) return this.close(delivery)
+    if (delivery.notBefore && delivery.notBefore > new Date().toISOString()) return delivery
     const transport = this.transportOf(delivery.transport)
     // Its channel is not up: nothing went out, and it waits.
     if (!transport) return delivery
     for (let index = delivery.sent.length; index < delivery.parts.length; index++) {
+      if (delivery.withdrawn) return this.close(delivery)
       if (!may()) return delivery
       const sent: Sent = await transport.send(delivery.to, delivery.parts[index]!, partId(delivery, index))
         .catch((error: Error) => ({ state: 'unknown', reason: error.message }))
       if (sent.state === 'failed') {
+        if (delivery.withdrawn) return this.close(delivery)
         delivery.tries = (delivery.tries ?? 0) + 1
         delivery.reason = sent.reason
         if (delivery.tries < TRIES) return this.save(), delivery
@@ -140,11 +200,26 @@ export class Deliveries {
         delivery.checks = 0
         delivery.checkAt = new Date(Date.now() + this.host.ms(MINUTE)).toISOString()
         delivery.reason = sent.reason
+        if (delivery.withdrawn) delivery.retries = TRIES
         return this.finish(delivery, 'unknown')
       }
       this.save()
     }
     return this.finish(delivery, 'accepted')
+  }
+
+  /**
+   * A withdrawn delivery ends with what went. Nothing did: a reply is as if it never was, and no one is told it
+   * stopped; anything else is settled as cancelled (Core's attempt behind a contact must end).
+   */
+  private async close(delivery: Delivery) {
+    delivery.parts.length = delivery.sent.length
+    if (delivery.sent.length) return this.finish(delivery, 'accepted')
+    if (delivery.kind !== 'reply' && delivery.kind !== 'reminder') return this.finish(delivery, 'cancelled')
+    delivery.state = 'cancelled'
+    delivery.remembered = true
+    this.save()
+    return delivery
   }
 
   /** Check an uncertain part before a bounded retry under the same id; only confirmed parts let the rest go. */

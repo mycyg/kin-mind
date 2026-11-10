@@ -19,16 +19,32 @@ export function apply(ctx: Context) {
   const contact = ctx.kinContact
   ctx.on('agent/status', ({ agent, status }) => contact.status(agent.session.id, status === 'running'))
   ctx.on('session/event', (session, event) => contact.event(session, event))
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => contact.stream(agent.session, frame))
 
   ctx.tools.register(defineTool({
     name: 'kin_tell',
-    description: '把话发给另一个人或群：你想告诉对方的、替人转告的、到点提醒的，你觉得该说就说。写你自己要发出去的原话；安静时段里会等时段过了再发。',
+    description: '把话发给另一个人或群，或者发到同一个人在别处的对话（比如对方不在桌面前，发到微信上）：你想告诉对方的、替人转告的、到点提醒的，你觉得该说就说。'
+      + '写你自己要发出去的原话；安静时段里会等时段过了再发。',
     parameters: {
       to: { type: 'string', required: true, description: '发给谁：联系人或群的名字' },
       text: { type: 'string', required: true, description: '要发给对方的话' },
+      via: { type: 'string', description: '发到哪：桌面、微信或飞书；不填就发到对方最近说话的地方' },
     },
     output: answer,
-    execute: (args, exec) => contact.tell(exec.agent?.session.id ?? '', exec.callId, args.to, args.text),
+    execute: (args, exec) => contact.tell(exec.agent?.session.id ?? '', exec.callId, args.to, args.text, args.via),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'kin_quiet',
+    description: '这段对话里的人让你这一阵先别找他（「三点前别找我」「我去开会，一小时后再说」「今晚别吵我」），就用它记下来：'
+      + '到那时为止你不主动找他，替别人转告给他的话也等到那之后；他来找你，你照常回。他说可以了、不用等了，minutes 填 0。'
+      + '只记对方自己的意思，别替他决定。',
+    parameters: {
+      until: { type: 'string', description: '到什么时候：钟点「15:00」（已经过了就算明天），或带日期的「2026-01-02 09:00」' },
+      minutes: { type: 'integer', description: '或者从现在起多少分钟；0 是取消' },
+    },
+    output: answer,
+    execute: async (args, exec) => contact.quiet(exec.agent?.session.id ?? '', args.until, args.minutes),
   }))
 
   ctx.tools.register(defineTool({

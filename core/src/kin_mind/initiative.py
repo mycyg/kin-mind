@@ -21,7 +21,9 @@ or more as stated or inferred meaning (never Kin's internal thought). Every sour
 cited must still be current: a delete or a correction of any of it, or words an erase took out, and
 it is no moment. One moment a day at most, the most important; at most three shown; the ones 用户甲
 asked not to be brought up are left out (`not_raised`). Dates and a few words of Kin's own label,
-nothing that asks for a contact: whether to mention one, and when, stays Kin's.
+nothing that asks for a contact: whether to mention one, and when, stays Kin's. On such a day the
+review minute wakes one idle review so that she can notice it (actions._due_reviews), and the
+calendar page reads them by date (`anniversaries_between`).
 
 **The decision an idle review states.** `contact_decision` reads what one committed: a contact
 wish it made or took up again, or the move that said why not now. It records; it decides nothing.
@@ -246,16 +248,58 @@ def moments(conn, mind):
     return [best[day] for day in sorted(best)]
 
 
-def anniversaries_today(conn, mind, at):
-    """Today's anniversaries of shared moments, oldest moment first, at most ANNIVERSARIES_SHOWN."""
-    today = timestamp(at).astimezone(ZoneInfo(ZONE)).date()
+def local_day(at):
+    return timestamp(at).astimezone(ZoneInfo(ZONE)).date()
+
+
+def anniversaries_on(conn, mind, day, shared=None):
+    """The anniversaries of shared moments on local `day`, oldest moment first, at most
+    ANNIVERSARIES_SHOWN. `shared` is `moments(conn, mind)` when one caller asks for many days."""
     found = []
-    for moment in moments(conn, mind):
-        reached = milestone(date.fromisoformat(moment["date"]), today)
+    for moment in moments(conn, mind) if shared is None else shared:
+        reached = milestone(date.fromisoformat(moment["date"]), day)
         if reached and not not_raised(conn, mind, {moment["moment_id"], *moment["cited"]}):
             found.append({"moment_id": moment["moment_id"], "date": moment["date"], "milestone": reached,
                           "topic": moment["topic"]})
     return found[:ANNIVERSARIES_SHOWN]
+
+
+def anniversaries_today(conn, mind, at):
+    """Today's anniversaries of shared moments, oldest moment first, at most ANNIVERSARIES_SHOWN."""
+    return anniversaries_on(conn, mind, local_day(at))
+
+
+# The calendar page's read (`anniversaries`): how many days one request may cover, and the words
+# for each milestone but the whole years.
+CALENDAR_DAYS = 92
+MILESTONE_WORDS = {"1-week": "满一周", "100-days": "满一百天", "1-month": "满一个月", "3-months": "满三个月", "6-months": "满半年"}
+
+
+def _calendar_day(value):
+    if not isinstance(value, str) or len(value) != 10:
+        raise ValueError("A day is YYYY-MM-DD")
+    return date.fromisoformat(value)
+
+
+def anniversaries_between(mind, start, end):
+    """The anniversaries from local day `start` up to, not including, `end` (YYYY-MM-DD; at most
+    CALENDAR_DAYS days), each as its day, a short line and its whole years (None for the others).
+    Nothing while `anniversaries` is off. Asks no model."""
+    first, last = _calendar_day(start), _calendar_day(end)
+    last = min(last, first + timedelta(days=CALENDAR_DAYS))
+    items = []
+    with mind.engine.db.connect() as conn:
+        if not enabled(conn, mind.scope.key(), ANNIVERSARIES):
+            return {"items": items}
+        shared = moments(conn, mind)
+        day = first
+        while day < last:
+            for found in anniversaries_on(conn, mind, day, shared):
+                years = int(found["milestone"].split("-")[0]) if "year" in found["milestone"] else None
+                words = f"{years} 周年" if years else MILESTONE_WORDS[found["milestone"]]
+                items.append({"date": day.isoformat(), "title": f"{found['topic']} · {words}", "years": years})
+            day += timedelta(days=1)
+    return {"items": items}
 
 
 def contact_decision(state, event_id, proposal):

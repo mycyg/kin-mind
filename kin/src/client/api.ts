@@ -1,5 +1,5 @@
 /** The page's side of KIN's host routes (src/index.ts), and the shapes Core answers with. */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 // Browser-relative routes: the page's carrier resolves them against its own base.
 export async function api<T>(route: string, body?: unknown): Promise<T> {
@@ -15,9 +15,14 @@ export async function api<T>(route: string, body?: unknown): Promise<T> {
 export function useApi<T>(route: string, everyMs?: number) {
   const [data, setData] = useState<T>()
   const [error, setError] = useState<string>()
-  const reload = useCallback(() => api<T>(route)
-    .then((value) => { setData(value); setError(undefined) })
-    .catch((reason: Error) => setError(reason.message)), [route])
+  // Only the latest request lands: a slower earlier one (last month's page, an older poll) is dropped.
+  const latest = useRef(0)
+  const reload = useCallback(() => {
+    const asked = ++latest.current
+    return api<T>(route)
+      .then((value) => { if (asked === latest.current) { setData(value); setError(undefined) } })
+      .catch((reason: Error) => { if (asked === latest.current) setError(reason.message) })
+  }, [route])
   useEffect(() => {
     void reload()
     if (!everyMs) return

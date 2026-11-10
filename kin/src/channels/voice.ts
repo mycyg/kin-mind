@@ -38,7 +38,12 @@ export class Voice {
       if (existsSync(file)) return file
       const answer = await new Promise<{ ok: boolean; stage?: string }>((resolve, reject) => {
         const timer = setTimeout(() => {
-          this.worker?.kill()
+          // Let go of the stuck worker before it is gone: the next request starts one of its own, and nothing
+          // the old one still says is taken for that request's answer.
+          const stuck = this.worker
+          this.worker = undefined
+          this.waiting = undefined
+          stuck?.kill()
           reject(new Error('她的声音三分钟没合成出来'))
         }, 180_000)
         this.waiting = (value) => { clearTimeout(timer); resolve(value) }
@@ -67,12 +72,14 @@ export class Voice {
       stdio: ['pipe', 'pipe', 'ignore'],
     }) as unknown as ChildProcessWithoutNullStreams
     createInterface({ input: worker.stdout }).on('line', (line) => {
+      if (this.worker !== worker) return
       const waiting = this.waiting
       this.waiting = undefined
       try { waiting?.(JSON.parse(line)) } catch { waiting?.({ ok: false, stage: 'protocol' }) }
     })
     const gone = () => {
-      if (this.worker === worker) this.worker = undefined
+      if (this.worker !== worker) return
+      this.worker = undefined
       this.waiting?.({ ok: false, stage: 'worker stopped' })
       this.waiting = undefined
     }

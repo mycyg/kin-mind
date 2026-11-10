@@ -29,7 +29,7 @@ const RESTART_TODO = '在 DSH 的插件页把 KIN 关掉再打开'
 /** Her heartbeat's lanes as her page says them; a lane another module adds is shown by its own name. */
 export const LANE_NAMES: Record<string, string> = {
   review: '静下来想事情', daily: '每日复盘', enrichment: '整理记忆', preparation: '预热回忆', exploration: '出门探索', creation: '做东西',
-  contact: '主动联系',
+  contact: '主动联系', deliveries: '核对送达', others: '替别人想事情', replies: '接回晚点的回复',
 }
 const laneName = (lane: string) => LANE_NAMES[lane] ?? lane
 

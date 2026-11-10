@@ -28,7 +28,7 @@ try {
   const directory = () => ({ people: [{ id: 'person:person_a', accounts: { wechat: 'owner' } }], groups: [] })
   const conversations = new Conversations(host, directory, () => ({}), () => undefined, () => {}, () => ({}))
   conversations.receive({ transport: 'wechat', id: 'stop-1', chat: 'owner', sender: 'owner', kind: 'direct', text: '停止任务', at: new Date().toISOString() })
-  await conversations.arrivals
+  await Promise.all(conversations.arrivals.values())
   assert.equal(cancelled, true)
   assert.deepEqual(stopped, ['mine'])
   // A finished model turn can still have queued output waiting for platform receipts.
@@ -173,14 +173,14 @@ try {
   assert.ok(concurrent.get('concurrent').acceptedAt)
   console.log('PASS: failed recording is isolated, retries count each delivery once across restart, owner decisions continue, and accepted messages never resend')
   let finishArrival, flushed = 0
-  conversations.arrivals = new Promise(resolve => { finishArrival = resolve })
+  conversations.arrivals.set('owner-chat', new Promise(resolve => { finishArrival = resolve }))
   conversations.flush = async () => { flushed++ }
   conversations.schedule('owner-chat', 1)
   await new Promise(resolve => setTimeout(resolve, 15))
   assert.equal(flushed, 0, 'a burst must not flush while an already-arrived message is still being ingested')
   let finishNextArrival
   const nextArrival = new Promise(resolve => { finishNextArrival = resolve })
-  conversations.arrivals = conversations.arrivals.then(() => nextArrival)
+  conversations.arrivals.set('owner-chat', conversations.arrivals.get('owner-chat').then(() => nextArrival))
   finishArrival()
   await new Promise(resolve => setTimeout(resolve, 15))
   assert.equal(flushed, 0, 'arrivals queued while waiting must finish too')
@@ -191,6 +191,107 @@ try {
   console.log('PASS: slow ingestion cannot split a burst; superseded timers do not flush')
   conversations.close()
   console.log('PASS: channel stop ends the current conversation and its running workers, leaving other sessions alone')
+
+  // Paragraphs go out as she writes them, each once; the finished message sends only what is left.
+  const out = [], told = [], events = [{ type: 'user/message', data: { source: { kind: 'kin-channel' } } }]
+  const said = (turn, step, text) => events.push({ type: 'assistant/message', data: { turn, step, message: { content: [{ type: 'text', text }] } } })
+  const session = { id: 'live-chat', get seq() { return events.length }, eventAt: seq => events[seq] }
+  let refusing = false
+  const liveHost = {
+    ...host, timeline: { landed: () => {} }, mind: { call: async () => ({}) },
+    ctx: { get: name => name === 'kin' ? { scopeOf: () => ({}) } : name === 'sessionController' ? { resolveAgent: async () => ({ agent: { session } }) } : undefined },
+    conversations: () => ({ 'wechat:owner': { sessionId: 'live-chat', channel: 'wechat', recipient: 'person:person_a', address: { chat: 'owner', kind: 'direct' } } }),
+  }
+  const sentLive = new Deliveries(liveHost, () => ({ send: async (_to, part, id) => { if (refusing) return { state: 'failed', reason: 'refused' }; out.push(`${id} ${part.text}`); return { state: 'accepted', platformId: id } } }), async delivery => sentLive.mark(delivery.id, { remembered: true }))
+  const live = new Conversations(liveHost, directory, () => sentLive, () => undefined, () => {}, () => ({ kind: 'reply' }))
+  live.say = async (_session, id, text) => { told.push(`${id} ${text}`) }
+  const settle = () => new Promise(resolve => setTimeout(resolve, 5))
+  const write = (attemptId, text) => live.stream(session, { type: 'chunk', attemptId, chunk: { type: 'text-delta', index: 0, text } })
+  live.stream(session, { type: 'start', attemptId: 'a1', turn: 1, step: 1 })
+  write('a1', '第一段\n\n第二')
+  await settle()
+  assert.deepEqual(out, ['reply:live-chat:live:1:0 第一段'], 'a finished paragraph goes before the message is whole; an unfinished one waits')
+  write('a1', '段\n\n第三段')
+  said(1, 1, '第一段\n\n第二段\n\n第三段')
+  live.forward(session)
+  await settle()
+  assert.deepEqual(out.map(sent => sent.split(' ')[1]), ['第一段', '第二段', '第三段'])
+  assert.equal(new Set(out.map(sent => sent.split(':').slice(0, 4).join(':'))).size, 1, 'one message is one delivery')
+  live.forwarded['live-chat'] = 0
+  live.forward(session)
+  await settle()
+  assert.equal(out.length, 3, 'catching up after a restart sends nothing twice')
+  // An attempt that broke off after a paragraph went out, written again differently: the new message goes whole, the stray words are told to her.
+  live.stream(session, { type: 'start', attemptId: 'a2', turn: 1, step: 2 })
+  write('a2', '甲\n\n乙')
+  await settle()
+  live.stream(session, { type: 'start', attemptId: 'a3', turn: 1, step: 2 })
+  write('a3', '丙\n\n丁')
+  said(1, 2, '丙\n\n丁')
+  live.forward(session)
+  await settle()
+  assert.deepEqual(out.slice(3).map(sent => sent.split(' ')[1]), ['甲', '丙', '丁'])
+  assert.deepEqual(told, ['told:reply:live-chat:live:2 甲'])
+  // One paragraph is one message, sent when it is whole, under its session position as before.
+  live.stream(session, { type: 'start', attemptId: 'a4', turn: 2, step: 1 })
+  write('a4', '只有一句')
+  said(2, 1, '只有一句')
+  live.forward(session)
+  live.rest('live-chat')
+  await settle()
+  assert.deepEqual(out.slice(6), ['reply:live-chat:3:0 只有一句'])
+  assert.equal(told.length, 1)
+  // A paragraph the platform refused, then the message written again: only the new words go, at once or at a later minute, and nothing is told as said.
+  refusing = true
+  live.stream(session, { type: 'start', attemptId: 'a5', turn: 3, step: 1 })
+  write('a5', '被拒收的旧段\n\n没写完')
+  await settle()
+  refusing = false
+  live.stream(session, { type: 'start', attemptId: 'a6', turn: 3, step: 1 })
+  said(3, 1, '重写的整条')
+  live.forward(session)
+  live.rest('live-chat')
+  await settle()
+  await sentLive.tick(() => true)
+  await settle()
+  assert.deepEqual(out.slice(7), ['reply:live-chat:4:0 重写的整条'], 'words taken back never go, not even at a later minute')
+  assert.equal(told.length, 1, 'what no platform took is not told to her as said')
+  assert.equal(sentLive.get('reply:live-chat:live:4').state, 'cancelled')
+  // A paragraph that went out, then a restart before the message formed: told to her once, and nothing is sent again.
+  live.stream(session, { type: 'start', attemptId: 'a7', turn: 4, step: 1 })
+  write('a7', '发出去的半截\n\n后面')
+  await settle()
+  const restarted = new Conversations(liveHost, directory, () => sentLive, () => undefined, () => {}, () => ({ kind: 'reply' }))
+  restarted.say = async (_session, id, text) => { told.push(`${id} ${text}`) }
+  await settle()
+  assert.deepEqual(told.slice(1), ['told:reply:live-chat:live:5 发出去的半截'])
+  assert.equal(out.length, 9, 'catching up from the start of the session sends nothing twice')
+  assert.equal(sentLive.list().filter(delivery => delivery.written && !delivery.written.known).length, 0)
+  console.log('PASS: paragraphs go out as she writes them, each once; a message written again takes back what had not gone and tells her what had; a restart tells her the half that went')
+
+  // An arrival her mind could not take in is kept and taken in when it can: the platform does not send it twice.
+  let away = true, takenIn = 0
+  const keptFiles = {}
+  const arrivalHost = {
+    ...host, ms: () => 1, load: (name, empty) => keptFiles[name] ?? empty, save: (name, value) => { keptFiles[name] = structuredClone(value) },
+    conversation: async () => ({ sessionId: 'owner-chat' }),
+    mind: { call: async () => { if (away) throw new Error('mind away'); takenIn++; return { source_id: 'source-1' } } },
+  }
+  const arriving = new Conversations(arrivalHost, () => ({ people: [{ id: 'person:person_a', name: '甲', accounts: { wechat: 'owner' } }], groups: [] }),
+    () => ({ list: () => [] }), () => undefined, () => {}, () => ({}))
+  arriving.flush = async () => {}
+  arriving.receive({ transport: 'wechat', id: 'in-1', chat: 'owner', sender: 'owner', kind: 'direct', text: 'synthetic hello', at: new Date().toISOString() })
+  await Promise.all(arriving.arrivals.values())
+  assert.equal(takenIn, 0)
+  assert.equal(keptFiles['inbox.json'].arriving.length, 1, 'what could not be taken in is kept')
+  away = false
+  await new Promise(resolve => setTimeout(resolve, 20))
+  await Promise.all(arriving.arrivals.values())
+  assert.equal(takenIn, 1)
+  assert.equal(keptFiles['inbox.json'].arriving.length, 0)
+  assert.equal(keptFiles['inbox.json'].bursts['wechat:owner'].length, 1, 'it joins its conversation as any arrival does')
+  arriving.close()
+  console.log('PASS: an arrival her mind could not take in is kept and taken in once it can')
 } finally {
   rmSync(output, { recursive: true, force: true })
 }

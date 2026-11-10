@@ -1,21 +1,23 @@
 /**
  * 她的小世界: a collection of tiles, each a little object of her life (a night sky for her dreams, an
- * envelope for letters, a framed diary, her wishes, where she wandered, her memories). A tile opens
- * into its place; the title glides along, and a round glass button brings you back.
+ * envelope for letters, a framed diary, her wishes, where she wandered, her memories, the week on her
+ * calendar). A tile opens into its place; the title glides along, and a round glass button brings you back.
  */
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import {
   activeWish, api, useApi,
   type Diary, type DiaryEntry, type Dreams, type Explore, type Home, type Letters, type Memory, type Wish,
 } from './api.js'
+import { CalendarView, dayKey, useWeek } from './Calendar.js'
 import { Back, Mail, Moon, Search } from './icons.js'
 import { Outing } from './steward/Outing.js'
 import { stamp } from '../render.js'
 import { ago, calendarDay, clock, day, isoDay, night } from './time.js'
 
-export type Place = 'dreams' | 'letters' | 'diary' | 'wishes' | 'wander' | 'memories'
+export type Place = 'dreams' | 'letters' | 'diary' | 'wishes' | 'wander' | 'memories' | 'calendar'
 
 const PLACES: Record<Place, { title: string; sub: string }> = {
+  calendar: { title: 'Calendar', sub: '等在前面的，还没做的，和过去的日子留下的' },
   dreams: { title: 'Dreams', sub: '她做过的梦' },
   letters: { title: 'Letters', sub: '到了日子才能拆的信' },
   diary: { title: 'Diary', sub: '她写下的这些天' },
@@ -33,10 +35,14 @@ const BASIS: Record<string, string> = { imagined: '梦里', internal_thought: '�
 const STEP_STATES: Record<string, string> = { pending: '还没开始', ready: '准备做', running: '正在做', waiting: '等时机', completed: '已完成', abandoned: '已放下' }
 const PLAN_STATES: Record<string, string> = { active: '进行中', waiting: '等着', done: '做完了', completed: '做完了', paused: '先放着' }
 
-export function World({ home, place, go, openSettings }: {
+export function World({ home, place, go, openSettings, talk }: {
   home: Home | undefined; place: Place | undefined; go: (place: Place | undefined) => void; openSettings: () => void
+  /** Takes a line into her chat, the composer started with it (the calendar's 和她说说). */
+  talk: (text: string) => void
 }) {
-  if (!place) return <Collection home={home} open={go} />
+  // The day her calendar opens on when a timed step of a plan leads there; from her collection it opens on today.
+  const [day, setDay] = useState<string>()
+  if (!place) return <Collection home={home} open={(next) => { setDay(undefined); go(next) }} />
   return (
     <div className="kin-scroll">
       <header className="kin-detail-head">
@@ -49,9 +55,10 @@ export function World({ home, place, go, openSettings }: {
       {place === 'dreams' ? <DreamsView openSettings={openSettings} /> : null}
       {place === 'letters' ? <LettersView openSettings={openSettings} /> : null}
       {place === 'diary' ? <DiaryView openSettings={openSettings} /> : null}
-      {place === 'wishes' ? <WishesView home={home} /> : null}
+      {place === 'wishes' ? <WishesView home={home} toDay={(at) => { setDay(dayKey(new Date(at))); go('calendar') }} /> : null}
       {place === 'wander' ? <Wander /> : null}
       {place === 'memories' ? <Recall /> : null}
+      {place === 'calendar' ? <CalendarView go={go} day={day} talk={talk} /> : null}
     </div>
   )
 }
@@ -69,6 +76,7 @@ function Collection({ home, open }: { home: Home | undefined; open: (place: Plac
   const dream = dreams.data?.dreams[0]
   const pages = diary.data?.entries.length ?? 0
   const wandered = explore.data?.explorations[0]
+  const week = useWeek()
 
   const tile = (place: Place, note: ReactNode, art?: ReactNode) => (
     <button type="button" className="kin-tile" data-tile={place} onClick={() => open(place)} aria-label={PLACES[place].sub}>
@@ -93,6 +101,7 @@ function Collection({ home, open }: { home: Home | undefined; open: (place: Plac
         {tile('wishes', '心愿', <strong className="kin-numeral kin-tile-count">{wishes.length}</strong>)}
         {tile('wander', wandered ? clip(wandered.title ?? wandered.text ?? '', 30) : '还没出门探索过', <i className="kin-art-horizon" />)}
         {tile('memories', '她记得你们聊过的事', <Constellation />)}
+        {tile('calendar', week.note, week.art)}
       </div>
     </div>
   )
@@ -133,7 +142,7 @@ export function Wishes({ wishes }: { wishes: Wish[] }) {
   )
 }
 
-function WishesView({ home }: { home: Home | undefined }) {
+function WishesView({ home, toDay }: { home: Home | undefined; toDay: (at: string) => void }) {
   const wishes = home?.state.desires.filter(activeWish) ?? []
   const plans = home?.plans.filter((plan) => plan.status === 'active') ?? []
   return (
@@ -151,7 +160,9 @@ function WishesView({ home }: { home: Home | undefined }) {
                 {plan.title ?? plan.goal}<span className="kin-dim"> · {PLAN_STATES[plan.status] ?? plan.status}{plan.steps?.some((step) => step.state === 'completed') ? ` · 已完成 ${plan.steps.filter((step) => step.state === 'completed').length}/${plan.steps.length} 步` : ''}</span>
                 {plan.steps?.filter((step) => !['completed', 'abandoned'].includes(step.state)).map((step) => <p key={step.id} className="kin-plan-step">
                   <span className="kin-tag">{STEP_STATES[step.state] ?? step.state}</span>{step.goal}
-                  {step.not_before && !['completed', 'abandoned'].includes(step.state) ? <span className="kin-dim"> · {calendarDay(step.not_before)} {clock(step.not_before)}</span> : null}
+                  {step.not_before && !['completed', 'abandoned'].includes(step.state) ? (
+                    <> · <button type="button" className="kin-link" aria-label={`在日程上看 ${calendarDay(step.not_before)}`} onClick={() => toDay(step.not_before!)}>{calendarDay(step.not_before)} {clock(step.not_before)}</button></>
+                  ) : null}
                 </p>)}
               </li>
             ))}
@@ -213,11 +224,15 @@ function DiaryView({ openSettings }: { openSettings: () => void }) {
 function DiaryPage({ entry, replying, onReplied }: { entry: DiaryEntry; replying: boolean; onReplied: () => void }) {
   const [text, setText] = useState('')
   const [error, setError] = useState<string>()
+  const [sending, setSending] = useState(false)
   const reply = () => {
-    if (!text.trim()) return
+    if (sending || !text.trim()) return
+    setSending(true)
     api('api/kin/diary/reply', { reflection_id: entry.source_id, text: text.trim() })
-      .then(() => { setText(''); setError(undefined); onReplied() })
+      // Words typed while it was on its way stay.
+      .then(() => { setText((now) => (now === text ? '' : now)); setError(undefined); onReplied() })
       .catch((reason: Error) => setError(reason.message))
+      .finally(() => setSending(false))
   }
   return (
     <article className="kin-paper">
@@ -233,7 +248,7 @@ function DiaryPage({ entry, replying, onReplied }: { entry: DiaryEntry; replying
         <div className="kin-inline-form">
           <input value={text} placeholder="回她一句…" aria-label="回复这篇日记" onChange={(event) => setText(event.target.value)}
             onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) reply() }} />
-          <button type="button" className="kin-btn" onClick={reply}>回她</button>
+          <button type="button" className="kin-btn" onClick={reply} disabled={sending}>回她</button>
         </div>
       ) : null}
       {error ? <p className="kin-error">{error}</p> : null}
@@ -266,13 +281,18 @@ function LettersView({ openSettings }: { openSettings: () => void }) {
   const [text, setText] = useState('')
   const [unlock, setUnlock] = useState(isoDay(30))
   const [problem, setProblem] = useState<string>()
+  const [sealing, setSealing] = useState(false)
   if (error) return <Failed error={error} retry={reload} />
   if (!data) return <Quiet>正在看信箱…</Quiet>
   const seal = () => {
+    if (sealing) return
     if (!text.trim()) return setProblem('先写点什么吧')
+    setSealing(true)
     api('api/kin/letters', { text: text.trim(), unlock_at: unlock })
-      .then(() => { setText(''); setProblem(undefined); void reload() })
+      // Words written while it was on its way stay.
+      .then(() => { setText((now) => (now === text ? '' : now)); setProblem(undefined); void reload() })
       .catch(() => setProblem('没封上。拆信的日子要在明天到一年之内'))
+      .finally(() => setSealing(false))
   }
   return (
     <>
@@ -284,7 +304,7 @@ function LettersView({ openSettings }: { openSettings: () => void }) {
             <label className="kin-date">那天才能拆
               <input type="date" value={unlock} min={isoDay(1)} max={isoDay(365)} onChange={(event) => setUnlock(event.target.value)} />
             </label>
-            <button type="button" className="kin-seal-btn" onClick={seal} aria-label="封好这封信">封</button>
+            <button type="button" className="kin-seal-btn" onClick={seal} disabled={sealing} aria-label="封好这封信">封</button>
           </div>
           {problem ? <p className="kin-error">{problem}</p> : null}
         </section>
@@ -310,11 +330,15 @@ function LettersView({ openSettings }: { openSettings: () => void }) {
 function Remembered({ memory, onCorrected }: { memory: Memory; onCorrected: () => void }) {
   const [text, setText] = useState<string>()
   const [error, setError] = useState<string>()
+  const [sending, setSending] = useState(false)
   const correct = () => {
-    if (!text?.trim()) return
+    if (sending || !text?.trim()) return
+    setSending(true)
     api('api/kin/correct', { id: memory.id, text: text.trim(), memory: memory.text })
-      .then(() => { setText(undefined); setError(undefined); onCorrected() })
+      // Words typed while it was on its way keep the form open.
+      .then(() => { setText((now) => (now === text ? undefined : now)); setError(undefined); onCorrected() })
       .catch((reason: Error) => setError(reason.message))
+      .finally(() => setSending(false))
   }
   return (
     <li className="kin-card">
@@ -328,7 +352,7 @@ function Remembered({ memory, onCorrected }: { memory: Memory; onCorrected: () =
               if (event.key === 'Enter' && !event.nativeEvent.isComposing) correct()
               if (event.key === 'Escape') setText(undefined)
             }} />
-          <button type="button" className="kin-btn" onClick={correct}>告诉她</button>
+          <button type="button" className="kin-btn" onClick={correct} disabled={sending}>告诉她</button>
         </div>
       ) : null}
       {error ? <p className="kin-error">{error}</p> : null}

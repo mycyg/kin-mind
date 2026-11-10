@@ -66,6 +66,7 @@ export class WeChat implements Transport {
   private readonly tickets = new Map<string, { value: string; until: number }>()
   private current: ReturnType<Transport['status']> = { state: 'stopped' }
   private inbound: (message: Inbound) => void = () => {}
+  private closed = false
 
   constructor(
     private readonly account: WeChatAccount,
@@ -85,8 +86,12 @@ export class WeChat implements Transport {
   }
 
   async close() {
+    this.closed = true
     this.stop()
     this.current = { state: 'stopped' }
+    // It writes nothing more: the cursor on disk still stands before whatever it was taking in, so the
+    // connection opened next is given that again and takes in what this one had not handed over.
+    this.store.close()
   }
 
   status() {
@@ -222,7 +227,7 @@ export class WeChat implements Transport {
   }
 
   private async take(message: Message) {
-    if (message.message_type === BOT) return
+    if (this.closed || message.message_type === BOT) return
     const id = String(message.message_id ?? message.client_id ?? '')
     if (!id || !this.store.fresh(id)) return
     const chat = message.group_id || message.from_user_id || ''
@@ -254,6 +259,7 @@ export class WeChat implements Transport {
       }
     }
     const text = texts.join('\n').trim()
+    if (this.closed) return
     this.inbound({
       transport: this.id, id, chat, kind: message.group_id ? 'group' : 'direct', sender: message.from_user_id ?? '',
       ...(text ? { text } : {}), ...(files.length ? { files } : {}), at: new Date(message.create_time_ms ?? Date.now()).toISOString(),

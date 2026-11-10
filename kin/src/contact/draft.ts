@@ -60,6 +60,7 @@ export async function draft(host: Host, occasion: Occasion): Promise<{ decision:
     .slice(-12).map((turn) => `${turn.role === 'user' ? occasion.who : '你'}：${turn.text}`)
   const facts = [
     `现在是 ${new Date().toLocaleString('zh-CN', { hour12: false })}。对方是${occasion.who}。`,
+    host.ctx.get('kinCalendar')?.current() ?? '',
     renderContext(memory, kin.dimensions(), kin.nameOf).text,
     recent.length ? '你们最近的对话：\n' + recent.join('\n') : '',
     occasion.wishes.length ? '此刻已经准备好的联系愿望（由你挑）：' + JSON.stringify(occasion.wishes) : '',

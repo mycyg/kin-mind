@@ -5,12 +5,13 @@
  * was said there. A send of unknown outcome or a message under way is finished by its delivery, never
  * drafted again. Technical failures in a row hold new drafts, up to two hours apart.
  */
+import { agenda, timeOf } from '../calendar.js'
 import type { Answer } from '../heartbeat.js'
 import type { Host } from '../index.js'
 import type { Deliveries, Delivery } from './deliveries.js'
 import { draft, type Decision } from './draft.js'
 import { isGroup, nameOf, OWNER, type Group, type People, type Person } from './people.js'
-import { hold, quiet, type Activity, type Hold, type Rules } from './rules.js'
+import { asked, hold, quiet, type Activity, type Hold, type Rules } from './rules.js'
 import type { Conversations } from './conversations.js'
 
 const PAUSE_MAX_MINUTES = 120
@@ -39,10 +40,8 @@ export class Reaching {
     private readonly conversations: Conversations,
   ) {}
 
-  /** One minute: what is due of what she sent, someone else's review, then each person and group in turn. */
+  /** One minute: each person and group in turn. What she already sent, and someone else's review, have lanes of their own (index.ts). */
   async round(): Promise<Answer> {
-    await this.deliveries.tick((delivery) => this.may(delivery))
-    await this.othersReview()
     const { people, groups } = this.directory()
     for (const target of [...people, ...groups]) {
       const answer = await this.reach(target).catch((error: Error) => ({ state: 'failed', reason: error.message }))
@@ -76,15 +75,34 @@ export class Reaching {
       return [[target.id, { person_id: target.id, conversation_key: place.key, channel: place.channel }]]
     }))
     // Companion agenda expansion uses Core's one-shot host entry, not its resident action set.
-    return this.host.mind.run('companion-targets', { routes })
+    const targets = await this.host.mind.run<Record<string, Record<string, unknown>>>('companion-targets', { routes })
+    // What her calendar holds for the next two days goes with the owner's entry (Core shows her every key of a
+    // target but its route): a review she is having anyway can think ahead of a day. It wakes nothing by itself.
+    const now = new Date()
+    const coming = targets[OWNER] && (await this.host.ctx.get('kinCalendar')?.items(now, new Date(now.getTime() + 2 * 86_400_000), true)
+      .catch((error: Error) => (this.host.log('contact: her calendar was not read for her review: ' + error.message), undefined)))
+      // A whole day (a stretch of days under way, today's anniversary) counts while it lasts.
+      ?.filter((item) => item.at && !item.done && item.kind !== 'review' && (item.at.length === 10 || timeOf(item) >= now.getTime()))
+    if (coming?.length) targets[OWNER]!.calendar = '接下来两天你日程上的事（到点各有各的安排，这里只是让你想事情时心里有数）：\n' + agenda(coming)
+    // Who asked her to leave them be for a while, and until when.
+    for (const [id, target] of Object.entries(targets)) {
+      const until = asked(this.activity(id))
+      if (until) target.asked_to_wait = `对方说过先别找他，到 ${until.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })} 为止`
+    }
+    return targets
   }
 
-  /** Whether one of her own messages may go out now; a reply may always. */
+  /**
+   * Whether one of her own messages may go out now; a reply may always. Someone who asked her to leave them be
+   * for a while hears nothing she starts or passes on until then; a reminder set for them still comes when set.
+   */
   may(delivery: Delivery): boolean {
     const rules = this.rules()
     if (delivery.kind === 'reply' || delivery.kind === 'notice') return true
     if (quiet(rules)) return false
-    if (delivery.kind === 'reminder' || delivery.kind === 'relay') return true
+    if (delivery.kind === 'reminder') return true
+    if (asked(this.activity(delivery.recipient))) return false
+    if (delivery.kind === 'relay') return true
     return rules.enabled && !this.host.replying() && this.allowed(delivery.recipient)
   }
 
@@ -148,15 +166,17 @@ export class Reaching {
     if (decision.references?.length) {
       await call('sharing-preflight', { draft_id: attempt.id, recipient: target.id, references: decision.references })
     }
-    const delivery = this.deliveries.open({
-      id: attempt.id, kind: 'contact', key: place.key, recipient: target.id, transport: place.channel,
-      to: place.address, parts: decision.bubbles.map((bubble) => ({ text: bubble })),
+    // Kept before Core hears of it, so a restart finishes it; the minute that keeps deliveries waits for Core's answer.
+    const [delivery, pending] = await this.deliveries.prepare(attempt.id, async () => {
+      const delivery = this.deliveries.open({
+        id: attempt.id, kind: 'contact', key: place.key, recipient: target.id, transport: place.channel,
+        to: place.address, parts: decision.bubbles.map((bubble) => ({ text: bubble })),
+      })
+      const pending = await call('settle', { attempt_id: attempt.id, state: 'pending', ...chosen, ...read, text, outbound: { id: attempt.id, text, bubbles: decision.bubbles } })
+      if (pending.state === 'canceled') this.deliveries.mark(delivery.id, { state: 'cancelled', remembered: true, reason: pending.reason })
+      return [delivery, pending] as const
     })
-    const pending = await call('settle', { attempt_id: attempt.id, state: 'pending', ...chosen, ...read, text, outbound: { id: attempt.id, text, bubbles: decision.bubbles } })
-    if (pending.state === 'canceled') {
-      this.deliveries.mark(delivery.id, { state: 'cancelled', remembered: true, reason: pending.reason })
-      return { state: 'idle', reason: pending.reason }
-    }
+    if (pending.state === 'canceled') return { state: 'idle', reason: pending.reason }
     const sent = await this.conversations.queue(place.key, () => this.deliveries.send(delivery.id, () => this.may(delivery))) as Delivery
     return { state: sent.state === 'accepted' ? 'complete' : sent.state, reason: sent.reason }
   }
@@ -186,7 +206,7 @@ export class Reaching {
   }
 
   /** Review one other person’s pending evidence in its origin, with the same bound agendas as the main heartbeat. */
-  private async othersReview() {
+  async othersReview() {
     for (const person of this.directory().people) {
       const key = this.activity(person.id).via
       if (person.id === OWNER || !key) continue

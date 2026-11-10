@@ -31,6 +31,8 @@ interface Pending {
   resolve: (value: any) => void
   reject: (error: Error) => void
   timer: NodeJS.Timeout
+  /** The resident process it was asked of. */
+  child: ChildProcess
 }
 
 /** How long an action that may call a model has, as the old host allowed (legacy/host/mind-host.mjs). */
@@ -74,10 +76,10 @@ export class Mind {
       const timer = setTimeout(() => {
         this.pending.delete(id)
         reject(new MindError(action, { code: 'timeout' }))
-        // The worker answers in order, so a stuck request blocks every later one: restart it.
-        this.stop()
+        // The worker answers in order, so a stuck request blocks every later one: restart it (one started since is not the stuck one).
+        if (this.child === child) this.stop()
       }, timeoutMs)
-      this.pending.set(id, { action, resolve, reject, timer })
+      this.pending.set(id, { action, resolve, reject, timer, child })
       child.stdin!.write(JSON.stringify({ id, action, args }) + '\n')
     })
   }
@@ -205,7 +207,9 @@ export class Mind {
     child.stdin!.on('error', () => {})
     child.on('exit', (code, signal) => {
       if (this.child === child) this.child = undefined
+      // Only what was asked of this process: one started since has requests of its own waiting.
       for (const [id, request] of this.pending) {
+        if (request.child !== child) continue
         clearTimeout(request.timer)
         request.reject(new MindError(request.action, { code: `exited (${signal ?? code})` }))
         this.pending.delete(id)
