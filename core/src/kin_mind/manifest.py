@@ -422,7 +422,9 @@ def compare(old, new):
     """
     changes = []
     for name in sorted(set(old.get("classes", {})) | set(new.get("classes", {}))):
-        if name in {"dimensions", "desires", "concerns", "decisions", "rhythm", "assessment", "style", "traits"}:
+        # Feelings can change freely; wishes and timed concerns also carry actions.
+        # A retry must notice those changes rather than silently reuse an old send.
+        if name in {"dimensions", "decisions", "rhythm", "assessment", "style", "traits"}:
             continue
         before, after = old["classes"].get(name) or {}, new["classes"].get(name) or {}
         for key in sorted(set(before) | set(after)):

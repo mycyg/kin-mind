@@ -2939,6 +2939,9 @@ class Appraisals:
                         stale = next((r["source_id"] for r in refs if not self.mind._fresh(conn, [r])), None)
                         raise Conflict("source-needs-review", code="source-needs-review", target=stale)
                     before_state = self.mind._load(conn)
+                    if before_state["revision"] != view["revision"]:
+                        raise Conflict("Mind revision changed; read current state before updating",
+                                       expected=view["revision"], actual=before_state["revision"])
                 for ref in refs:
                     sources.append(
                         {
@@ -3872,6 +3875,12 @@ class Appraisals:
                             **({"contact_decision": contact} if contact else {})}
 
                 def rebase(conn, state):
+                    # A new wish or a changed concern can make a second contact obsolete,
+                    # even when this proposal only creates wishes and names no update id.
+                    # These are shared operational inputs, not a limit on subjective mood.
+                    if not historical and any(state.get(k) != before_state.get(k) for k in ("desires", "concerns")):
+                        raise Conflict("Appraisal operational inputs changed before commit",
+                                       expected=before_state["revision"], actual=state["revision"])
                     if manifest and flags[manifests.REBASE]:
                         # The manifest's predicate: nobody wrote what this proposal writes, and nothing
                         # this judgment type was shown of the mind state moved. Bookkeeping passes.
@@ -3901,7 +3910,7 @@ class Appraisals:
                     # in one leased, idempotent transaction, and the mind keeps its revision and history (CR-RT-10).
                     data["result"] = self.mind._record_only(event, apply)
                 else:
-                    data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase if semantic_enabled else None)
+                    data["result"] = self.mind._mutate(event, "memory-history" if historical else "affect", apply, rebase=rebase)
             # What the appraisal was shown goes with the result: the reflection is written from it (CR5-MM-02).
             self.memory.remember_reflection({**data["result"], "evaluated_sources": data.get("evaluated_sources") or [],
                                              "evaluated_ids": data.get("evaluated_ids") or []})

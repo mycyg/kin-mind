@@ -70,6 +70,9 @@ REGISTRY = {
     "Migration source set needs a bounded batch": ("semantic", "migration-batch-unbounded", "block"),
     "Exploration result changed after enqueue": ("runtime", "exploration-target-changed", "terminal"),
     "source-needs-review": ("runtime", "source-needs-review", "block"),
+    # Shared operational changes may be outside this recipient's manifest. Judge afresh,
+    # never reuse the old proposal merely because that narrower view is unchanged.
+    "Appraisal operational inputs changed before commit": ("runtime", "appraisal-inputs-changed", "block"),
     "Appraisal lease no longer owns this proposal": ("runtime", "lease-lost", "block"),
     "Evaluated sources changed before commit": ("runtime", "root-evidence-changed", "block"),
     "Referenced semantic evidence changed before commit": ("runtime", "cited-evidence-changed", "reuse"),

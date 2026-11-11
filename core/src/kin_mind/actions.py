@@ -19,8 +19,10 @@ class ActionEvents:
     def __init__(self, mind):
         self.mind = mind
 
-    def emit(self, conn, kind, key, data):
-        identifier = "action_" + digest(recipient.key([self.mind.scope.key(), kind, key]))[:32]
+    def emit(self, conn, kind, key, data, *, shared=False):
+        # A shared concern has one clock edge, regardless of which recipient checks first.
+        parts = [self.mind.scope.key(), kind, key]
+        identifier = "action_" + digest(parts if shared else recipient.key(parts))[:32]
         conn.execute(
             "INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)",
             (
@@ -187,7 +189,7 @@ class ActionEvents:
                 queued.append(self.emit(conn, "idle-review", ["concern", cid, after], {
                     "concern_id": cid, "surface_after": after,
                     "reason": "The time Kin gave this concern to come up again has come; whether to raise it stays Kin's",
-                    "evidence_ids": [r["record_id"] for r in timed[cid]["evidence"]], "agent_version": state["agent_version"]}))
+                    "evidence_ids": [r["record_id"] for r in timed[cid]["evidence"]], "agent_version": state["agent_version"]}, shared=True))
         policy = (state.get("action_policy") or {}).get("evidence") or []
         if settings.get("anniversaries") is True and policy and self.mind._fresh(conn, policy):
             from .initiative import anniversaries_today, local_day

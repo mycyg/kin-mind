@@ -72,3 +72,9 @@ npm run dev    # 起一个隔离的开发版 DSH 网页（独立 DSH_HOME，数�
 Python 的 `local-embedding` 与 `media`/`all` 附加包互斥，不使用 `--all-extras`。
 
 迁移同时恢复旧聊天地址、最后联系时间与近期已接受的主动联系记录，不重播旧消息。计划默认只读未完成的 `active` / `paused`；完成或取消后保留历史，但退出常规上下文和当前列表。按编号或明确状态仍可查询历史。
+
+### Conversation checkpoints
+
+The KIN presets use `dsh-kin/compaction`, a `BasicCompactionEngine` subclass. DSH still owns range selection, locks, token pricing, retained messages and append-only checkpoint commits. The subclass isolates the summarization task from the companion persona, presents earlier records as data without executable tools, and requires all eight non-empty checkpoint sections before allowing replacement. Invalid, empty, truncated or tool-producing output leaves the existing surface intact. Prior checkpoints and later corrections are summarized together; source identities remain attached so the existing deletion filter still applies. Structural validation does not prove semantic completeness of model-written summaries.
+
+`node dev/e2e-compaction.mjs` checks real compaction transactions with a synthetic model, cumulative context, unchanged retained messages, rejection and serialized session replay. `KIN_COMPACTION_BASELINE=1` runs the same assertions against the unmodified upstream engine and exposes the original acceptance bug. No contacts or real sessions are used.

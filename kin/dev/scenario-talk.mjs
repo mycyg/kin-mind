@@ -150,6 +150,9 @@ async function run(ctx, config, chat) {
   report.afterApprovalSystem = chat.requests.at(-1)?.system ?? ''
   await settle()
 
+  // Verify the held reply before deliberately cooling down its scripted model in the fallback check.
+  report.cameBack = await until(() => assistantSaid(ctx, sessionId, '我回来啦'), 480_000)
+
   // A turn that goes to DSH's own model, so the harness can measure what a KIN request carries.
   report.measured = await say(ctx, sessionId, '量一下')
   await settle()
@@ -160,8 +163,6 @@ async function run(ctx, config, chat) {
   const coding = await ctx.sessionController.create({ cwd: work, agentPreset: 'standard' })
   report.coding = await say(ctx, coding.sessionId, '看看这里有什么')
 
-  // Her held reply comes back into the conversation when its time comes (Core's least wait is five minutes).
-  report.cameBack = await until(() => assistantSaid(ctx, sessionId, '我回来啦'), 480_000)
   const { state } = await mind.call('read')
   report.laterWish = state.desires.find((wish) => wish.id === report.laterChoice.desire_id)?.status ?? 'archived'
   report.energy = (await mind.call('state-overview', { query: '' })).energy_context

@@ -632,7 +632,9 @@ class Mind(Continuity):
         with self.engine.db.connect(write=True) as conn:
             def run():
                 state = self._load(conn)
-                subjective = kind == "affect" and payload.get("subjective") is True
+                # Direct feelings need no snapshot fence. A review also writes operational
+                # decisions, so its supplied rebase predicate must still be honored.
+                subjective = kind == "affect" and payload.get("subjective") is True and rebase is None
                 if state["revision"] != payload["expected_revision"] and not subjective and not (rebase and rebase(conn, state)):
                     raise Conflict(
                         "Mind revision changed; read current state before updating",

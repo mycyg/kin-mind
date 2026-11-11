@@ -8,6 +8,7 @@
   "exports": {
     ".": "./lib/index.js",
     "./preset": "./lib/preset.js",
+    "./compaction": "./lib/compaction.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -44,6 +45,7 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
     "@deepseek-ai/dsh-agent": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-compaction-basic": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-agent-preset-registry": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-api-session-controller": ">=0.2.2-rc.1 <0.3.0",
     "@deepseek-ai/dsh-attachment": ">=0.2.2-rc.1 <0.3.0",

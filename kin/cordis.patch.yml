@@ -42,7 +42,7 @@
               # 32K or 64K model no room to compact at all. Her turns add little at a time (a recall block,
               # pruned tool results), so a smaller margin serves every window her lanes may be given.
               - id: compaction-basic
-                name: '@deepseek-ai/dsh-compaction-basic'
+                name: 'dsh-kin/compaction'
                 config:
                   headroomTokens: 16384
               - id: command-compact
@@ -134,7 +134,7 @@
             config:
               # The same margin as her own preset: this one runs on her lanes too.
               - id: compaction-basic
-                name: '@deepseek-ai/dsh-compaction-basic'
+                name: 'dsh-kin/compaction'
                 config:
                   headroomTokens: 16384
               - id: command-compact

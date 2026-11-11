@@ -153,3 +153,13 @@ CI 首轮发现 contact 合成场景先等主人联系，再确认朋友的未�
 - 两次现有记忆检索返回记录；原生 DSH 聊天实际执行三次 `kin_recall`，请求含真实人设及回忆上下文，产生可见回复并正常结束。人工检查回复与回忆中的表达偏好相符。没有测试消息发给联系人；原始回复、记忆和凭据仅留在私有验证目录。
 - 当前四条不同模型路线均通过实际 API 结构化工具调用；没有修改生产路线或思考档位。这证明本次调用可用，不能替代长时间稳定性、真实平台故障重试或所有人格情境的验证。
 - 仍有配置边界：32K 上下文同时预留 16K 输出与 16K 压缩空间时，压缩会被拒绝；需降低输出上限或更换聊天模型。没有为了测试放宽该保护。
+
+
+## 2026-11-11 continuity and concurrent review repair
+
+- Nine synthetic regression cases fail against the original source and pass against the repair: one shared timer event across recipient orderings; stale operational proposals rejected and freshly judged in both semantic modes; cross-recipient retries; and a context-assembly revision race. Related Core coverage passes 66 tests.
+- Full Core suite: 1427 passed, 1 skipped. The first run exposed the pre-existing local SOCKS dependency issue; the clean test-process environment passes without changing product settings or test expectations.
+- Compaction regressions use the real DSH transaction and native Session replay with a synthetic model. The original engine accepts a conversational answer and fails the regression; the new engine rejects it before surface replacement. Valid cumulative output, unchanged original events and tail, truncation/empty/missing sections, source identities and media are covered.
+- TypeScript typecheck and production build pass. New Python regression file passes Ruff. The five affected existing Python modules retain the same 22 baseline lint findings; no new lint findings were introduced.
+- End-to-end suites use isolated local data and fake transports; no real contact messages are sent. Existing parallel test fixtures can race on their non-atomic JSON reads; affected suites are rerun individually with their original assertions.
+- Automated checkpoint validation proves structural completeness and preserves transaction boundaries, not semantic perfection of future model-written summaries. No natural production conversation or future model compaction is fabricated as a test.

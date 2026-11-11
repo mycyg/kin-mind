@@ -13,7 +13,7 @@ rmSync('lib', { recursive: true, force: true })
 
 // Host half: ESM for Node. Packages stay external so DSH resolves its own copies (peers).
 await build({
-  entryPoints: ['src/index.ts', 'src/preset.ts'],
+  entryPoints: ['src/index.ts', 'src/preset.ts', 'src/compaction.ts'],
   outdir: 'lib',
   bundle: true,
   splitting: true,

@@ -1,5 +1,13 @@
 # Changelog
 
+
+## 2026-11-11
+
+- A shared timed concern now wakes one durable appraisal across recipient checks instead of creating a separate event per recipient.
+- Appraisals validate operational state at commit and rebuild their judgment after shared wishes or concerns change. Direct subjective feelings remain freely editable.
+- KIN compaction uses an isolated cumulative-summary task, with no executable conversation or tools, and rejects conversational, incomplete, empty or truncated output before replacing context.
+- Added regression coverage for cross-recipient timer identity, concurrent stale proposals, retry behavior, checkpoint validation and retained history.
+
 ## 2026-11-10 — Validate and release the reviewed runtime
 
 - Keep the channel integration checks aligned with per-conversation ordering while retaining exact message counts, uniqueness and attachment checks. Supply the optional service lookup in the review-health host fixture.
