@@ -30,7 +30,9 @@ interface Pending {
   action: string
   resolve: (value: any) => void
   reject: (error: Error) => void
-  timer: NodeJS.Timeout
+  timer?: NodeJS.Timeout
+  timeoutMs: number
+  frame: string
   /** The resident process it was asked of. */
   child: ChildProcess
 }
@@ -73,15 +75,25 @@ export class Mind {
     const child = this.child ?? this.start()
     const id = ++this.seq
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new MindError(action, { code: 'timeout' }))
-        // The worker answers in order, so a stuck request blocks every later one: restart it (one started since is not the stuck one).
-        if (this.child === child) this.stop()
-      }, timeoutMs)
-      this.pending.set(id, { action, resolve, reject, timer, child })
-      child.stdin!.write(JSON.stringify({ id, action, args }) + '\n')
+      this.pending.set(id, { action, resolve, reject, timeoutMs, frame: JSON.stringify({ id, action, args }) + '\n', child })
+      this.sendNext(child)
     })
+  }
+
+  /** Core serves frames serially. Only its executing request owns a deadline: time spent
+   * behind another request is not evidence that this action is stuck. */
+  private sendNext(child: ChildProcess): void {
+    if (this.child !== child || [...this.pending.values()].some(p => p.child === child && p.timer)) return
+    const next = [...this.pending.entries()].find(([, p]) => p.child === child)
+    if (!next) return
+    const [id, request] = next
+    request.timer = setTimeout(() => {
+      this.pending.delete(id)
+      request.reject(new MindError(request.action, { code: 'timeout' }))
+      // Do not replay queued writes after an uncertain result. The exiting worker rejects them.
+      if (this.child === child) this.stop()
+    }, request.timeoutMs)
+    child.stdin!.write(request.frame)
   }
 
   /** An action that may call a model, in a process of its own; it ends when the action does or its time is up. */
@@ -201,6 +213,7 @@ export class Mind {
       clearTimeout(request.timer)
       if (frame.ok) request.resolve(frame.result)
       else request.reject(new MindError(request.action, frame.error ?? {}))
+      this.sendNext(child)
     })
     this.relay(child, 'serve')
     // A process that died takes its pipe with it; the exit below answers every waiting request.
@@ -215,7 +228,17 @@ export class Mind {
         this.pending.delete(id)
       }
     })
-    child.on('error', (error) => log('mind: cannot start ' + python + ': ' + error.message))
+    child.on('error', (error) => {
+      log('mind: cannot start ' + python + ': ' + error.message)
+      if (this.child === child) this.child = undefined
+      // A failed spawn emits no exit event; queued calls have no execution timers yet.
+      for (const [id, request] of this.pending) {
+        if (request.child !== child) continue
+        clearTimeout(request.timer)
+        request.reject(new MindError(request.action, { code: 'cannot start: ' + error.message }))
+        this.pending.delete(id)
+      }
+    })
     this.child = child
     return child
   }

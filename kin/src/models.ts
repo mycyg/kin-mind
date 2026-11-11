@@ -3,12 +3,13 @@
  * - `kin/chat`: her replies in conversation, where feeling matters.
  * - `kin/task`: everything else she does — helpers, exploration, reviews and background work.
  * A call tries its lane's routes in order and moves on while a route has not started answering:
- * an error, or no first chunk in time (a minute; twenty seconds for a chat route with another behind it,
+ * an error, or no first chunk in time (a minute; thirty seconds for a chat route with another behind it,
  * since someone is waiting). Once a route answers it keeps the turn. A route that just failed is tried
  * after the others for a few minutes, so a route that is down does not cost every reply its wait.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
 import { answerText, modelOutput } from './model-output.js'
+import { modelRequest, rememberRoute } from './model-history.js'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   LlmAdapter, ReasoningEffortId, type GenerateOptions, type LlmFailure, type LlmResolvedModelInfo, type StreamChunk,
@@ -21,7 +22,7 @@ export const LANES = ['chat', 'task'] as const
 export type Lane = (typeof LANES)[number]
 const NAMES: Record<Lane, string> = { chat: 'KIN 聊天', task: 'KIN 做事' }
 const FIRST_CHUNK_MS = 60_000
-const CHAT_FIRST_CHUNK_MS = 20_000
+const CHAT_FIRST_CHUNK_MS = 30_000
 const COOL_MS = 5 * 60_000
 
 export interface Route {
@@ -142,7 +143,8 @@ export class KinModel extends LlmAdapter {
       const stop = () => attempt.abort()
       options.signal?.addEventListener('abort', stop, { once: true })
       const patience = lane === 'chat' && index < order.length - 1 ? CHAT_FIRST_CHUNK_MS : FIRST_CHUNK_MS
-      const timer = setTimeout(stop, patience)
+      let firstTokenTimedOut = false
+      const timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
       const held: StreamChunk[] = []
       let answering = false
       failure = undefined
@@ -151,11 +153,21 @@ export class KinModel extends LlmAdapter {
         this.effortOf(lane, route),
         new Promise<undefined>((resolve) => attempt.signal.addEventListener('abort', () => resolve(undefined), { once: true })),
       ])
+      // Observe transport tokens before envelope decoding: hidden reasoning is progress too.
+      const observe = async function* (source: AsyncIterable<StreamChunk>) {
+        for await (const chunk of source) {
+          if (((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && Boolean(chunk.text))
+            || (chunk.type === 'tool-call-delta' && Boolean(chunk.argumentsDelta))
+            || (chunk.type === 'block-end' && (chunk.block.type === 'tool-call'
+              || ((chunk.block.type === 'text' || chunk.block.type === 'reasoning') && Boolean(chunk.block.text))))) clearTimeout(timer)
+          yield chunk
+        }
+      }
       try {
-        for await (const chunk of modelOutput(this.ctx.llm.stream({
+        for await (const chunk of modelOutput(observe(this.ctx.llm.stream(modelRequest({
           ...options, messages, provider: route.provider, model: route.model, signal: attempt.signal,
           reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
-        }))) {
+        }, route))))) {
           if (!answering) {
             if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
               failure = chunk.reason.failure
@@ -163,7 +175,6 @@ export class KinModel extends LlmAdapter {
             }
             if (chunk.type === 'finish') break
             // Thinking and incomplete tool arguments have not answered or executed anything yet.
-            if (chunk.type !== 'usage') clearTimeout(timer)
             const visible = (chunk.type === 'text-delta' && Boolean(chunk.text))
               || (chunk.type === 'block-end' && (chunk.block.type === 'tool-call' || (chunk.block.type === 'text' && Boolean(chunk.block.text))))
             if (!visible) {
@@ -174,7 +185,7 @@ export class KinModel extends LlmAdapter {
             clearTimeout(timer)
             yield* held
           }
-          yield chunk
+          yield rememberRoute(chunk, route)
         }
         if (!answering && !failure) failure = { code: 'NO_RESPONSE', message: '模型没有返回内容' }
       } catch (error) {
@@ -195,7 +206,7 @@ export class KinModel extends LlmAdapter {
         this.last[lane] = { at: new Date().toISOString(), answered: route, failed: [...failed, ...resting] }
         return
       }
-      const reason = attempt.signal.aborted ? `${patience / 1000} 秒没有回应` : describe(failure)
+      const reason = firstTokenTimedOut ? `${patience / 1000} 秒未收到首个 token（含思考）` : describe(failure)
       this.cooling.set(key(route), { until: Date.now() + COOL_MS, reason })
       failed.push({ route, reason })
     }

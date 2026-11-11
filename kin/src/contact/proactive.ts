@@ -213,8 +213,9 @@ export class Reaching {
       const scope = { recipient_person_id: person.id, conversation_key: key }
       const due = await this.host.mind.call('review-due', scope)
       if (due.action !== true) continue
-      this.status['review:' + person.id] = { ...(await this.host.mind.run<Answer>('review', { ...scope, unified_targets: await this.reviewTargets() })), at: new Date().toISOString() }
-      return
+      const answer = await this.host.mind.run<Answer>('review', { ...scope, unified_targets: await this.reviewTargets() })
+      this.status['review:' + person.id] = { ...answer, at: new Date().toISOString() }
+      return answer
     }
   }
 

@@ -1,3 +1,13 @@
+## 2026-11-11 — Model replay and background health recovery
+
+- Chat fallback waits 30 seconds for the first real token, including reasoning and hidden relay reasoning; empty stream headers do not count. Explicit errors remain distinguishable from a first-token timeout.
+- Claude requests project full dialogue and tool results without incompatible Responses replay state, including state returned by the same Claude relay. Stored history and native replay for other routes remain intact.
+- Resident Core requests receive an execution deadline only when dispatched, avoiding queue-induced timeout cascades; uncertain or interrupted writes are never replayed automatically.
+- Successful idle polls clear stale background failure streaks, while per-contact review outcomes reach heartbeat health instead of being discarded.
+
+# Changelog
+
+
 # Changelog
 
 

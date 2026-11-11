@@ -150,6 +150,7 @@ export class Heartbeat {
       void this.lane(lane, async () => {
         const answer = await round()
         if (answer) this.note(lane, answer)
+        else if (this.beats[lane]?.state === 'failed') this.note(lane, { state: 'idle' })
       }, whileReplying)
     }
   }
@@ -169,6 +170,7 @@ export class Heartbeat {
   /** Nothing to run: a pause is worth saying, an idle minute is not (the last round that ran stays on show). */
   private quiet(lane: Lane, due: Due) {
     if (due.state === 'paused') this.note(lane, due)
+    else if (this.beats[lane]?.state === 'failed') this.note(lane, { state: 'idle' })
   }
 
   /** One lane's round, never two at once and none while she is replying or frozen. */
