@@ -78,3 +78,10 @@ Python 的 `local-embedding` 与 `media`/`all` 附加包互斥，不使用 `--al
 The KIN presets use `dsh-kin/compaction`, a `BasicCompactionEngine` subclass. DSH still owns range selection, locks, token pricing, retained messages and append-only checkpoint commits. The subclass isolates the summarization task from the companion persona, presents earlier records as data without executable tools, and requires all eight non-empty checkpoint sections before allowing replacement. Invalid, empty, truncated or tool-producing output leaves the existing surface intact. Prior checkpoints and later corrections are summarized together; source identities remain attached so the existing deletion filter still applies. Structural validation does not prove semantic completeness of model-written summaries.
 
 `node dev/e2e-compaction.mjs` checks real compaction transactions with a synthetic model, cumulative context, unchanged retained messages, rejection and serialized session replay. `KIN_COMPACTION_BASELINE=1` runs the same assertions against the unmodified upstream engine and exposes the original acceptance bug. No contacts or real sessions are used.
+
+
+### Long requests on relay routes
+
+A route may set `longInputWaitMs` between `60000` and `300000`. It applies only when the complete BPE request estimate, including tool definitions and results, reaches 128,000 tokens. Smaller requests retain the existing 30-second chat fallback or 60-second deadline. Genuine reasoning or output ends the first-token wait; user cancellation still aborts the request. This does not change the input budget, output reservation, or retry rules after visible output or completed tool calls.
+
+Configure each provider with a protocol its endpoint actually supports. A relay's model list does not prove Responses compatibility. Separate providers can use `anthropic-messages` and `openai-completions`; keep credentials in the DSH credentials service through `apiKeyEnv`. A protocol migration preserves durable history and projects completed old-protocol exchanges only at the request boundary.

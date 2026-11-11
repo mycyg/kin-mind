@@ -85,6 +85,44 @@ try {
       assert.ok(!error.model.last.task.failed[0].reason.includes('秒'))
     } finally { globalThis.setTimeout = set; globalThis.clearTimeout = clear }
   })
+  await check('long-input waits are route-scoped, count tool overhead, and remain cancellable', async () => {
+    const set = globalThis.setTimeout, clear = globalThis.clearTimeout
+    const scheduled = new Map()
+    globalThis.setTimeout = (fn, ms, ...args) => {
+      if (![30000, 60000, 300000].includes(ms)) return set(fn, ms, ...args)
+      const handle = { ms, fn }; scheduled.set(handle, handle); return handle
+    }
+    globalThis.clearTimeout = handle => { if (!scheduled.delete(handle)) clear(handle) }
+    try {
+      for (const large of [false, true]) {
+        let calls = 0
+        const model = new KinModel({ llm: { async *stream(request) {
+          calls++
+          assert.equal([...scheduled.values()][0].ms, large ? 300000 : 30000)
+          yield { type: 'reasoning-delta', index: 0, text: 'working' }
+          assert.equal(scheduled.size, 0)
+          yield { type: 'text-delta', index: 1, text: 'done' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        } } }, () => [{ ...route('selected'), longInputWaitMs: 300000 }, route('fallback')])
+        for await (const _ of model.stream({ provider: 'kin', model: 'chat', messages: [user()],
+          tools: large ? [{ name: 'large_schema', description: '漢'.repeat(80000), parameters: { type: 'object' } }] : tools })) {}
+        assert.equal(calls, 1)
+        assert.equal(model.last.chat.answered.model, 'selected')
+      }
+      const stop = new AbortController()
+      let calls = 0
+      const model = new KinModel({ llm: { async *stream(request) {
+        calls++
+        assert.equal([...scheduled.values()][0].ms, 300000)
+        stop.abort()
+        assert.equal(request.signal.aborted, true)
+        throw Error('cancelled')
+      } } }, () => [{ ...route('selected'), longInputWaitMs: 300000 }, route('fallback')])
+      for await (const _ of model.stream({ provider: 'kin', model: 'chat', messages: [user('漢'.repeat(80000))], signal: stop.signal })) {}
+      assert.equal(calls, 1, 'user cancellation must not start fallback')
+      assert.equal(scheduled.size, 0)
+    } finally { globalThis.setTimeout = set; globalThis.clearTimeout = clear }
+  })
   await check('Gemini normalizes nested nullable schemas and tool updates, preserving every mixed-union branch and durable definitions', async () => {
     const before = JSON.stringify(tools), message = user()
     const { requests: [sent] } = await capture([route('gemini-test')], { messages: [message], tools,

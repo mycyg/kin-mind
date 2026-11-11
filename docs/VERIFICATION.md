@@ -172,4 +172,16 @@ CI 首轮发现 contact 合成场景先等主人联系，再确认朋友的未�
 - 注入“段落已经开始投递，模型随后报告上下文错误”并验证没有重新生成，平台回执最终持久化为 accepted。测试使用隔离假平台，没有向真实联系人发送消息。
 - 实际 Gemini Responses 适配器携带完整工具定义，完成工具调用、合成结果回放、第二轮最终回答。原版与候选均通过；先前的 schema 400 未复现，不能据此宣称已找到该错误的唯一根因。
 - 对同一合成长输入做流式/非流式与有/无工具矩阵：无工具两种模式均读取约 665k tokens，非流式有工具读取约 680k，六处随机校验点全部保留；当前转发路线流式有工具仅报告 127,997，后四处校验点错误。此约束属于实测转发链路，不能泛化为 Gemini 官方窗口。
-- KIN 请求输入预算为 648,000，正常预检触发点 583,200；物理窗口仍须容纳请求输出与安全余量。BPE 是保守估计而非供应商精确计数。单独配置有工具的转发输入限制，提前切换可承载的备用路线，不降低整条模型列表的预算。
+- KIN 请求输入预算为 648,000，正常预检触发点 583,200；物理窗口仍须容纳请求输出与安全余量。BPE 是本地预算估计，与供应商计数可能有偏差；648k 和 583,200 均指 KIN 的本地预算，并非供应商精确 token 上限。单独配置有工具的转发输入限制，提前切换可承载的备用路线，不降低整条模型列表的预算。
+
+
+## 2026-11-11: replacement relay and long-input waiting
+
+- The replacement relay's Responses route did not pass: Claude returned an explicit unsupported conversion error; Gemini emitted a tool call followed by a parser error. Production uses the advertised native Messages and Chat Completions endpoints instead, through the existing DSH adapters.
+- Real API tests supplied all 68 generic tool definitions without executing business tools or sending contact messages. Both models completed a tool call, detached synthetic result, and successful second response. Synthetic completed history from the previous Responses protocol also passed through the actual KIN route and both new protocols.
+- Fresh random long inputs contained six A markers and six different B markers distributed throughout the request. The first tool call had to quote A only; the second response had to recover B from the original input. Both sets passed in full, without first-call leakage of B. Claude reported about 919k input tokens and Gemini about 679k, including reported cache accounting. This verifies retention for these requests, not every future relay response.
+- The requested output caps were 128,000 for Claude and 65,536 for Gemini; actual test outputs were short. These tests establish acceptance of the cap, not generation of an entire maximum-length response.
+- Long Gemini prefill exceeded the normal first-token deadline. The new opt-in route setting is tested with tool-schema pressure, short-request deadlines, reasoning progress, cancellation, settings persistence and a real KIN long-request round trip. Codex and DeepSeek do not opt in.
+- No proxy, upstream dependency patch, synthetic signature, private history fixture or credential is included in the release. The existing 648k/90% compaction and no-regeneration-after-side-effects protections remain active.
+
+- Release checks: Core 1,427 passed / 1 skipped; Node business 10 passed; 13 integration suites 147 passed. Type checking, build and stop/runtime/session-head checks passed. The new wait regression fails against the previously deployed source and passes with the candidate; the strengthened settings-persistence check also passes.

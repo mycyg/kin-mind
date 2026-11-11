@@ -24,6 +24,7 @@ export type Lane = (typeof LANES)[number]
 const NAMES: Record<Lane, string> = { chat: 'KIN 聊天', task: 'KIN 做事' }
 const FIRST_CHUNK_MS = 60_000
 const CHAT_FIRST_CHUNK_MS = 30_000
+const LONG_INPUT_TOKENS = 128_000
 const COOL_MS = 5 * 60_000
 
 export interface Route {
@@ -33,6 +34,8 @@ export interface Route {
   effort?: string
   /** Verified relay input ceiling when tool definitions are present; independent of model capacity. */
   toolInputLimit?: number
+  /** Bounded first-token wait for requests estimated at 128k tokens or more on this route. */
+  longInputWaitMs?: number
 }
 
 /** How a lane's latest call went: which route answered and why the ones before it did not. */
@@ -163,10 +166,15 @@ export class KinModel extends LlmAdapter {
     const order = [...routes.filter((route) => !cool(route)), ...routes.filter(cool)]
     for (const [index, route] of order.entries()) {
       if (options.signal?.aborted) return
-      if (route.toolInputLimit && options.tools?.length) {
+      let estimatedTokens: number | undefined
+      const requestEstimate = () => {
+        if (estimatedTokens !== undefined) return estimatedTokens
         const request = modelRequest({ ...options, messages, provider: route.provider, model: route.model }, route)
-        const estimate = estimateRequestTokens(request, this.ctx.llm.imageRequestPricing?.(route.provider, route.model),
+        return estimatedTokens = estimateRequestTokens(request, this.ctx.llm.imageRequestPricing?.(route.provider, route.model),
           ref => this.ctx.llm.fileRequestText(ref), tokenCache)
+      }
+      if (route.toolInputLimit && options.tools?.length) {
+        const estimate = requestEstimate()
         if (estimate >= Math.max(0, route.toolInputLimit - 8192)) {
           failure = { code: 'CONTEXT_WINDOW_EXCEEDED', message: `Route tool-input limit: estimated ${estimate} tokens exceeds safe budget ${route.toolInputLimit - 8192} (relay limit ${route.toolInputLimit}).` }
           failed.push({ route, reason: failure.message })
@@ -176,7 +184,9 @@ export class KinModel extends LlmAdapter {
       const attempt = new AbortController()
       const stop = () => attempt.abort()
       options.signal?.addEventListener('abort', stop, { once: true })
-      const patience = lane === 'chat' && index < order.length - 1 ? CHAT_FIRST_CHUNK_MS : FIRST_CHUNK_MS
+      const normalPatience = lane === 'chat' && index < order.length - 1 ? CHAT_FIRST_CHUNK_MS : FIRST_CHUNK_MS
+      const patience = route.longInputWaitMs && requestEstimate() >= LONG_INPUT_TOKENS
+        ? Math.max(normalPatience, Math.min(300_000, route.longInputWaitMs)) : normalPatience
       let firstTokenTimedOut = false
       const timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
       const held: StreamChunk[] = []

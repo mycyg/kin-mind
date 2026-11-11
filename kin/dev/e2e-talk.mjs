@@ -47,10 +47,12 @@ if (existsSync(out)) {
   pages.working = await page('models/test', { provider: 'deepseek-official', model: 'deepseek-flash' })
   pages.after = await page('talk')
   const settings = await page('settings')
-  const savedRoutes = settings.models.lanes.chat.routes.map((r, i) => i === 0 ? { ...r, toolInputLimit: 128000 } : r).reverse()
+  const savedRoutes = settings.models.lanes.chat.routes.map((r, i) => i === 0 ? { ...r, toolInputLimit: 128000, longInputWaitMs: 300000 } : r).reverse()
   await page('models', { lane: 'chat', routes: savedRoutes })
   pages.routeBudget = (await page('settings')).models.lanes.chat.routes.at(-1)?.toolInputLimit === 128000
+    && (await page('settings')).models.lanes.chat.routes.at(-1)?.longInputWaitMs === 300000
     && JSON.parse(readFileSync(join(dataDir, 'models.json'), 'utf8')).chat.at(-1)?.toolInputLimit === 128000
+    && JSON.parse(readFileSync(join(dataDir, 'models.json'), 'utf8')).chat.at(-1)?.longInputWaitMs === 300000
 }
 dsh.kill('SIGTERM')
 await Promise.race([new Promise((done) => dsh.once('exit', done)), new Promise((done) => setTimeout(done, 5000))])

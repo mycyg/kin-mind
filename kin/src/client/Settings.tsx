@@ -190,7 +190,7 @@ function RouteLane({ lane, title, hint, answered, data, catalog, onSaved }: {
                 }}>
                 <span className="kin-grip"><Grip size={14} /></span>
                 <span className="kin-route-n">{index + 1}</span>
-                <span className="kin-route-name">{nameOf(route, catalog)}{route.toolInputLimit && <small title="此转发路线携带工具时的实测输入限制；超限会提前转到备用路线。"> · 工具输入上限 {route.toolInputLimit.toLocaleString()}</small>}</span>
+                <span className="kin-route-name">{nameOf(route, catalog)}{route.longInputWaitMs && <small title={`完整请求估算达到 128k token 时，最多等待 ${route.longInputWaitMs / 1000} 秒开始输出；短请求保留原等待时间，可随时取消。`}> · 长输入等待 {route.longInputWaitMs / 1000} 秒</small>}{route.toolInputLimit && <small title="此转发路线携带工具时的实测输入限制；超限会提前转到备用路线。"> · 工具输入上限 {route.toolInputLimit.toLocaleString()}</small>}</span>
                 <span className="kin-route-tools">
                   <Effort lane={lane} route={route} catalog={catalog}
                     onChange={(effort) => {
@@ -281,7 +281,7 @@ function Features({ features, onSaved }: { features: Record<Feature, boolean>; o
 interface Probe { ok: boolean; ms: number; reason?: string }
 const seconds = (ms: number) => (ms < 1000 ? `${ms} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`)
 const same = (a: Route, b: Route) => a.provider === b.provider && a.model === b.model
-const keyOf = (routes: Route[]) => routes.map((r) => `${r.provider}/${r.model}/${r.effort ?? ''}/${r.toolInputLimit ?? ''}`).join('\n')
+const keyOf = (routes: Route[]) => routes.map((r) => `${r.provider}/${r.model}/${r.effort ?? ''}/${r.toolInputLimit ?? ''}/${r.longInputWaitMs ?? ''}`).join('\n')
 
 function nameOf(route: Route, catalog: Catalog): string {
   const group = catalog.find((g) => g.id === route.provider)

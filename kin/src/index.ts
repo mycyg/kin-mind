@@ -432,9 +432,10 @@ export function apply(ctx: Context, config: Config) {
       const { lane, routes: next } = await body<{ lane: Lane; routes: Route[] }>(request)
       const valid = Array.isArray(next) && next.every((r) => typeof r?.provider === 'string' && typeof r?.model === 'string'
         && r.provider !== PROVIDER && (r.effort === undefined || typeof r.effort === 'string')
-        && (r.toolInputLimit === undefined || (Number.isSafeInteger(r.toolInputLimit) && r.toolInputLimit > 8192)))
+        && (r.toolInputLimit === undefined || (Number.isSafeInteger(r.toolInputLimit) && r.toolInputLimit > 8192))
+        && (r.longInputWaitMs === undefined || (Number.isSafeInteger(r.longInputWaitMs) && r.longInputWaitMs >= 60000 && r.longInputWaitMs <= 300000)))
       if (!lane || !LANES.includes(lane) || !valid) throw new Error('模型路线格式不对')
-      routes[lane] = next.map(({ provider, model, effort, toolInputLimit }) => ({ provider, model, ...(effort ? { effort } : {}), ...(toolInputLimit ? { toolInputLimit } : {}) }))
+      routes[lane] = next.map(({ provider, model, effort, toolInputLimit, longInputWaitMs }) => ({ provider, model, ...(effort ? { effort } : {}), ...(toolInputLimit ? { toolInputLimit } : {}), ...(longInputWaitMs ? { longInputWaitMs } : {}) }))
       save('models.json', routes)
       return { saved: true }
     },

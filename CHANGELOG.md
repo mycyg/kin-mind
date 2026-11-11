@@ -1,3 +1,9 @@
+## 2026-11-11 — Native relay migration and long-input patience
+
+- Use the replacement relay's supported protocols: native Anthropic Messages for Claude and Chat Completions for Gemini. Preserve completed prior-protocol history and native tool replay; no local proxy or fabricated signatures are required.
+- Allow a configured route to wait up to five minutes for its first token when the complete request estimate reaches 128,000 tokens. Short requests retain their existing deadlines; cancellation and failure recovery remain unchanged. Persist and display the route setting.
+- Keep the 648,000-token KIN input budget and 583,200-token compaction threshold. Retire the former relay's tool-input restriction only on the replacement route after independent long-input/tool-result checks.
+
 ## 2026-11-11 — Complete request budgets and safe error recovery
 
 - Set KIN's input budget to 648,000 tokens with a 90% preflight threshold, separately reserving actual output capacity. Count complete requests with a bounded BPE estimate, including tool schemas, results and expanded files; preserve per-route output reservations.
