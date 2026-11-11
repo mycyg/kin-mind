@@ -5,19 +5,21 @@ import type { Route } from './models.js'
 type ObjectValue = Record<string, unknown>
 const object = (value: unknown): ObjectValue | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ObjectValue : undefined
 
-/** Gemini's relay accepts nullable, but drops the type of a single typed anyOf plus null. Mixed unions stay unions. */
+/** Lift null out of nullable unions, retaining every non-null branch and its constraints. */
 function geminiSchema(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(geminiSchema)
   const node = object(value)
   if (!node) return value
   const result = Object.fromEntries(Object.entries(node).map(([key, child]) => [key, geminiSchema(child)]))
-  if (Array.isArray(result.anyOf) && result.anyOf.length === 2) {
-    const alternatives = result.anyOf.map(object)
-    const nonNull = alternatives.filter((branch) => branch && branch.type !== 'null')
-    if (nonNull.length === 1 && alternatives.some((branch) => branch?.type === 'null')) {
-      delete result.anyOf
-      return { ...nonNull[0], ...result, nullable: true }
-    }
+  for (const keyword of ['anyOf', 'oneOf']) {
+    const branches = result[keyword]
+    if (!Array.isArray(branches)) continue
+    const nonNull = branches.filter(branch => object(branch)?.type !== 'null')
+    if (!nonNull.length || nonNull.length === branches.length) continue
+    delete result[keyword]
+    if (nonNull.length === 1) return { ...object(nonNull[0]), ...result, nullable: true }
+    result[keyword] = nonNull
+    result.nullable = true
   }
   return result
 }

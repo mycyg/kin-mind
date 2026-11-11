@@ -83,6 +83,10 @@ if (report.error) {
 
 const unknownPart = report.mingUnknown?.id + ':0'
 const checks = {
+  'late overflow with an in-flight platform receipt ends in error without compaction, regeneration or duplicate sends': report.partialFailure?.calls === 1
+    && report.partialFailure.summaries === 0 && report.partialFailure.compactions === 0 && report.partialFailure.attempts === 1
+    && report.partialFailure.delivery?.sent.filter(s => s.state === 'accepted').length === 1
+    && report.partialFailure.delivery.sent[0].platformId && report.partialFailure.ended.includes('error') && report.partialFailure.sent.length === 1 && report.partialFailure.sent[0].text === 'Synthetic accepted paragraph.',
   'relay thought paragraphs never reach WeChat or cross-conversation history': report.mingSends.some((s) => s.text === '收到啦～')
     && !JSON.stringify([report.mingSends, report.groupMentioned.sent, report.looks]).includes('Private test reasoning'),
   '小明 twice within 20 s is one message to her, named': report.ming?.turns.length === 1 && report.ming.turns[0].text === '小明：在吗\n小明：我今天看到星星了',

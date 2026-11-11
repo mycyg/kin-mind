@@ -24,6 +24,7 @@ class FakeWechat {
   close() {}
   status() { return { state: 'connected' } }
   async send(to, part, id) {
+    if (part.text === 'Synthetic accepted paragraph.') await new Promise(resolve => setTimeout(resolve, 200))
     this.sent.push({ chat: to.chat, text: part.text ?? '', file: part.file, kind: part.kind, named: part.named, id, at: new Date().toISOString() })
     if (part.text === this.unknownText) return { state: 'unknown', reason: 'timeout' }
     return { state: 'accepted', platformId: 'wx-' + this.sent.length }
@@ -44,9 +45,13 @@ class Chat extends LlmAdapter {
   providerInfo() { return { id: 'kin-test', name: 'KIN test' } }
   async listModels() { return [] }
   async resolveModel(provider, model) {
-    return { provider, id: model, name: model, inputModalities: ['text'], context: { contextWindow: 200_000 } }
+    return { provider, id: model, name: model, inputModalities: ['text'], defaultMaxTokens: 2000, context: { contextWindow: 200_000 } }
   }
   async *stream(options) {
+    if (options.purpose === 'compaction') {
+      this.partialSummaries = (this.partialSummaries ?? 0) + 1
+      return yield* words(['Primary Request and Intent', 'Key Technical Concepts', 'Files and Code', 'Errors and Fixes', 'Pending Jobs', 'Current Work', 'Next Step', 'Critical Context'].map(name => `## ${name}\n- Synthetic retained context.`).join('\n\n'))
+    }
     if (options.model === 'scripted') return yield* appraisal(options)
     const texts = (options.messages ?? []).map((m) => ({ role: m.role, text: (m.content ?? []).map((b) => b.text ?? '').join('') }))
     if (options.system?.includes('最后只输出一个 JSON 对象')) {
@@ -60,6 +65,14 @@ class Chat extends LlmAdapter {
     // What was said last: the newest words of a person, not her recall block, her own told words or DSH's runtime notes.
     const answered = texts.at(-1)?.role === 'tool'
     const said = texts.findLast((m) => m.role === 'user' && !/^(（|这条消息的来源编号|Current runtime context|Time sampled)/.test(m.text))?.text ?? ''
+    if (said.includes('synthetic partial failure')) {
+      this.partialCalls = (this.partialCalls ?? 0) + 1
+      if (this.partialCalls > 1) return yield* words('Synthetic regenerated reply.')
+      yield { type: 'text-delta', index: 0, text: 'Synthetic accepted paragraph.\n\nUnfinished tail' }
+      await new Promise(resolve => setTimeout(resolve, 30))
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'Synthetic late overflow' } } }
+      return
+    }
     // What she read of another conversation, kept for the report.
     if (answered && texts.at(-1).text.includes('最近的话')) (this.looks ??= []).push(texts.at(-1).text)
     const relay = /转告小明：(.+)/.exec(said)
@@ -252,6 +265,23 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
   await say(ctx, app, '看看小明那边在聊什么')
   arrive({ chat: 'wx-ming', sender: 'wx-ming', text: '你和小光聊了什么' })
   report.looks = await until(() => (chat.looks?.length >= 2 ? chat.looks : undefined), 60_000)
+  // A terminal model error races a platform receipt. The real agent loop must not compact/retry.
+  const ownerSession = sessions()['wechat:wx-owner'].sessionId
+  const { agent: ownerAgent } = await ctx.sessionController.resolveAgent(ownerSession)
+  await ownerAgent.whenIdle()
+  const beforePartial = Number(ownerAgent.session.seq)
+  chat.partialSummaries = 0
+  arrive({ chat: 'wx-owner', sender: 'wx-owner', text: 'synthetic partial failure' })
+  await until(() => chat.partialCalls > 0, 60000)
+  await ownerAgent.whenIdle()
+  await until(() => wechat.sent.some(s => s.text === 'Synthetic accepted paragraph.'), 10000)
+  const partialEvents = ownerAgent.session.snapshotEvents().slice(beforePartial)
+  report.partialFailure = { calls: chat.partialCalls, summaries: chat.partialSummaries,
+    sent: wechat.sent.filter(s => s.text.startsWith('Synthetic ')),
+    delivery: await until(() => deliveries().find(d => d.parts?.some(p => p.text === 'Synthetic accepted paragraph.') && d.sent?.some(s => s.state === 'accepted')), 10000),
+    ended: partialEvents.filter(e => e.type === 'turn/end').map(e => e.data.reason.kind),
+    compactions: partialEvents.filter(e => e.type === 'compaction/start').length,
+    attempts: partialEvents.filter(e => e.type === 'assistant/attempt').length }
   report.sessions = sessions()
   return report
 }

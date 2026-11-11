@@ -61,7 +61,7 @@ if (report.error) {
 // What the model was actually sent: KIN's requests carry the persona and recall; the coding session's do not.
 const bodies = mock.requests.map((request) => JSON.stringify(request.body))
 const kinRequests = bodies.filter((body) => body.includes('你是 KIN'))
-const kinTools = (mock.requests.find((request) => JSON.stringify(request.body).includes('你是 KIN'))?.body?.tools ?? [])
+const kinTools = (mock.requests.find((request) => String(request.body.system ?? '').includes('你是 KIN'))?.body?.tools ?? [])
   .map((tool) => tool.name ?? tool.function?.name)
 const kinEvents = report.kinTurns.flatMap((turn) => turn.events)
 const checks = {

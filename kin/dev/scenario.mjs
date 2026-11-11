@@ -19,7 +19,7 @@ export class Scripted extends LlmAdapter {
   providerInfo() { return { id: 'kin-test', name: 'KIN test' } }
   async listModels() { return [] }
   async resolveModel(provider, model) {
-    return { provider, id: model, name: model, inputModalities: ['text'], context: { contextWindow: 200_000 } }
+    return { provider, id: model, name: model, inputModalities: ['text'], defaultMaxTokens: 2000, context: { contextWindow: 200_000 } }
   }
   async *stream(options) {
     const tools = (options.tools ?? []).map((tool) => tool.name)

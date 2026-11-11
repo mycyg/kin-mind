@@ -163,3 +163,13 @@ CI 首轮发现 contact 合成场景先等主人联系，再确认朋友的未�
 - TypeScript typecheck and production build pass. New Python regression file passes Ruff. The five affected existing Python modules retain the same 22 baseline lint findings; no new lint findings were introduced.
 - End-to-end suites use isolated local data and fake transports; no real contact messages are sent. Existing parallel test fixtures can race on their non-atomic JSON reads; affected suites are rerun individually with their original assertions.
 - Automated checkpoint validation proves structural completeness and preserves transaction boundaries, not semantic perfection of future model-written summaries. No natural production conversation or future model compaction is fabricated as a test.
+
+
+## 2026-11-11：完整请求预算与错误恢复
+
+- Core 全量：1427 通过、1 跳过；Node 业务测试全量通过。全部离线集成套件运行一次后，按变更重跑模型、压缩、聊天、设置相关套件；类型检查、构建和停止/运行时/会话头检查通过。
+- 新增真实 DSH 代理循环回归：先记录完整请求预检溢出，再压缩旧轮次，最终只调用一次模型；本轮用户原话独立保留。旧保留算法在后置运行时上下文场景下被同一断言捕获。
+- 注入“段落已经开始投递，模型随后报告上下文错误”并验证没有重新生成，平台回执最终持久化为 accepted。测试使用隔离假平台，没有向真实联系人发送消息。
+- 实际 Gemini Responses 适配器携带完整工具定义，完成工具调用、合成结果回放、第二轮最终回答。原版与候选均通过；先前的 schema 400 未复现，不能据此宣称已找到该错误的唯一根因。
+- 对同一合成长输入做流式/非流式与有/无工具矩阵：无工具两种模式均读取约 665k tokens，非流式有工具读取约 680k，六处随机校验点全部保留；当前转发路线流式有工具仅报告 127,997，后四处校验点错误。此约束属于实测转发链路，不能泛化为 Gemini 官方窗口。
+- KIN 请求输入预算为 648,000，正常预检触发点 583,200；物理窗口仍须容纳请求输出与安全余量。BPE 是保守估计而非供应商精确计数。单独配置有工具的转发输入限制，提前切换可承载的备用路线，不降低整条模型列表的预算。

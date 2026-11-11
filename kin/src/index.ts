@@ -18,6 +18,7 @@ import { callOf, EMPTY, OWNER, rosterOf, type People } from './contact/people.js
 import { health } from './health/index.js'
 import { Heartbeat } from './heartbeat.js'
 import { Mind } from './mind.js'
+import { CONTEXT_WINDOW, PRESSURE_RATIO, HEADROOM_TOKENS, OUTPUT_BUDGET } from './model-budget.js'
 import { KinModel, LANES, PROVIDER, type Lane, type Route } from './models.js'
 import { KIN, memoriesOf, RECALL, type Dimension } from './render.js'
 import { DEFAULT_PERSONA, personaText } from './persona.js'
@@ -393,6 +394,7 @@ export function apply(ctx: Context, config: Config) {
         persona: personaText(persona),
         features: Object.fromEntries(FEATURES.map((key) => [key, settings[key] === true])),
         models: {
+          budget: { inputWindow: CONTEXT_WINDOW, compactAt: Math.floor(CONTEXT_WINDOW * PRESSURE_RATIO), outputBudget: OUTPUT_BUDGET, headroom: HEADROOM_TOKENS },
           lanes: Object.fromEntries(LANES.map((lane) => [lane, {
             routes: routes[lane] ?? [], last: model.last[lane] ?? null, fallback: catalog?.default ?? null,
           }])),
@@ -429,9 +431,10 @@ export function apply(ctx: Context, config: Config) {
     POST: async (request) => {
       const { lane, routes: next } = await body<{ lane: Lane; routes: Route[] }>(request)
       const valid = Array.isArray(next) && next.every((r) => typeof r?.provider === 'string' && typeof r?.model === 'string'
-        && r.provider !== PROVIDER && (r.effort === undefined || typeof r.effort === 'string'))
+        && r.provider !== PROVIDER && (r.effort === undefined || typeof r.effort === 'string')
+        && (r.toolInputLimit === undefined || (Number.isSafeInteger(r.toolInputLimit) && r.toolInputLimit > 8192)))
       if (!lane || !LANES.includes(lane) || !valid) throw new Error('模型路线格式不对')
-      routes[lane] = next.map(({ provider, model, effort }) => ({ provider, model, ...(effort ? { effort } : {}) }))
+      routes[lane] = next.map(({ provider, model, effort, toolInputLimit }) => ({ provider, model, ...(effort ? { effort } : {}), ...(toolInputLimit ? { toolInputLimit } : {}) }))
       save('models.json', routes)
       return { saved: true }
     },

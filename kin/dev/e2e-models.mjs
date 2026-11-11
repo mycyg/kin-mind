@@ -13,7 +13,7 @@ import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-dee
 const kin = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const output = mkdtempSync(join(kin, '.model-regression-'))
 await build({ entryPoints: [process.env.KIN_MODEL_SOURCE || join(kin, 'src/models.ts')], outfile: join(output, 'models.js'), format: 'esm', platform: 'node', bundle: true, packages: 'external' })
-const { KinModel } = await import(join(output, 'models.js'))
+const { KinModel, probe } = await import(join(output, 'models.js'))
 let failures = 0
 async function check(name, run) {
   try { await run(); console.log('✓ ' + name) } catch (error) { failures++; console.error('✗ ' + name + '\n' + error.stack) }
@@ -85,14 +85,14 @@ try {
       assert.ok(!error.model.last.task.failed[0].reason.includes('秒'))
     } finally { globalThis.setTimeout = set; globalThis.clearTimeout = clear }
   })
-  await check('Gemini normalizes nested nullable schemas and tool updates, preserving mixed unions and durable definitions', async () => {
+  await check('Gemini normalizes nested nullable schemas and tool updates, preserving every mixed-union branch and durable definitions', async () => {
     const before = JSON.stringify(tools), message = user()
     const { requests: [sent] } = await capture([route('gemini-test')], { messages: [message], tools,
       toolHistory: { tools, updates: [{ messageId: 'synthetic-update', additions: tools }] } })
     assert.deepEqual(sent.tools[0].parameters.properties.query, { type: 'string', minLength: 1, default: null, nullable: true })
     assert.equal(sent.tools[0].parameters.properties.nested.items.type, 'integer')
     assert.equal(sent.tools[0].parameters.properties.nested.items.nullable, true)
-    assert.deepEqual(sent.tools[0].parameters.properties.mixed, tools[0].parameters.properties.mixed)
+    assert.deepEqual(sent.tools[0].parameters.properties.mixed, { anyOf: [{ type: 'object' }, { type: 'string' }], nullable: true })
     assert.deepEqual(sent.toolHistory.updates[0].additions, sent.tools)
     assert.equal(sent.messages[0], message)
     assert.equal(JSON.stringify(tools), before)
@@ -172,6 +172,79 @@ try {
     const pi = await capture([route('gpt-test', 'openai-codex')], { messages: [assistant([call('pi')], codexResponse)] })
     assert.equal(pi.requests[0].messages[0].source.provider, 'openai-codex')
     assert.equal(pi.requests[0].messages[0].source.model, 'gpt-test')
+  })
+
+  await check('probe rejects empty headers, reasoning-only, truncation, and errors after visible text', async () => {
+    const text = { type: 'text-delta', index: 0, text: 'Connected' }
+    const stop = { type: 'finish', reason: { kind: 'stop' } }
+    for (const chunks of [[], [{ type: 'block-start', index: 0, blockType: 'text' }, stop],
+      [{ type: 'reasoning-delta', index: 0, text: 'thinking' }, stop], [text],
+      [text, { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'failed' } } }],
+      [text, { type: 'finish', reason: { kind: 'max-tokens' } }]]) {
+      assert.equal((await probe({ llm: { async *stream() { yield* chunks } } }, route('test'))).ok, false)
+    }
+    let reachedFinish = false
+    assert.equal((await probe({ llm: { async *stream() { yield text; reachedFinish = true; yield stop } } }, route('test'))).ok, true)
+    assert.equal(reachedFinish, true)
+  })
+  await check('terminal failure after text or a completed call throws its original cause without fallback or false success', async () => {
+    for (const first of [{ type: 'text-delta', index: 0, text: 'Sent paragraph.\n\n' },
+      { type: 'block-end', index: 0, block: call('toolu_partial') }]) {
+      for (const finish of [true, false]) {
+        let calls = 0
+        const model = new KinModel({ llm: { async *stream() {
+          calls++; yield first
+          if (finish) yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'original failure', status: 400 } } }
+        } } }, () => [route('first'), route('second')])
+        await assert.rejects(async () => { for await (const _ of model.stream({ provider: 'kin', model: 'chat', messages: [user()] })) {} },
+          error => error.code === (finish ? 'CONTEXT_WINDOW_EXCEEDED' : 'INCOMPLETE_RESPONSE'))
+        assert.equal(calls, 1)
+        assert.equal(model.last.chat.answered, null)
+        assert.equal(model.last.chat.failed.length, 1)
+      }
+    }
+  })
+  await check('verified tool-bearing relay limits skip before generation without reducing other routes or cooling the route', async () => {
+    const limited = { ...route('limited'), toolInputLimit: 128000 }
+    const options = { messages: [user('x '.repeat(130000))], tools }
+    const { requests, model } = await capture([limited, route('capable')], options)
+    assert.deepEqual(requests.map(r => r.model), ['capable'])
+    assert.match(model.last.task.failed[0].reason, /tool-input limit/)
+    for await (const _ of model.stream({ provider: 'kin', model: 'task', messages: [user()], tools })) {}
+    assert.equal(requests.at(-1).model, 'limited', 'capacity skips must not cool a healthy short-request route')
+    const noTools = await capture([limited], { messages: options.messages })
+    assert.equal(noTools.requests.length, 1)
+    const none = new KinModel({ llm: {} }, () => [limited])
+    const chunks = []
+    for await (const chunk of none.stream({ provider: 'kin', model: 'task', ...options })) chunks.push(chunk)
+    assert.equal(chunks.at(-1).reason.failure.code, 'CONTEXT_WINDOW_EXCEEDED')
+  })
+  await check('648k input ceiling at 90% and actual output reservations are sent consistently; large complete requests compact before generation', async () => {
+    const requests = []
+    const ctx = { llm: {
+      resolveModelInfo: async (provider, model) => ({ provider, id: model, context: { contextWindow: 1048576 }, defaultMaxTokens: model.startsWith('gemini') ? 65536 : 384000 }),
+      imageRequestPricing: () => undefined, fileRequestText: () => 'expanded file '.repeat(400000),
+      async *stream(request) { requests.push(request); yield { type: 'text-delta', index: 0, text: 'ok' }; yield { type: 'finish', reason: { kind: 'stop' } } },
+    } }
+    const model = new KinModel(ctx, () => [route('gemini-test'), route('deepseek-test')])
+    const info = await model.resolveModel('kin', 'chat')
+    assert.equal(info.context.contextWindow, 1048576); assert.equal(info.defaultMaxTokens, 128000)
+    for await (const _ of model.stream({ provider: 'kin', model: 'chat', sessionId: 'synthetic', messages: [user()] })) {}
+    assert.equal(requests[0].maxTokens, 65536)
+    for (const extra of [{ messages: [user('汉'.repeat(590000))] },
+      { system: 'abcd1234 '.repeat(200000) }, { tools: [{ name: 'large', description: 'abcd1234 '.repeat(200000), parameters: {} }] },
+      { messages: [createUserMessage({ content: [{ type: 'file', attachment: { attachmentId: 'synthetic-file' } }] })] },
+      { toolHistory: { tools: [], updates: [{ messageId: 'update', additions: [{ name: 'large', description: 'abcd1234 '.repeat(200000), parameters: {} }] }] } }]) {
+      requests.length = 0
+      const chunks = []
+      for await (const chunk of model.stream({ provider: 'kin', model: 'chat', sessionId: 'synthetic', messages: [user()], ...extra })) chunks.push(chunk)
+      assert.equal(requests.length, 0, 'preflight must run before any provider starts')
+      assert.equal(chunks.at(-1).reason.failure.code, 'CONTEXT_WINDOW_EXCEEDED')
+      assert.match(chunks.at(-1).reason.failure.message, /583200/)
+    }
+    requests.length = 0
+    for await (const _ of model.stream({ provider: 'kin', model: 'chat', sessionId: 'synthetic', maxTokens: 600000, messages: [user('汉'.repeat(450000))] })) {}
+    assert.equal(requests.length, 0, 'explicit large output moves the pressure threshold earlier')
   })
 
   // The real adapters serialize requests and parse a real SSE stream over loopback. Assertions inspect wire bodies.

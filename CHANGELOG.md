@@ -1,3 +1,11 @@
+## 2026-11-11 — Complete request budgets and safe error recovery
+
+- Set KIN's input budget to 648,000 tokens with a 90% preflight threshold, separately reserving actual output capacity. Count complete requests with a bounded BPE estimate, including tool schemas, results and expanded files; preserve per-route output reservations.
+- Preserve the current turn verbatim during overflow compaction. Never compact or regenerate after visible output or a completed tool call, including delivery receipts still in flight. Keep terminal failures visible.
+- Require useful text and a successful terminal event for model connectivity checks. Normalize nullable Gemini unions without dropping valid alternatives.
+- Support explicitly configured relay limits for tool-bearing input. Skip incompatible long requests before generation and show the limitation in settings; other routes retain their own capacities.
+- Added regressions through the real agent/compaction loop, persisted channel receipts, settings and provider wire adapters. The previously reported Gemini schema rejection was not reproduced by current live probes; both original and normalized schemas completed the tool call.
+
 ## 2026-11-11 — Model replay and background health recovery
 
 - Chat fallback waits 30 seconds for the first real token, including reasoning and hidden relay reasoning; empty stream headers do not count. Explicit errors remain distinguishable from a first-token timeout.

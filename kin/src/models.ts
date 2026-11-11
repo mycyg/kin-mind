@@ -8,11 +8,12 @@
  * after the others for a few minutes, so a route that is down does not cost every reply its wait.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
+import { OUTPUT_BUDGET, estimateRequestTokens, requestThreshold } from './model-budget.js'
 import { answerText, modelOutput } from './model-output.js'
 import { modelRequest, rememberRoute } from './model-history.js'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  LlmAdapter, ReasoningEffortId, type GenerateOptions, type LlmFailure, type LlmResolvedModelInfo, type StreamChunk,
+  LlmAdapter, LlmError, ReasoningEffortId, type GenerateOptions, type LlmFailure, type LlmResolvedModelInfo, type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-compaction'
@@ -30,6 +31,8 @@ export interface Route {
   model: string
   /** Reasoning effort for this route; unset, the chat lane thinks lightly and the task lane uses the model's default. */
   effort?: string
+  /** Verified relay input ceiling when tool definitions are present; independent of model capacity. */
+  toolInputLimit?: number
 }
 
 /** How a lane's latest call went: which route answered and why the ones before it did not. */
@@ -101,12 +104,12 @@ export class KinModel extends LlmAdapter {
     const lane = laneOf(model)
     const settled = await Promise.allSettled(this.routes(lane).map((route) => this.ctx.llm.resolveModelInfo(route.provider, route.model, signal)))
     const infos = settled.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []))
-    const sized = infos.flatMap((info) => (info.context ? [{ window: info.context.contextWindow, output: info.defaultMaxTokens ?? 0 }] : []))
+    const sized = infos.flatMap((info) => (info.context ? [{ window: info.context.contextWindow, output: info.defaultMaxTokens ?? OUTPUT_BUDGET }] : []))
     const images = infos.length > 0 && infos.every((info) => info.inputModalities?.includes('image'))
     // What a request leaves for the conversation is its route's window less the output that route reserves:
     // the lane says the smallest window and, as its own reservation, what makes the smallest such room.
     const window = Math.min(...sized.map((route) => route.window))
-    const reserved = window - Math.min(...sized.map((route) => route.window - route.output))
+    const reserved = window - Math.min(...sized.map((route) => route.window - Math.min(OUTPUT_BUDGET, route.output)))
     return {
       provider: PROVIDER, id: lane, name: NAMES[lane],
       inputModalities: images ? ['text', 'image'] : ['text'],
@@ -131,6 +134,27 @@ export class KinModel extends LlmAdapter {
       if (content.every((block, i) => block.type !== 'text' || block.text === (message.content[i] as { text: string }).text)) return message
       return { ...message, content, source: { ...message.source, replayState: undefined } }
     })
+    const tokenCache = new Map<string, number>()
+    // This is after the loop assembled the newest system prompt, tools and incoming messages.
+    // A pressure finish here reaches DSH's normal compaction recovery before any route can answer.
+    if (options.sessionId && !options.purpose) {
+      const info = await this.resolveModel(PROVIDER, lane, options.signal)
+      if (info.context) {
+        const output = options.maxTokens ?? info.defaultMaxTokens ?? 0
+        const threshold = requestThreshold(info.context.contextWindow, output)
+        const estimates = this.routes(lane).map(route => {
+          const request = modelRequest({ ...options, messages, provider: route.provider, model: route.model }, route)
+          return estimateRequestTokens(request, this.ctx.llm.imageRequestPricing(route.provider, route.model),
+            ref => this.ctx.llm.fileRequestText(ref), tokenCache)
+        })
+        const estimate = Math.max(...estimates)
+        if (estimate >= threshold) {
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED',
+            message: `Request preflight: estimated ${estimate} input tokens reaches ${threshold}; context ${info.context.contextWindow}, output reservation ${output}. Compact before generation.` } } }
+          return
+        }
+      }
+    }
     const failed: LastCall['failed'] = []
     let failure: LlmFailure | undefined
     const key = (route: Route) => route.provider + '/' + route.model
@@ -139,6 +163,16 @@ export class KinModel extends LlmAdapter {
     const order = [...routes.filter((route) => !cool(route)), ...routes.filter(cool)]
     for (const [index, route] of order.entries()) {
       if (options.signal?.aborted) return
+      if (route.toolInputLimit && options.tools?.length) {
+        const request = modelRequest({ ...options, messages, provider: route.provider, model: route.model }, route)
+        const estimate = estimateRequestTokens(request, this.ctx.llm.imageRequestPricing?.(route.provider, route.model),
+          ref => this.ctx.llm.fileRequestText(ref), tokenCache)
+        if (estimate >= Math.max(0, route.toolInputLimit - 8192)) {
+          failure = { code: 'CONTEXT_WINDOW_EXCEEDED', message: `Route tool-input limit: estimated ${estimate} tokens exceeds safe budget ${route.toolInputLimit - 8192} (relay limit ${route.toolInputLimit}).` }
+          failed.push({ route, reason: failure.message })
+          continue
+        }
+      }
       const attempt = new AbortController()
       const stop = () => attempt.abort()
       options.signal?.addEventListener('abort', stop, { once: true })
@@ -147,6 +181,7 @@ export class KinModel extends LlmAdapter {
       const timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
       const held: StreamChunk[] = []
       let answering = false
+      let finished = false
       failure = undefined
       // A model's own facts that never come are not waited on past a stop or this route's patience.
       const effort = await Promise.race([
@@ -164,10 +199,21 @@ export class KinModel extends LlmAdapter {
         }
       }
       try {
+        const info = await this.ctx.llm.resolveModelInfo?.(route.provider, route.model, attempt.signal)
+        const maxTokens = Math.min(options.maxTokens ?? OUTPUT_BUDGET, info?.defaultMaxTokens ?? OUTPUT_BUDGET)
         for await (const chunk of modelOutput(observe(this.ctx.llm.stream(modelRequest({
-          ...options, messages, provider: route.provider, model: route.model, signal: attempt.signal,
+          ...options, messages, maxTokens, provider: route.provider, model: route.model, signal: attempt.signal,
           reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
         }, route))))) {
+          if (chunk.type === 'finish') {
+            finished = true
+            if (answering && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+              const cause = chunk.reason.failure
+              // Keep the original terminal failure; the compaction engine guards agent-level
+              // recovery after partial output, including transports whose receipts are still pending.
+              throw new LlmError(cause.message, cause.code, cause)
+            }
+          }
           if (!answering) {
             if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
               failure = chunk.reason.failure
@@ -187,9 +233,15 @@ export class KinModel extends LlmAdapter {
           }
           yield rememberRoute(chunk, route)
         }
+        if (answering && !finished) throw new LlmError('模型开始回复后连接中断，未收到结束确认', 'INCOMPLETE_RESPONSE')
         if (!answering && !failure) failure = { code: 'NO_RESPONSE', message: '模型没有返回内容' }
       } catch (error) {
-        if (answering) throw error
+        if (answering) {
+          const reason = (error as Error).message
+          this.cooling.set(key(route), { until: Date.now() + COOL_MS, reason })
+          this.last[lane] = { at: new Date().toISOString(), answered: null, failed: [...failed, { route, reason }] }
+          throw error
+        }
         failure = { code: 'ROUTE_FAILED', message: (error as Error).message }
       } finally {
         clearTimeout(timer)
@@ -218,23 +270,26 @@ export class KinModel extends LlmAdapter {
   }
 }
 
-/** How one route answers a tiny call of its own: whether it started answering, and how long that took. */
+/** A successful connectivity check requires visible text and a successful terminal event. */
 export async function probe(ctx: Context, route: Route): Promise<{ ok: boolean; ms: number; reason?: string }> {
   const started = Date.now()
   const ms = () => Date.now() - started
+  let visible = false
   try {
-    for await (const chunk of ctx.llm.stream({
+    for await (const chunk of modelOutput(ctx.llm.stream({
       provider: route.provider, model: route.model, reasoningEffort: route.effort ? ReasoningEffortId(route.effort) : undefined,
       messages: [{ role: 'user', content: [{ type: 'text', text: '只回复：连通成功' }] }], maxTokens: 4096, signal: AbortSignal.timeout(FIRST_CHUNK_MS),
-    })) {
-      if (chunk.type === 'usage') continue
-      if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-        return { ok: false, ms: ms(), reason: chunk.reason.failure ? describe(chunk.reason.failure) : '一分钟没有回应' }
+    }))) {
+      if ((chunk.type === 'text-delta' && chunk.text.trim())
+        || (chunk.type === 'block-end' && chunk.block.type === 'text' && chunk.block.text.trim())) visible = true
+      if (chunk.type !== 'finish') continue
+      if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+        return { ok: false, ms: ms(), reason: describe(chunk.reason.failure) }
       }
-      if (chunk.type === 'finish') break
-      return { ok: true, ms: ms() }
+      return visible && chunk.reason.kind === 'stop' ? { ok: true, ms: ms() }
+        : { ok: false, ms: ms(), reason: visible ? '回复未正常完成：' + chunk.reason.kind : '没有可见回复' }
     }
-    return { ok: false, ms: ms(), reason: '没有回应' }
+    return { ok: false, ms: ms(), reason: visible ? '回复未收到结束确认' : '没有回应' }
   } catch (error) {
     return { ok: false, ms: ms(), reason: (error as Error).message.slice(0, 200) }
   }

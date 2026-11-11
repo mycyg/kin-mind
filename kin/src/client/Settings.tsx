@@ -45,7 +45,8 @@ export function Settings() {
       <TalkSettings />
       <section className="kin-card">
         <h3 className="kin-card-title">她用的模型</h3>
-        <p className="kin-hint">每条线按顺序试：上一个超时或报错，就换下一个。拖动排序；模型的密钥和地址在 DSH 的设置里配。</p>
+        <p className="kin-hint">每条线按顺序试：开始回复前超时或报错，就换下一个。拖动排序；模型的密钥和地址在 DSH 的设置里配。</p>
+        {data.models.budget && <p className="kin-hint">上下文预算 {data.models.budget.inputWindow.toLocaleString()} tokens，约 {data.models.budget.compactAt.toLocaleString()} 时压缩（90%）。回复空间另行预留；模型实际容量较小时会提前压缩。</p>}
         {LANES.map((lane) => (
           <RouteLane key={lane.lane} {...lane} data={data.models.lanes[lane.lane]} catalog={data.models.catalog} onSaved={reload} />
         ))}
@@ -189,11 +190,11 @@ function RouteLane({ lane, title, hint, answered, data, catalog, onSaved }: {
                 }}>
                 <span className="kin-grip"><Grip size={14} /></span>
                 <span className="kin-route-n">{index + 1}</span>
-                <span className="kin-route-name">{nameOf(route, catalog)}</span>
+                <span className="kin-route-name">{nameOf(route, catalog)}{route.toolInputLimit && <small title="此转发路线携带工具时的实测输入限制；超限会提前转到备用路线。"> · 工具输入上限 {route.toolInputLimit.toLocaleString()}</small>}</span>
                 <span className="kin-route-tools">
                   <Effort lane={lane} route={route} catalog={catalog}
                     onChange={(effort) => {
-                      const next = routes.map((r, i) => (i === index ? { provider: r.provider, model: r.model, ...(effort ? { effort } : {}) } : r))
+                      const next = routes.map((r, i) => (i === index ? { ...r, effort } : r))
                       setRoutes(next)
                       void save(next)
                     }} />
@@ -280,7 +281,7 @@ function Features({ features, onSaved }: { features: Record<Feature, boolean>; o
 interface Probe { ok: boolean; ms: number; reason?: string }
 const seconds = (ms: number) => (ms < 1000 ? `${ms} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`)
 const same = (a: Route, b: Route) => a.provider === b.provider && a.model === b.model
-const keyOf = (routes: Route[]) => routes.map((r) => `${r.provider}/${r.model}/${r.effort ?? ''}`).join('\n')
+const keyOf = (routes: Route[]) => routes.map((r) => `${r.provider}/${r.model}/${r.effort ?? ''}/${r.toolInputLimit ?? ''}`).join('\n')
 
 function nameOf(route: Route, catalog: Catalog): string {
   const group = catalog.find((g) => g.id === route.provider)

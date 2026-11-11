@@ -100,7 +100,7 @@ export interface Explore {
 /** One memory of hers as the page lists it; `who` is who said it to whom ("小美私下跟她说"). */
 export interface Memory { id: string | null; text: string; at: string | null; who: string; basis: string | null }
 
-export interface Route { provider: string; model: string; effort?: string }
+export interface Route { provider: string; model: string; effort?: string; toolInputLimit?: number }
 /** One of KIN's two model lanes: chat (her replies) and task (everything she does). */
 export interface LaneState {
   routes: Route[]
@@ -112,6 +112,7 @@ export interface Settings {
   persona: string
   features: Record<Feature, boolean>
   models: {
+    budget?: { inputWindow: number; compactAt: number; outputBudget: number; headroom: number }
     lanes: { chat: LaneState; task: LaneState }
     catalog: { id: string; name: string; models: { id: string; name: string; reasoning?: { efforts: { id: string; name: string }[] } }[] }[]
   }

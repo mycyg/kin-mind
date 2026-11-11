@@ -1,7 +1,10 @@
 /** KIN checkpoint generation; DSH owns selection, locking, durable replacement and retention. */
-import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
-import { BlockAssembler, createSystemMessage, createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
+import type { Context } from '@deepseek-ai/cordis'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
+import { BasicCompactionEngine, type BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
+import { assistantStreamHasVisibleText, assistantStreamChunks, BlockAssembler, createSystemMessage, createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -35,6 +38,41 @@ function validateCheckpoint(blocks: ReturnType<BlockAssembler['blocks']>): void 
 }
 
 export default class KinCompactionEngine extends BasicCompactionEngine {
+  constructor(ctx: Context, config: BasicCompactionConfig = {}) {
+    super(ctx, config)
+    // LlmRuntime converts adapter exceptions back into terminal chunks. Stop recovery at the
+    // agent boundary too: text handed to a channel may still be in flight when this error arrives.
+    ctx.on('agent/request-error', async ({ agent, turn, step }, next) => {
+      for (let seq = Number(agent.session.seq) - 1; seq >= 0; seq--) {
+        const event = agent.session.eventAt(SessionSeq(seq))
+        if (event?.type === 'step/start') break
+        if (event?.type !== 'assistant/attempt' || event.data.turn !== turn || event.data.step !== step) continue
+        const visible = assistantStreamHasVisibleText(event.data.stream)
+          || assistantStreamChunks(event.data.stream, 'block-end').some(chunk => chunk.block.type === 'tool-call')
+        if (visible) return undefined
+        break
+      }
+      return next()
+    }, { prepend: true })
+  }
+
+  override async compactIfNeeded(agent: Agent, trigger: CompactionTrigger, signal: AbortSignal) {
+    if (trigger !== 'context-overflow') return super.compactIfNeeded(agent, trigger, signal)
+    // Overflow recovery must retain the current turn verbatim, including its original user
+    // message and tool results. The upstream zero-token tail can retain only runtime context.
+    const session = agent.session
+    let turnStart = -1
+    for (let seq = Number(session.seq) - 1; seq >= 0; seq--) {
+      if (session.eventAt(SessionSeq(seq))?.type === 'turn/start') { turnStart = seq; break }
+    }
+    if (turnStart < 0) return null
+    const older = session.surface.nodes.filter(seq => Number(seq) < turnStart)
+    if (older.length && session.eventAt(older[0])?.type === 'system/message') older.shift()
+    if (!older.length) return null
+    // compactRegion owns pairing validation, locking and durable replacement.
+    return this.compactRegion(older[0], older[older.length - 1], agent, signal)
+  }
+
   protected override async summarize(input: { messages: readonly Message[]; tools?: readonly ToolSchema[] }, agent: Agent, signal?: AbortSignal) {
     const latest = agent.session.requestHeader()?.config
     const target = latest ?? agent.options

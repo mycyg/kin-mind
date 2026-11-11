@@ -46,6 +46,11 @@ if (existsSync(out)) {
   pages.broken = await page('models/test', { provider: 'nowhere', model: 'gone' })
   pages.working = await page('models/test', { provider: 'deepseek-official', model: 'deepseek-flash' })
   pages.after = await page('talk')
+  const settings = await page('settings')
+  const savedRoutes = settings.models.lanes.chat.routes.map((r, i) => i === 0 ? { ...r, toolInputLimit: 128000 } : r).reverse()
+  await page('models', { lane: 'chat', routes: savedRoutes })
+  pages.routeBudget = (await page('settings')).models.lanes.chat.routes.at(-1)?.toolInputLimit === 128000
+    && JSON.parse(readFileSync(join(dataDir, 'models.json'), 'utf8')).chat.at(-1)?.toolInputLimit === 128000
 }
 dsh.kill('SIGTERM')
 await Promise.race([new Promise((done) => dsh.once('exit', done)), new Promise((done) => setTimeout(done, 5000))])
@@ -66,7 +71,7 @@ if (report.error) {
 }
 
 // The KIN request that went to DSH's own model, kept for measuring what every request of hers carries.
-const measured = mock.requests.find((request) => JSON.stringify(request.body).includes('量一下'))?.body
+const measured = mock.requests.find((request) => String(request.body.system ?? '').includes('你是 KIN') && JSON.stringify(request.body).includes('量一下'))?.body
 writeFileSync(join(root, 'kin-request.json'), JSON.stringify(measured ?? null, null, 2))
 const toolsOf = (body) => (body?.tools ?? []).map((tool) => tool.name ?? tool.function?.name)
 const coding = mock.requests.find((request) => JSON.stringify(request.body).includes('看看这里有什么'))?.body
@@ -75,6 +80,7 @@ const OWN = ['read_autonomous_plans', 'manage_autonomous_plan', 'manage_desire',
   'read_graph', 'kin_reply', 'kin_note', 'kin_persona', 'kin_recall']
 
 const checks = {
+  'relay input limits survive route reorder and persisted settings': pages.routeBudget,
   'her tools ride in her requests': OWN.every((tool) => report.chatTools.includes(tool) && toolsOf(measured).includes(tool)),
   'a coding session gets none of them': coding !== undefined && !toolsOf(coding).some((tool) => OWN.includes(tool)),
   'a plan made in conversation, named after the message': report.plans.includes('这周和对方一起读完那本书'),

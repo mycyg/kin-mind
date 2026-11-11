@@ -38,13 +38,14 @@
               compaction: true
               toolResultPruner: true
             config:
-              # DSH's default keeps 65,536 tokens of headroom beyond a request's own output, which leaves a
-              # 32K or 64K model no room to compact at all. Her turns add little at a time (a recall block,
-              # pruned tool results), so a smaller margin serves every window her lanes may be given.
+              # The complete-request preflight applies KIN's 648K input budget at 90%.
+              # This physical-capacity backstop also reserves output and summary headroom.
               - id: compaction-basic
                 name: 'dsh-kin/compaction'
                 config:
-                  headroomTokens: 16384
+                  thresholdRatio: 0.9
+                  headroomTokens: 32768
+                  maxTokens: 16384
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -136,7 +137,9 @@
               - id: compaction-basic
                 name: 'dsh-kin/compaction'
                 config:
-                  headroomTokens: 16384
+                  thresholdRatio: 0.9
+                  headroomTokens: 32768
+                  maxTokens: 16384
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner

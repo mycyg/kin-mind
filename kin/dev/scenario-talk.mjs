@@ -16,7 +16,7 @@ class Chat extends LlmAdapter {
   providerInfo() { return { id: 'kin-chat-test', name: 'KIN chat test' } }
   async listModels() { return [] }
   async resolveModel(provider, model) {
-    return { provider, id: model, name: model, inputModalities: ['text'], context: { contextWindow: 200_000 } }
+    return { provider, id: model, name: model, inputModalities: ['text'], defaultMaxTokens: 2000, context: { contextWindow: 200_000 } }
   }
   async *stream(options) {
     const messages = options.messages
@@ -28,7 +28,7 @@ class Chat extends LlmAdapter {
     // The tool whose answer she is reading, if any: the call in her last message.
     const answered = messages.findLast((m) => m.role === 'assistant')?.content.find((block) => block.type === 'tool-call')?.name
     const result = last?.role === 'tool' ? textOf(last) : null
-    this.requests.push({ tools: (options.tools ?? []).map((tool) => tool.name), system: messages[0]?.role === 'system' ? textOf(messages[0]) : '',
+    this.requests.push({ purpose: options.purpose, tools: (options.tools ?? []).map((tool) => tool.name), system: messages[0]?.role === 'system' ? textOf(messages[0]) : '',
       said, notes, answered, result })
     // A wish: her state first (its revision and version), then the wish; Core says what a call lacks.
     const turnSource = [...messages].reverse().map((m) => m.source?.kind === 'kin-context' && /src_[0-9a-f]{32}/.exec(textOf(m))?.[0]).find(Boolean)
@@ -166,7 +166,7 @@ async function run(ctx, config, chat) {
   const { state } = await mind.call('read')
   report.laterWish = state.desires.find((wish) => wish.id === report.laterChoice.desire_id)?.status ?? 'archived'
   report.energy = (await mind.call('state-overview', { query: '' })).energy_context
-  report.chatTools = chat.requests[0]?.tools ?? []
+  report.chatTools = chat.requests.find(request => !request.purpose)?.tools ?? []
   report.recorded = JSON.parse(readFileSync(join(config.dataDir, 'recorded.json'), 'utf8'))[sessionId] ?? 0
   return report
 }
