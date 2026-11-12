@@ -1,3 +1,9 @@
+## 2026-11-12 — Give short chat requests a full minute to start
+
+- Increase chat routes with a fallback from 30 to 60 seconds for their first real token. Thinking still counts as progress; empty stream headers do not. Keep the task/single-route timeout, configured 300-second long-input patience, cancellation and fallback order unchanged.
+- Cover the 59,999/60,000 ms boundary, reasoning progress, explicit errors and fallback using the actual KIN adapter with a controlled clock.
+- Isolate the heartbeat appraisal fixture from concurrent backfill consuming the same sources first; retain the mood-change and committed-appraisal assertions without changing runtime scheduling.
+
 ## 2026-11-12 — Separate private mood notes from public replies
 
 - Restore the explicit conversation envelope: `private_note`, `action`, and object-valued `bubbles`. Every public reply requires a first-person mood note; only validated bubble text reaches public streaming, history and channels.

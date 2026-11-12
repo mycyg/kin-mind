@@ -44,12 +44,17 @@ async function capture(routes, options, reject = () => false) {
   return { requests, model }
 }
 try {
-  await check('chat waits 30s for a token, not a block header; thinking and hidden envelope tokens cancel that deadline', async () => {
+  await check('chat waits 60s for a token, not a block header; thinking and hidden envelope tokens cancel that deadline', async () => {
     const set = globalThis.setTimeout, clear = globalThis.clearTimeout
     const scheduled = new Map()
+    let now = 0
+    const advance = ms => {
+      now += ms
+      for (const [handle, timer] of scheduled) if (timer.deadline <= now) { scheduled.delete(handle); timer.fn() }
+    }
     globalThis.setTimeout = (fn, ms, ...args) => {
       if (ms !== 30000 && ms !== 60000) return set(fn, ms, ...args)
-      const handle = { ms, fn }; scheduled.set(handle, handle); return handle
+      const handle = { ms, fn, deadline: now + ms }; scheduled.set(handle, handle); return handle
     }
     globalThis.clearTimeout = handle => { if (!scheduled.delete(handle)) clear(handle) }
     try {
@@ -57,11 +62,15 @@ try {
         let calls = 0
         const model = new KinModel({ llm: { async *stream(request) {
           calls++
-          assert.equal([...scheduled.values()][0].ms, 30000)
+          assert.equal([...scheduled.values()][0].ms, 60000)
           yield { type: 'block-start', index: 0, blockType: thinking ? 'reasoning' : 'text' }
           assert.equal(scheduled.size, 1, 'headers are not tokens')
+          advance(59999)
+          assert.equal(request.signal.aborted, false, 'a short request still has time before 60 seconds')
           yield { type: thinking ? 'reasoning-delta' : 'text-delta', index: 0, text: thinking ? 'thinking' : '🧠\nreasoning' }
           assert.equal(scheduled.size, 0, 'reasoning must not trigger a no-first-token switch')
+          advance(1)
+          assert.equal(request.signal.aborted, false, 'progress before the deadline keeps this route')
           yield { type: 'text-delta', index: thinking ? 1 : 0, text: thinking ? 'answer' : '🪒answer' }
           yield { type: 'finish', reason: { kind: 'stop' } }
         } } }, () => [route('first'), route('second')])
@@ -72,7 +81,9 @@ try {
       let calls = 0
       const timeout = new KinModel({ llm: { async *stream(request) {
         if (++calls === 1) {
-          const timer = [...scheduled.values()][0]; assert.equal(timer.ms, 30000); timer.fn()
+          const timer = [...scheduled.values()][0]; assert.equal(timer.ms, 60000)
+          advance(59999); assert.equal(request.signal.aborted, false)
+          advance(1)
           assert.equal(request.signal.aborted, true); throw Error('aborted')
         }
         yield { type: 'text-delta', index: 0, text: 'ok' }
@@ -80,10 +91,20 @@ try {
       } } }, () => [route('first'), route('second')])
       for await (const _ of timeout.stream({ provider: 'kin', model: 'chat', messages: [user()] })) {}
       assert.equal(calls, 2)
-      assert.match(timeout.last.chat.failed[0].reason, /30 秒未收到首个 token/)
-      const error = await capture([route('first'), route('second')], { messages: [user()] }, r => r.model === 'first')
-      assert.match(error.model.last.task.failed[0].reason, /synthetic network reset/)
-      assert.ok(!error.model.last.task.failed[0].reason.includes('秒'))
+      assert.match(timeout.last.chat.failed[0].reason, /60 秒未收到首个 token/)
+      const error = await capture([route('first'), route('second')], { model: 'chat', messages: [user()] }, r => r.model === 'first')
+      assert.match(error.model.last.chat.failed[0].reason, /synthetic network reset/)
+      assert.ok(!error.model.last.chat.failed[0].reason.includes('秒'))
+      assert.deepEqual(error.requests.map(request => request.model), ['first', 'second'])
+      for (const lane of ['chat', 'task']) {
+        const single = new KinModel({ llm: { async *stream(request) {
+          assert.equal([...scheduled.values()][0].ms, 60000, 'single-route chat and task waits remain one minute')
+          yield { type: 'text-delta', index: 0, text: 'ok' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        } } }, () => [route('only')])
+        for await (const _ of single.stream({ provider: 'kin', model: lane, messages: [user()] })) {}
+        assert.equal(single.last[lane].answered.model, 'only')
+      }
     } finally { globalThis.setTimeout = set; globalThis.clearTimeout = clear }
   })
   await check('long-input waits are route-scoped, count tool overhead, and remain cancellable', async () => {
@@ -99,7 +120,7 @@ try {
         let calls = 0
         const model = new KinModel({ llm: { async *stream(request) {
           calls++
-          assert.equal([...scheduled.values()][0].ms, large ? 300000 : 30000)
+          assert.equal([...scheduled.values()][0].ms, large ? 300000 : 60000)
           yield { type: 'reasoning-delta', index: 0, text: 'working' }
           assert.equal(scheduled.size, 0)
           yield { type: 'text-delta', index: 1, text: 'done' }

@@ -3,8 +3,8 @@
  * - `kin/chat`: her replies in conversation, where feeling matters.
  * - `kin/task`: everything else she does — helpers, exploration, reviews and background work.
  * A call tries its lane's routes in order and moves on while a route has not started answering:
- * an error, or no first chunk in time (a minute; thirty seconds for a chat route with another behind it,
- * since someone is waiting). Once a route answers it keeps the turn. A route that just failed is tried
+ * an error, or no first token (including thinking) within a minute, unless the route has a longer
+ * configured wait for large inputs. Once a route answers it keeps the turn. A route that just failed is tried
  * after the others for a few minutes, so a route that is down does not cost every reply its wait.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
@@ -25,7 +25,7 @@ export const LANES = ['chat', 'task'] as const
 export type Lane = (typeof LANES)[number]
 const NAMES: Record<Lane, string> = { chat: 'KIN 聊天', task: 'KIN 做事' }
 const FIRST_CHUNK_MS = 60_000
-const CHAT_FIRST_CHUNK_MS = 30_000
+const CHAT_FIRST_CHUNK_MS = 60_000
 const LONG_INPUT_TOKENS = 128_000
 const COOL_MS = 5 * 60_000
 

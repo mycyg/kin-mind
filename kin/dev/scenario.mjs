@@ -75,23 +75,32 @@ export function apply(ctx, config) {
   const scripted = new Scripted()
   scripted.appraisalDelayMs = Number(process.env.KIN_REVIEW_RESPONSE_DELAY_MS || 0)
   ctx.llm.registerAdapter(['kin-test'], scripted)
-  setTimeout(() => run(ctx, config, scripted).then(
+  let releaseEnrichment
+  const reviewed = new Promise((resolve) => { releaseEnrichment = resolve })
+  setTimeout(() => run(ctx, config, scripted, reviewed, releaseEnrichment).finally(releaseEnrichment).then(
     (report) => writeFileSync(config.out, JSON.stringify(report, null, 2)),
     (error) => writeFileSync(config.out, JSON.stringify({ error: error.stack ?? String(error) }, null, 2)),
   ), 300)
 }
 
-async function run(ctx, config, scripted) {
+async function run(ctx, config, scripted, reviewed, releaseEnrichment) {
   ctx.logger('kin-e2e').info('scenario starts')
   await ctx.kin.mind.call('liveness-facts')
   const report = { reviewOutcomes: [] }
   const runMind = ctx.kin.mind.run.bind(ctx.kin.mind)
   ctx.kin.mind.run = async (command, ...args) => {
+    // This scenario tests the interaction appraisal's affect commit. Backfill may otherwise integrate
+    // the same sources first, correctly making that appraisal a no-op. Keep real enrichment queued
+    // until the target review finishes; its own queue/commit rules are covered by Core business tests.
+    if (command === 'review-enrichment') await reviewed
     const answer = await runMind(command, ...args)
-    if (command === 'review') report.reviewOutcomes.push({
-      state: answer.state, reason: answer.reason ?? answer.waiting_reason ?? answer.error,
-      alreadyIntegrated: answer.result?.already_integrated === true,
-    })
+    if (command === 'review') {
+      report.reviewOutcomes.push({
+        state: answer.state, reason: answer.reason ?? answer.waiting_reason ?? answer.error,
+        alreadyIntegrated: answer.result?.already_integrated === true,
+      })
+      if (answer.state === 'complete' && !answer.result?.already_integrated) releaseEnrichment()
+    }
     return answer
   }
   const mood = async () => (await ctx.kin.mind.call('read')).state.dimensions.mood.value
@@ -136,6 +145,7 @@ async function run(ctx, config, scripted) {
     const value = await mood()
     return value !== report.moodBefore ? value : undefined
   }, 300_000)
+  releaseEnrichment() // Also release on the bounded failure path; apply() does the same on exceptions.
   report.review = scripted.requests.find((request) => request.tools.includes('submit_appraisal')) ?? null
   report.reviewAttempts = await ctx.kin.mind.run('appraisal-attempts', { limit: 20 })
     .catch((error) => ({ error: String(error) }))
