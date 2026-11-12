@@ -113,6 +113,16 @@ async function run(ctx, config, scripted) {
   const mind = ctx.kin.mind
   await mind.call('liveness-facts')
   const report = { taskEvents: [] }
+  // Test-only: Core may commit completion before the host receives plan-result and publishes its page state.
+  const completionDelay = Number(process.env.KIN_STEWARD_SETTLE_DELAY_MS || 0)
+  if (completionDelay > 0) {
+    const runMind = mind.run.bind(mind)
+    mind.run = async (action, ...args) => {
+      const answer = await runMind(action, ...args)
+      if (action === 'plan-result' && answer.state === 'completed') await new Promise(resolve => setTimeout(resolve, completionDelay))
+      return answer
+    }
+  }
   const callMind = mind.call.bind(mind)
   mind.call = (action, args) => {
     if (action === 'runtime-event' && args?.kind === 'task-result') report.taskEvents.push(args)

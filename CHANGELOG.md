@@ -6,6 +6,7 @@
 - Append each saved mood note to the next model step once as private role context, retaining original text and native conversation prefixes. Durable note ids prevent duplicate injection after restart or compaction, and source deletion removes the derived context.
 - Validate all Core bridge tool arguments against their declared JSON Schema before dispatch, including mixed unions and nested constraints, without coercion or changing open-object contracts. Existing native tool result/error and media handling remain in place.
 - This is a local validation boundary. The current DSH adapter does not enable server-side JSON-schema generation. Historical data and persona are not rewritten.
+- Wait for the host outing page to publish completion in the steward integration check; Core committing a result does not imply the asynchronous host has finished. Preserve the business assertions and cover the race with an optional delayed result fixture.
 
 ## 2026-11-11 — Native relay migration and long-input patience
 

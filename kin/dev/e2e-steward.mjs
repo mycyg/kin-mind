@@ -36,9 +36,23 @@ const pages = {}
 if (existsSync(out)) {
   const login = await fetch(await url, { redirect: 'manual' })
   const cookie = login.headers.getSetCookie().map((value) => value.split(';')[0]).join('; ')
-  for (const route of ['work', 'outing', 'permission', 'home']) {
+  const readPage = async (route) => {
     const response = await fetch(new URL('api/kin/' + route, await url), { headers: { cookie } })
-    pages[route] = { status: response.status, body: await response.json().catch(() => null) }
+    return { status: response.status, body: await response.json().catch(() => null) }
+  }
+  for (const route of ['work', 'outing', 'permission', 'home']) {
+    pages[route] = await readPage(route)
+    if (route !== 'outing') continue
+    // Core's completed plan precedes the host's awaited plan-result and page publication.
+    // Observe the same HTTP boundary the assertion checks, keeping its final expectations intact.
+    const settled = () => pages.outing.status === 200
+      && pages.outing.body?.exploration?.last?.state === 'complete' && pages.outing.body.exploration.current === null
+      && pages.outing.body?.creation?.last?.state === 'completed' && pages.outing.body.creation.current === null
+    const end = Date.now() + 30_000
+    while (!settled() && Date.now() < end) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+      pages.outing = await readPage('outing')
+    }
   }
 }
 dsh.kill('SIGTERM')
