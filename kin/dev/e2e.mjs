@@ -3,7 +3,7 @@
 // Usage: node dev/e2e.mjs        (run `npm run build` first)
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { bootDsh, kinDir, repo } from './env.mjs'
+import { bootDsh, kinDir, repo, signIn } from './env.mjs'
 
 const out = join(repo, '.dev', 'e2e', 'report.json')
 const dataDir = join(repo, '.dev', 'e2e', 'kin-data')
@@ -12,7 +12,7 @@ const dataDir = join(repo, '.dev', 'e2e', 'kin-data')
 const kinFiles = { 'models.json': {
   chat: [{ provider: 'nowhere', model: 'gone' }, { provider: 'deepseek-official', model: 'deepseek-flash' }],
   task: [{ provider: 'kin-test', model: 'scripted' }],
-} }
+}, 'health.json': { frozen: { since: new Date().toISOString() }, problems: {}, resolved: [], checked: {}, days: [] } }
 const { root, mock, dsh, url, logs: readLogs } = await bootDsh({ name: 'e2e', mockText: '辛苦啦，火锅走起！', kinFiles, extraRows: `- insert:
     - id: kin-e2e
       name: ${JSON.stringify(join(kinDir, 'dev/scenario.mjs'))}
@@ -22,7 +22,16 @@ const { root, mock, dsh, url, logs: readLogs } = await bootDsh({ name: 'e2e', mo
 ` })
 
 const deadline = Date.now() + 540_000
-while (!existsSync(out) && Date.now() < deadline && dsh.exitCode === null) await new Promise((r) => setTimeout(r, 500))
+let thawed = false
+while (!existsSync(out) && Date.now() < deadline && dsh.exitCode === null) {
+  if (!thawed && existsSync(out + '.review-ready')) {
+    const api = await signIn(await url)
+    const health = await api.post('api/kin/health/freeze', { frozen: false })
+    if (health.frozen !== null) throw new Error('The isolated heartbeat did not thaw')
+    thawed = true
+  }
+  await new Promise((r) => setTimeout(r, 500))
+}
 
 // The page's routes, called the way the browser calls them: the login link mints a cookie.
 const pages = {}
@@ -94,12 +103,13 @@ const checks = {
   'mood said once while unchanged': kinEvents.filter((e) => e.source === 'kin-context' && e.text.includes('你此刻的感受')).length === 1,
   // Her heartbeat: Core's own review reaches the task lane through the bridge, with her persona, and commits.
   // A round completed (`done`); the latest one may already be waiting again, the minute being short at the dev pace.
-  'heartbeat reviewed what was said, on the task lane': report.review !== null && Boolean(pages.home?.body?.heartbeat?.review?.done),
+  'heartbeat reviewed what was said, on the task lane': report.review !== null && Boolean(report.reviewCommit) && Boolean(pages.home?.body?.heartbeat?.review?.done),
   'the review speaks with her persona': report.review?.system.includes('这是 KIN 当前可编辑的人格') && report.review.system.includes('你是 KIN'),
   'the review changed her mood': typeof report.moodAfter === 'number' && report.moodAfter < report.moodBefore,
 }
 for (const [name, ok] of Object.entries(checks)) console.log(`${ok ? '✓' : '✗'} ${name}`)
 console.log(`\nKIN tools: ${kinTools.join(', ')}`)
 console.log(`heartbeat: ${JSON.stringify(pages.home?.body?.heartbeat ?? null)}`)
+console.log(`review transaction: ${JSON.stringify({ moodBefore: report.moodBefore, moodAfter: report.moodAfter, outcomes: report.reviewOutcomes, commit: report.reviewCommit, attempts: report.reviewAttempts })}`)
 console.log(`model requests: ${bodies.length} (KIN ${kinRequests.length}) · report: ${out}`)
 process.exit(Object.values(checks).every(Boolean) ? 0 : 1)

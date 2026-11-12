@@ -16,6 +16,7 @@ export const inject = ['kin', 'llm', 'sessionController', 'sessions']
  */
 export class Scripted extends LlmAdapter {
   requests = []
+  appraisalDelayMs = 0
   providerInfo() { return { id: 'kin-test', name: 'KIN test' } }
   async listModels() { return [] }
   async resolveModel(provider, model) {
@@ -28,6 +29,13 @@ export class Scripted extends LlmAdapter {
     const id = ToolCallId('call_' + this.requests.length)
     const args = JSON.stringify(name === 'submit_appraisal' ? { reason: '听说对方下班很累，有点心疼。', values: { mood: 60 } }
       : name === 'submit_compression' ? compression(options.messages) : {})
+    if (name === 'submit_appraisal' && this.appraisalDelayMs) {
+      // Optional synthetic latency: generation has begun, but nothing has been submitted or committed.
+      yield { type: 'block-start', index: 1, blockType: 'reasoning' }
+      yield { type: 'reasoning-delta', index: 1, text: 'Review in progress.' }
+      await new Promise((resolve) => setTimeout(resolve, this.appraisalDelayMs))
+      yield { type: 'block-end', index: 1, block: { type: 'reasoning', text: 'Review in progress.' } }
+    }
     if (name) {
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
       yield { type: 'tool-call-delta', index: 0, id, name, argumentsDelta: args }
@@ -65,6 +73,7 @@ export function keepLog(ctx, file) {
 export function apply(ctx, config) {
   keepLog(ctx, config.out + '.log')
   const scripted = new Scripted()
+  scripted.appraisalDelayMs = Number(process.env.KIN_REVIEW_RESPONSE_DELAY_MS || 0)
   ctx.llm.registerAdapter(['kin-test'], scripted)
   setTimeout(() => run(ctx, config, scripted).then(
     (report) => writeFileSync(config.out, JSON.stringify(report, null, 2)),
@@ -75,7 +84,16 @@ export function apply(ctx, config) {
 async function run(ctx, config, scripted) {
   ctx.logger('kin-e2e').info('scenario starts')
   await ctx.kin.mind.call('liveness-facts')
-  const report = {}
+  const report = { reviewOutcomes: [] }
+  const runMind = ctx.kin.mind.run.bind(ctx.kin.mind)
+  ctx.kin.mind.run = async (command, ...args) => {
+    const answer = await runMind(command, ...args)
+    if (command === 'review') report.reviewOutcomes.push({
+      state: answer.state, reason: answer.reason ?? answer.waiting_reason ?? answer.error,
+      alreadyIntegrated: answer.result?.already_integrated === true,
+    })
+    return answer
+  }
   const mood = async () => (await ctx.kin.mind.call('read')).state.dimensions.mood.value
   report.moodBefore = await mood()
 
@@ -108,8 +126,22 @@ async function run(ctx, config, scripted) {
 
   // Her heartbeat: once the conversation has been quiet a while (Core holds background thinking for
   // three minutes after a recall), what was said is reviewed on the task lane, in her voice.
-  report.review = await until(() => scripted.requests.find((request) => request.tools.includes('submit_appraisal')), 300_000)
-  report.moodAfter = await until(async () => { const value = await mood(); return value !== report.moodBefore ? value : undefined })
+  // The harness held the heartbeat during setup, so neither the baseline nor the target review can
+  // race a foreground recall. Thaw through the real health API only after all foreground work ends.
+  writeFileSync(config.out + '.review-ready', 'ready')
+  // Admission retries use real 30/60/120-second backoff, not the accelerated heartbeat clock.
+  // Bound this transaction wait separately; a model request alone is not a committed appraisal.
+  report.moodAfter = await until(async () => {
+    if (!report.reviewOutcomes.some((answer) => answer.state === 'complete' && !answer.alreadyIntegrated)) return undefined
+    const value = await mood()
+    return value !== report.moodBefore ? value : undefined
+  }, 300_000)
+  report.review = scripted.requests.find((request) => request.tools.includes('submit_appraisal')) ?? null
+  report.reviewAttempts = await ctx.kin.mind.run('appraisal-attempts', { limit: 20 })
+    .catch((error) => ({ error: String(error) }))
+  report.reviewCommit = report.reviewAttempts.attempts?.find((attempt) =>
+    attempt.outcome === 'committed' && attempt.stimulus === 'interaction-batch'
+      && attempt.calls?.some((call) => call.tool === 'submit_appraisal')) ?? null
   // What she took in is hers in another conversation too.
   report.laterRecall = await until(async () => {
     const answer = await ctx.kin.mind.call('memory-context', { query: '晚饭想吃什么', purpose: 'chat', mode: 'light', session: 'e2e-another-chat', budget: 800 })
