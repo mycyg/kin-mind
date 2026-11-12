@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Dev-only scenario for dev/e2e-steward.mjs: KIN as chief steward inside a real headless DSH. Her chat
 // lane and her task lane are scripted here: she hands the owner's work to a DSH worker, has a quick
 // subagent jot something down in the owner's folder, explores a question through Core's DSH backend,
@@ -37,7 +38,7 @@ class Steward extends Scripted {
       const said = options.messages.slice(options.messages.findLastIndex((m) => m.role === 'assistant') + 1)
         .filter((m) => m.role === 'user').map(textOf).join('\n')
       // Each ask is acted on once: her recall and DSH's notices can repeat its words later.
-      if (said.includes('宿主事实') && said.includes('做完了')) return yield* reply('整理好啦，清单写在你那个文件夹的 整理结果.md 里了。')
+      if (said.includes('宿主事实') && said.includes('做完了')) return yield* publicReply('整理好啦，清单写在你那个文件夹的 整理结果.md 里了。')
       if (said.includes('记一笔') && !this.jotted && tools.includes('subagent')) {
         this.jotted = true
         return yield* call('subagent', { description: '记一笔', prompt: `在 ${this.workDir}/便签.md 写一句：周五交周报。`, cwd: this.workDir })
@@ -47,7 +48,7 @@ class Steward extends Scripted {
         this.delegated = said.includes(this.workDir)
         return yield* call('kin_delegate', { title: '整理笔记', folder: this.delegated ? this.workDir : 'notes', task: '把这个文件夹里的笔记整理成一份清单，写进 整理结果.md。' })
       }
-      return yield* reply('嗯，知道了。')
+      return yield* publicReply('嗯，知道了。')
     }
     if (tools.includes('structured_output')) {
       return yield* (all.includes('"name":"write"')
@@ -199,3 +200,5 @@ function sessionEvents(agent) {
   }
   return events
 }
+
+function* publicReply(text) { yield* reply(replyEnvelope(text)) }

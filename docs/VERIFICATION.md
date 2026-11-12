@@ -185,3 +185,80 @@ CI 首轮发现 contact 合成场景先等主人联系，再确认朋友的未�
 - No proxy, upstream dependency patch, synthetic signature, private history fixture or credential is included in the release. The existing 648k/90% compaction and no-regeneration-after-side-effects protections remain active.
 
 - Release checks: Core 1,427 passed / 1 skipped; Node business 10 passed; 13 integration suites 147 passed. Type checking, build and stop/runtime/session-head checks passed. The new wait regression fails against the previously deployed source and passes with the candidate; the strengthened settings-persistence check also passes.
+
+
+## 2026-11-12 — 心情札记 JSON 隔离验收记录
+
+以下为用户确认上线前的隔离验收记录。该阶段只在独立副本构建和验证；随后获用户明确授权的上线结果见本节末尾。
+
+普通聊天文字必须是完整 JSON：`{private_note:string,action:"send"|"silent",bubbles:[{text:string}]}`。根对象与每个气泡拒绝额外字段；send 要求非空札记和气泡，silent 要求空气泡。纯工具轮可没有文字，工具及媒体仍沿原生调度链路。每步等待正常终态、全部校验及札记保存成功后，只投影气泡正文；平台原有长度和段落拆分保留。原生 reasoning 独立保留，不作为心情札记保存。
+
+格式错误只在本步尚无任何副作用时反馈同一路线纠正一次，第二次失败才进入原 fallback/终态路径；错误原因保留，拒绝文本不加入公开历史。札记保存失败、取消和已释放输出不会套用格式纠错。札记使用 session/turn/step 稳定编号，Core 已有同编号同内容幂等与冲突检测。
+
+本地严格校验是最终边界，当前 DSH 生成请求仅使用协议提示词；不能把另外进行的原生 API `json_schema` 能力探测写成这个通道已启用服务端 grammar。模型仍可能写出不合规内容，它会被拒绝，不会按普通文字外发。
+
+新增 `e2e-reply-output` 覆盖对象气泡、换行/引号/emoji、晚到错误、截断、取消、保存失败、一次纠错、silent、原生签名对齐、并行工具；`e2e-reply-channel` 经过真实 DSH、Core 和假渠道，检查札记先落库、接受账本、公开流与持久历史以及工具错误恢复。`e2e-tool-arguments` 动态读取全部 27 个 Core 工具 schema，合法调用保留，106 个缺字段/错类型/复杂 union/范围和嵌套约束错误在 dispatch 前被拒绝。测试素材均为合成内容，不调用真实联系人业务工具。
+
+同一新渠道测试的初版 8 项在原版源代码隔离快照中 7 项失败、1 项通过，明确捕获普通分析文字和 JSON 原文外发；候选通过这 8 项，后来追加的札记上下文项也通过，最终为 9 项。原有 query/task/voice、媒体与多轮工具集成断言保留，模拟模型的正常聊天文字改为新封套。原 late-overflow 场景尚未公开时允许压缩恢复，最终仅发送一次；已公开文字/已完成工具后的禁止重试仍单独覆盖。
+
+
+札记上下文使用独立隐藏 `kin-context` 增量，正文只有简短角色/时间标签与札记原文，不携带 `reply_text`、provider 或完整封套，也不在 source metadata 重复正文。下一 pre-step 只精确读取上一已执行步骤的封套札记及兼容 `kin_note` 工具札记；初次启动不扫描所有历史步骤 RPC。`noteIds` 由原生事件持久保存，重启及压缩后不重新塞入旧包。读取失败发生在新步骤开始之前，不会推进并永久略过待注入札记。`evidence_ids` 转为现有删除传播的 `rests`；原话不为省 token 而缩写。
+
+`e2e-reply-context` 验证 1000 个旧步骤仍仅查询上一组 id、原文只注入一次、会话序列化/恢复、压缩替换后去重、读取失败恢复及来源删除。真实 DSH/Core/fake channel 验证下一轮与工具续轮请求中确有上一札记，每个 id 仅一个上下文块。Core bridge 的 schema 校验位于 MCP 归一化之前：额外 135 个错误根值被拦截，原 output/projectContent 保留，合法参数不做类型转换。
+
+候选 Core 全量：1427 通过 / 1 跳过；Node business：10 通过；既有 stop/runtime/session-head：12 项通过。真实 API、最终集成数量和仍受上游影响的场景另按最终结果报告；没有对真实联系人执行测试工具或发送消息。
+
+
+最终完整 KIN 离线集成：17 套、173 项通过、0 失败（126 秒）。随后仅补充摘要对 `role_note` 的说话人/主观性/不确定性说明，并定向复验 compaction；此规则不将札记提升为用户陈述或已证实事实。札记 API 测试仍由隔离真实模型场景验收，未上线。
+
+### 真实 API 最终验收
+
+每个模型使用独立 DSH、Core 数据目录及假微信渠道；输入只含用户授权的近期消息和合成测试文本，不上传完整真实人设或记忆。四个生产路由 `gemini-4-argon`、`claude-opus-5-5`、`gpt-6.1-terra`、`deepseek-flash` 均完成 3 轮：真实消息回复、下一轮札记回填、参数错误后的连续工具自纠错。每模型有 2 次合成工具尝试（一次失败、一次成功），错误通过实际 agent 的 tool/result 回传；随后正常完成 JSON 回复。共 12 轮全部完成，札记在下一请求中仅出现一次，公开文本未包含完整札记或封套。独立重读四份原生会话日志核对上述计数及终态。
+
+另通过实际适配器运行 36 个场景：近期 3 条消息、单工具、多种查询/任务/语音工具调用与合成结果回放、取消、格式损坏反馈、受控截断恢复、参数错误纠正。首次 34/36 通过；Gemini 一次连接失败、一次在受控截断前被上游 content_filter 终止，均零札记保存、零公开输出。只复测这两项后均通过，原失败证据保留。四模型的格式损坏测试均经历真实 API 首次响应、本地注入格式损坏、错误反馈、第二次真实响应恢复；不将故障注入称为自然复现。
+
+完整 agent 的较早共享测试库曾造成跨模型合成记忆污染，已用上述独立目录验收替代；此前 Gemini 有一次约 60 秒后取消，记录保留，不能由后续通过推断中转不再超时。独立验收完成后，脚手架的附加状态读取误用了不存在的 GET 路由，导致进程退出码 1；这发生在所有断言和报告落盘之后，已经修正诊断地址，另独立核对原生日志。所有临时凭据副本已清除。
+
+原生结构能力单独探测：Gemini/Codex 接受对象气泡的 schema；Claude 接受基础对象结构，但拒绝本次 schema 的 maxItems，不能直接套用全部本地约束；DeepSeek 当前 Messages 兼容接口对无效 format schema 仍返回 200，未证明服务端严格执行。当前候选统一依赖本地校验与纠错，未声称四条路线都开启服务端严格 JSON grammar。实际最大输出截断只在 Gemini/DeepSeek 观察到；Claude/Codex 的小输出预算未产生相同终态，因此它们的此项依据受控截断与离线边界测试，不能宣称已自然复现。
+
+上述结构边界保护 private_note 字段与原始 JSON；它不是对合法 bubbles 内文字语义的证明。札记仍是第一人称主观情绪、碎碎念，不采集供应商隐藏推理；实际样本风格留给用户验收。历史日志能确认普通 text 流绕过隔离并被渠道接受，但没有历史原始 HTTP 报文，不能断言内容最初来自模型隐藏推理、上游转换还是普通分析文字。
+
+验收结束时，候选未提交、未推送、未部署，GitHub CI 未触发；当时生产源码为 dc21ba5 且工作树干净。用户确认后才可同步已验收源码和依赖、在保留当前数据/人设/路由配置的前提下构建重启并复核，再同步 GitHub；不得用测试目录覆盖生产配置。
+
+### 逐模型验收明细
+
+配置中共有四个不同模型。chat 顺序为 Gemini、Claude、Codex、DeepSeek；task 顺序为 DeepSeek、Codex，没有额外未测试的模型 ID。以下为 chat 实际适配器测试；task 后台完整执行采用离线回归与合成工具，不应写成对真人执行了任务或语音。
+
+| 实际 provider/model | 配置 effort | 真实 API 已测 | 完整 agent 的独立环境三轮 |
+|---|---|---|---|
+| kin-tree-gemini/gemini-4-argon | medium | 是 | 通过 |
+| kin-tree-claude/claude-opus-5-5 | medium | 是 | 通过 |
+| openai-codex/gpt-6.1-terra | max | 是 | 通过 |
+| deepseek-official/deepseek-flash | max | 是 | 通过 |
+
+近期原话 S1/S2/S3 的私密 fixture 编号为 1144/1156/1166；真实原文留在版本库外，不复制进本报告。
+
+| 实际适配器场景 | Gemini | Claude | Codex | DeepSeek |
+|---|---|---|---|---|
+| 近期原话 S1 | 首次连接失败；单独复测通过 | 通过 | 通过 | 通过 |
+| 近期原话 S2 | 通过 | 通过 | 通过 | 通过 |
+| 近期原话 S3 | 通过 | 通过 | 通过 | 通过 |
+| read_event_thread 调用、合成结果、最终回复 | 通过 | 通过 | 通过 | 通过 |
+| read_event_thread + kin_work + kin_voice 调用/合成结果回放 | 通过 | 通过 | 通过 | 通过 |
+| 取消后不保存札记、不公开内容 | 通过 | 通过 | 通过 | 通过 |
+| 格式损坏反馈后同模型纠正 | 通过 | 通过 | 通过 | 通过 |
+| 受控截断后反馈纠正 | 首次被上游过滤；单独复测通过 | 通过 | 通过 | 通过 |
+| 参数校验错误、纠正调用、最终回复 | 通过 | 通过 | 通过 | 通过 |
+
+34/36 的两个失败各只做过一次针对性复测：S1 初次 1 次 API 调用在 5.338 秒以 TRANSPORT/Connection error 结束，复测 1 次 API 调用在 22.887 秒正常 stop，保存 1 札记、公开 109 字符。受控截断场景初次 1 次 API 调用在 43.095 秒以 PI_AI_ERROR/content_filter 结束，尚无正文，故未执行截断注入或纠错；复测包含 2 次 API 调用（第一次截断、第二次反馈纠正），合计 15.542 秒，保存 1 札记、公开 78 字符。合计两场景最初 2 次 API 调用，加针对性复测 3 次 API 调用。不能把第一次过滤计为“截断保护失败”，也不能把故意截断后的第二次生成计为额外人工复测。
+
+接收到发送的验证边界：真实/脚本化模型流 → 完整终态缓冲 → JSON 根对象及每个对象气泡校验 → Core 私密札记保存确认 → 仅 bubbles 正文投影到公开流/持久历史 → 假平台 accepted 回执与账本。格式不符、未完成、晚到错误、保存失败均在释放文字/工具前拦截；实际连续工具测试的错误结果由 DSH 自动回给 agent，而不是人工拼接替代整个调度循环。真实平台业务消息未发送。
+
+版本证据：a3cb188（2026-11-05）把私密札记实现为可选 kin_note 工具，描述仍是感受、猜测、留给自己的话；e331968（2026-11-10）加入普通文字的段落流式发送。未找到把札记语义直接改成供应商隐藏推理的变更。扫描快照中的 42 份 native session 未出现 kin_note 调用；近期三例泄露出现在普通 text 块，最近微信案例的渠道账本仍可核验两段 accepted。更准确的故障结论是：札记改为可选工具后未被调用，同时普通分析样文字未受到 JSON 公私隔离；由于缺少历史原始 HTTP wire，分析样文字的最初生成/转换来源尚不确定。
+
+
+### 用户确认后的上线记录
+
+用户确认逐模型结果后明确授权上线，随后授权同步 GitHub。2026-11-12 已按文件清单替换已验证源码和构建产物，并核对一致性。部署前排空、备份数据库及原产物，SQLite 备份 quick_check 为 ok；停止写入期间 mind_state revision 保持不变。人设、联系人/渠道设置、模型路线顺序、供应商配置和密钥未由部署改写。后台恢复原冻结状态。
+
+重启后的新一轮核心自检无 error；微信完成首轮成功拉取，飞书连接正常。仍有部署前已有的 digests-evidence 警告，保留并单独报告，没有为上线清除诊断。上线验证不发送联系人测试消息；渠道连接不等同于联系人实际收到测试消息。生产模型测试入口对四条实际路线的真实 API 短句检查均成功且正常结束。

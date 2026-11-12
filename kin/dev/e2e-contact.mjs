@@ -83,12 +83,13 @@ if (report.error) {
 
 const unknownPart = report.mingUnknown?.id + ':0'
 const checks = {
-  'late overflow with an in-flight platform receipt ends in error without compaction, regeneration or duplicate sends': report.partialFailure?.calls === 1
-    && report.partialFailure.summaries === 0 && report.partialFailure.compactions === 0 && report.partialFailure.attempts === 1
+  'buffered late overflow recovers before any delivery and sends the regenerated answer exactly once': report.partialFailure?.calls === 2
+    && report.partialFailure.summaries === 1 && report.partialFailure.compactions === 1 && report.partialFailure.attempts === 1
     && report.partialFailure.delivery?.sent.filter(s => s.state === 'accepted').length === 1
-    && report.partialFailure.delivery.sent[0].platformId && report.partialFailure.ended.includes('error') && report.partialFailure.sent.length === 1 && report.partialFailure.sent[0].text === 'Synthetic accepted paragraph.',
-  'relay thought paragraphs never reach WeChat or cross-conversation history': report.mingSends.some((s) => s.text === '收到啦～')
-    && !JSON.stringify([report.mingSends, report.groupMentioned.sent, report.looks]).includes('Private test reasoning'),
+    && report.partialFailure.delivery.sent[0].platformId && report.partialFailure.ended.includes('completed')
+    && report.partialFailure.sent.length === 1 && report.partialFailure.sent[0].text === 'Synthetic regenerated reply.',
+  'reply envelope notes never reach WeChat or cross-conversation public history': report.mingSends.some((s) => s.text === '收到啦～')
+    && !JSON.stringify([report.mingSends, report.groupMentioned.sent, report.looks]).includes('我把这一点开心留在心里。'),
   '小明 twice within 20 s is one message to her, named': report.ming?.turns.length === 1 && report.ming.turns[0].text === '小明：在吗\n小明：我今天看到星星了',
   'her reply to 小明 went back on WeChat, typing while she wrote': report.ming !== null && report.typing.some((t) => t.on) && report.typing.at(-1)?.on === false,
   'plain group talk is heard, not answered': report.groupQuiet.turns.length === 0 && report.groupQuiet.sent === 0,

@@ -16,11 +16,13 @@ import { OWNER } from './contact/people.js'
 import { PLATFORMS } from './contact/conversations.js'
 import * as contact from './contact/preset.js'
 import { MindError } from './mind.js'
+import { replyNoteContext } from './reply-context.js'
+import { REPLY_INSTRUCTION } from './reply-output.js'
 import { PROVIDER } from './models.js'
 import { RECALL, renderContext, stamp, when } from './render.js'
 import * as steward from './steward/preset.js'
 import * as talk from './talk/preset.js'
-import { spoken, textOf, typed } from './turn.js'
+import { heard, spoken, textOf, typed } from './turn.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -40,6 +42,8 @@ declare module '@deepseek-ai/dsh-llm' {
       readonly receipt?: { readonly id: string; readonly epoch: string; readonly marker: string }
       /** The memories and sources the block's words rest on: one deleted later takes the block out of what a model is sent (models.ts). */
       readonly rests?: readonly string[]
+      /** Private notes already appended; retained in the log across restart and compaction. */
+      readonly noteIds?: readonly string[]
     }
   }
 }
@@ -62,6 +66,16 @@ export function apply(ctx: Context) {
   ctx.effect(() => ctx.systemPrompt.variable('kin_persona', () => kin.persona()), 'kin persona variable')
   ctx.effect(() => ctx.systemPrompt.section({ name: 'kin-presence', order: ctx.systemPrompt.getSectionOrder('TOOL_SUBAGENT'), text: PRESENCE }),
     'kin presence guide')
+
+  ctx.effect(() => ctx.systemPrompt.section({ name: 'kin-reply-envelope', order: ctx.systemPrompt.getSectionOrder('TOOL_SUBAGENT'), text: REPLY_INSTRUCTION }), 'kin reply envelope')
+  ctx.on('agent/request', async ({ agent, turn, step }, next) => {
+    const request = await next()
+    const input = heard(agent).at(-1)
+    kin.replyTargets.set(agent.session.id, { id: `note:${agent.session.id}:${turn}:${step}`, sessionId: agent.session.id, ...(input ? { inputId: input.id } : {}) })
+    return request
+  })
+
+  ctx.on('agent/request-error', async ({ failure }, next) => failure.code === 'REPLY_NOTE_SAVE_FAILED' ? undefined : next(), { prepend: true })
 
   // The feeling line each conversation last showed her, so an unchanged mood is not repeated every turn. It
   // counts as shown once the session has kept the block that carries it (`showing`: that block, until then):
@@ -124,8 +138,11 @@ export function apply(ctx: Context) {
     if (step === 1) await forget(agent.session).catch(warn('deleted memories not checked'))
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
+    const { channel: _noteChannel, ...noteScope } = kin.scopeOf(agent.session.id)
+    const noteContext = await replyNoteContext(agent.session, id => kin.mind.call('private-notes', { identifier: id, limit: 1, semantic: false, ...noteScope }))
+    const withNotes = (messages: UserMessage[]) => noteContext ? [...messages, noteContext] : messages
     const said = decision.messages.some(spoken)
-    if (step !== 1 && !said) return decision
+    if (step !== 1 && !said) return { ...decision, messages: withNotes(decision.messages) }
     const query = decision.messages.map(textOf).join('\n').trim()
     const session = agent.session.id
     if (said) kin.timeline.mark(session, 'step')
@@ -174,7 +191,7 @@ export function apply(ctx: Context) {
     const wait = step === 1 && channel !== 'own' && ctx.get('kinContact')?.askedToWait(scope.recipient_person_id)
     const asked = wait && `（对方说过先别找他，到 ${wait} 为止。）`
     const text = [step === 1 && here, days, away, asked, recalled, work, source && `这条消息的来源编号：${source}`].filter(Boolean).join('\n')
-    if (!text) return decision
+    if (!text) return { ...decision, messages: withNotes(decision.messages) }
     const block = createUserMessage({
       content: [{ type: 'text', text }],
       source: {
@@ -183,7 +200,7 @@ export function apply(ctx: Context) {
       },
     })
     if (recalled && feeling) showing.set(session, { message: block.id, feeling })
-    return { ...decision, messages: [...decision.messages, block] }
+    return { ...decision, messages: withNotes([...decision.messages, block]) }
   }, { prepend: true })
 
   // The session has kept a block of her memories: Core counts them as given to this session from now, so a
@@ -216,6 +233,7 @@ export function apply(ctx: Context) {
     if (status === 'running') agent.model.select({ provider: PROVIDER, model: 'chat' })
     kin.replying(agent.session.id, status === 'running')
     if (status !== 'idle') return
+    kin.replyTargets.delete(agent.session.id)
     kin.timeline.rest(agent.session.id, kin.channelOf(agent.session.id) !== 'app')
     void record(agent).then(() => kin.nudge(), warn('recording failed'))
   })

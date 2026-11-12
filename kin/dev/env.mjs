@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // An isolated DSH home with dsh-kin linked in, a scripted mock model and KIN's real mind on synthetic data.
 // Nothing here touches ~/.dsh: DSH_HOME and HOME both point inside .dev/.
 import { spawn } from 'node:child_process'
@@ -35,7 +36,7 @@ export async function bootDsh({ name, extraRows = '', mockText = '嗯嗯，我�
     pace: ${pace}
 ${extraRows}`)
 
-  const mock = await startMockLlmServer({ sequence: ['success'], repeatLast: true, successText: mockText })
+  const mock = await startMockLlmServer({ sequence: ['success'], repeatLast: true, successText: replyEnvelope(mockText) })
   const dsh = spawn(process.execPath, [join(kinDir, 'node_modules/@deepseek-ai/dsh/lib/bin.js'),
     '--profile', name, '--patch', overlay, '--no-open', '--port', '0'], {
     cwd: root,

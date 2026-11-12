@@ -1,3 +1,12 @@
+## 2026-11-12 — Separate private mood notes from public replies
+
+- Restore the explicit conversation envelope: `private_note`, `action`, and object-valued `bubbles`. Every public reply requires a first-person mood note; only validated bubble text reaches public streaming, history and channels.
+- Buffer the complete model step through successful termination and confirmed private-note persistence. Reject malformed, partial or failed responses before releasing text or tools. Preserve native reasoning and tool replay separately; keep pure tool turns and parallel/multi-step tools intact.
+- Feed a safe validation error back to the same route once before fallback, without exposing rejected text or replaying completed tools. Storage failures and cancellation do not regenerate output. Use stable note identities for idempotent persistence.
+- Append each saved mood note to the next model step once as private role context, retaining original text and native conversation prefixes. Durable note ids prevent duplicate injection after restart or compaction, and source deletion removes the derived context.
+- Validate all Core bridge tool arguments against their declared JSON Schema before dispatch, including mixed unions and nested constraints, without coercion or changing open-object contracts. Existing native tool result/error and media handling remain in place.
+- This is a local validation boundary. The current DSH adapter does not enable server-side JSON-schema generation. Historical data and persona are not rewritten.
+
 ## 2026-11-11 — Native relay migration and long-input patience
 
 - Use the replacement relay's supported protocols: native Anthropic Messages for Claude and Chat Completions for Gemini. Preserve completed prior-protocol history and native tool replay; no local proxy or fabricated signatures are required.

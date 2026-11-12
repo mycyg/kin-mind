@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Dev-only, mounted by dev/e2e-world.mjs in both of its DSH runs: her chat and task lanes played by a script, and two
 // dev routes for the harness — a turn in her desktop chat (as the page's chat box sends one) and a conversation of hers
 // read back in full (everything the model saw there: what was said, her recall, her tools' answers).
@@ -38,7 +39,7 @@ class World extends Scripted {
   }
 
   async *chat(options) {
-    const messages = options.messages ?? []
+    const messages = (options.messages ?? []).filter(m => !m.source?.noteIds)
     if (options.system?.includes('最后只输出一个 JSON 对象')) {
       const facts = textOf(messages.at(-1))
       this.seen.drafts.push(facts)
@@ -49,17 +50,17 @@ class World extends Scripted {
     if (messages.at(-1)?.role === 'tool') {
       const asked = JSON.stringify(messages.at(-2))
       const turn = JSON.stringify(messages.slice(messages.findLastIndex((m, i) => m.role === 'assistant' && i < messages.length - 2) + 1))
-      if (asked.includes('kin_note')) return yield* reply('放心，我替你保密。')
-      if (asked.includes('kin_delegate')) return yield* reply('交给帮手啦，做好了告诉你。')
-      if (asked.includes('kin_tell')) return yield* reply('好，我跟小红说了。')
-      if (asked.includes('悄悄话')) return yield* reply('小光挺好的呀～')
-      return yield* reply(turn.includes('杭州') ? '你说过下周三要去杭州出差呀，别怕，我陪着你。' : '这个我想不起来了。')
+      if (asked.includes('kin_note')) return yield* publicReply('放心，我替你保密。')
+      if (asked.includes('kin_delegate')) return yield* publicReply('交给帮手啦，做好了告诉你。')
+      if (asked.includes('kin_tell')) return yield* publicReply('好，我跟小红说了。')
+      if (asked.includes('悄悄话')) return yield* publicReply('小光挺好的呀～')
+      return yield* publicReply(turn.includes('杭州') ? '你说过下周三要去杭州出差呀，别怕，我陪着你。' : '这个我想不起来了。')
     }
     // The words of this turn, without the recall the host adds after them.
     const words = messages.slice(messages.findLastIndex((m) => m.role === 'assistant') + 1)
       .filter((m) => m.role === 'user' && m.source?.kind !== 'kin-context').map(textOf).filter((text) => !CONTEXT.test(text)).join('\n')
     if (words.includes('宿主事实')) {
-      return yield* reply(words.includes('做完了') ? '整理好啦，清单写在你那个文件夹的 整理结果.md 里了。'
+      return yield* publicReply(words.includes('做完了') ? '整理好啦，清单写在你那个文件夹的 整理结果.md 里了。'
         : words.includes('重启') ? '刚才 DSH 重启，核对账单的活断在半路了，要我让它接着做吗？' : '嗯。')
     }
     if (words.includes('去哪儿出差')) return yield* call('kin_recall', { about: '出差 坐飞机' })
@@ -73,9 +74,9 @@ class World extends Scripted {
     }
     const relay = /转告小红：(.+)/.exec(words)
     if (relay) return yield* call('kin_tell', { to: '小红', text: '小光说' + relay[1] })
-    if (words.includes('你说呢')) return yield* reply('吃火锅吧！')
-    if (words.includes('去忙')) return yield* reply('嗯嗯，去吧～')
-    return yield* reply('好呀，路上小心～')
+    if (words.includes('你说呢')) return yield* publicReply('吃火锅吧！')
+    if (words.includes('去忙')) return yield* publicReply('嗯嗯，去吧～')
+    return yield* publicReply('好呀，路上小心～')
   }
 }
 
@@ -132,3 +133,5 @@ export function apply(ctx, config) {
   })
   route('/api/kin-world/model', async () => world.seen)
 }
+
+function* publicReply(text) { yield* reply(replyEnvelope(text)) }

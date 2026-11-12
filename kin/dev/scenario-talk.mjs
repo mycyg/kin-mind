@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Dev-only scenario for what she does in a conversation (src/talk/), mounted by dev/e2e-talk.mjs inside a
 // real headless DSH. Her chat lane is a scripted model that uses her tools the way a person's words invite.
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -20,7 +21,7 @@ class Chat extends LlmAdapter {
   }
   async *stream(options) {
     const messages = options.messages
-    const last = messages.at(-1)
+    const last = messages.filter(m => m.source?.kind !== 'kin-context' && m.source?.kind !== 'runtime-context').at(-1)
     // This turn: what the person said, and the notes her plugin gave her (recall, the message's source, a reply come due).
     const since = messages.slice(messages.findLastIndex((m) => m.role === 'assistant') + 1)
     const said = since.filter((m) => m.source?.kind === 'user').map(textOf).join('\n')
@@ -76,6 +77,7 @@ function* call(name, args) {
 }
 
 function* words(text) {
+  text = replyEnvelope(text)
   yield { type: 'block-start', index: 0, blockType: 'text' }
   yield { type: 'text-delta', index: 0, text }
   yield { type: 'block-end', index: 0, block: { type: 'text', text } }

@@ -21,6 +21,7 @@ import { Mind } from './mind.js'
 import { CONTEXT_WINDOW, PRESSURE_RATIO, HEADROOM_TOKENS, OUTPUT_BUDGET } from './model-budget.js'
 import { KinModel, LANES, PROVIDER, type Lane, type Route } from './models.js'
 import { KIN, memoriesOf, RECALL, type Dimension } from './render.js'
+import type { ReplyTarget } from './reply-output.js'
 import { DEFAULT_PERSONA, personaText } from './persona.js'
 import { steward } from './steward/index.js'
 import { talk } from './talk/index.js'
@@ -34,6 +35,7 @@ declare module '@deepseek-ai/cordis' {
 
 /** What the KIN preset's per-session plugin uses. */
 export interface Kin {
+  readonly replyTargets: Map<string, ReplyTarget>
   readonly mind: Mind
   /** Her persona and who she knows, as her models read it. */
   persona(): string
@@ -286,6 +288,7 @@ export function apply(ctx: Context, config: Config) {
       save('erased.json', Object.fromEntries(model.erased))
     },
     summaries: model.summaries,
+    replyTargets: model.replyTargets,
   } satisfies Kin)
 
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {

@@ -6,8 +6,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { randomUUID } from 'node:crypto'
+import { toolNoteId } from '../reply-context.js'
 import type {} from '../index.js'
+import { checkedTool } from '../tool-arguments.js'
 import { localTimes } from '../render.js'
 import { heard, lastTurn, textOf } from '../turn.js'
 import type {} from './index.js'
@@ -29,7 +30,7 @@ export async function apply(ctx: Context) {
 
   // Core's own tools, as Core declares them, through DSH's MCP tool bridge; her resident mind runs each call.
   for (const tool of await kinTalk.tools) {
-    ctx.tools.register(createMcpToolDefinition(ctx, {
+    ctx.tools.register(checkedTool(createMcpToolDefinition(ctx, {
       name: tool.name, rawName: tool.name, description: tool.description, inputSchema: tool.inputSchema,
       // Core answers as an MCP server does: the result as text, or what was wrong with the call. Its times come
       // with their local stamps, as her recall shows them.
@@ -38,7 +39,7 @@ export async function apply(ctx: Context) {
         for (const block of answer.content ?? []) if (block.type === 'text') block.text = localTimes(block.text)
         return answer
       },
-    }))
+    })))
   }
 
   // Messages she chose to answer together with whatever is said next, with why, by conversation: this preset
@@ -87,13 +88,13 @@ export async function apply(ctx: Context) {
   // Notes to herself (Core's private notes): never sent, recalled later with the rest of what she remembers.
   ctx.tools.register(defineTool({
     name: 'kin_note',
-    description: '在心里记一笔：此刻真实的感受、猜测，或只想留给自己的话。只有你自己看得到，不会发出去；以后回想时会想起来。',
-    parameters: { text: { type: 'string', required: true } },
+    description: '给自己留心情札记：用第一人称“我”写自然口语的心情、想念、猜测或没说出口的话。只保存参数 text，不外发；不要另写普通文字旁白。不要写分析步骤、回复计划或复制模型隐藏推理。没有想记的就不用；公开回复封套的 private_note 也可保存札记，不要重复记同一笔。',
+    parameters: { text: { type: 'string', required: true, description: '第一人称、自然口语的心情札记，最多 4000 字符' } },
     output: text,
     async execute(args, exec) {
       const input = heard(exec.agent!).at(-1)
       await kin.mind.call('private-note-save', {
-        id: randomUUID(), group_id: input?.id ?? exec.callId, ...(input ? { input_id: input.id } : {}),
+        id: toolNoteId(kin.replyTargets.get(exec.agent!.session.id)!.id, exec.callId), group_id: input?.id ?? exec.callId, ...(input ? { input_id: input.id } : {}),
         text: args.text, session: exec.agent!.session.id, ...viewOf(exec.agent!.session.id),
       })
       return '记下了。'

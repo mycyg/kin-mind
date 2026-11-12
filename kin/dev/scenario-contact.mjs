@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Dev-only scenario for her conversations and reaching out, mounted by dev/e2e-contact.mjs inside a real headless
 // DSH. A fake WeChat stands in on the channels module's `kinTransports` service: the owner (小光), a friend (小明)
 // and a family group write to her through it, and everything she sends is kept. Her voice is a fake speech worker
@@ -53,7 +54,7 @@ class Chat extends LlmAdapter {
       return yield* words(['Primary Request and Intent', 'Key Technical Concepts', 'Files and Code', 'Errors and Fixes', 'Pending Jobs', 'Current Work', 'Next Step', 'Critical Context'].map(name => `## ${name}\n- Synthetic retained context.`).join('\n\n'))
     }
     if (options.model === 'scripted') return yield* appraisal(options)
-    const texts = (options.messages ?? []).map((m) => ({ role: m.role, text: (m.content ?? []).map((b) => b.text ?? '').join('') }))
+    const texts = (options.messages ?? []).filter(m => m.source?.kind !== 'kin-context' || !m.source?.noteIds).map((m) => ({ role: m.role, text: (m.content ?? []).map((b) => b.text ?? '').join('') }))
     if (options.system?.includes('最后只输出一个 JSON 对象')) {
       const user = texts.at(-1).text
       this.drafts.push({ system: options.system, user })
@@ -67,7 +68,7 @@ class Chat extends LlmAdapter {
     const said = texts.findLast((m) => m.role === 'user' && !/^(（|这条消息的来源编号|Current runtime context|Time sampled)/.test(m.text))?.text ?? ''
     if (said.includes('synthetic partial failure')) {
       this.partialCalls = (this.partialCalls ?? 0) + 1
-      if (this.partialCalls > 1) return yield* words('Synthetic regenerated reply.')
+      if (this.partialCalls > 1) return yield* words(replyEnvelope('Synthetic regenerated reply.'))
       yield { type: 'text-delta', index: 0, text: 'Synthetic accepted paragraph.\n\nUnfinished tail' }
       await new Promise(resolve => setTimeout(resolve, 30))
       yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'Synthetic late overflow' } } }
@@ -82,7 +83,7 @@ class Chat extends LlmAdapter {
     if (!answered && said.includes('把报告发我')) return yield* call('kin_send_file', { path: this.report, asked: true })
     if (!answered && said.includes('发个表情')) return yield* call('kin_sticker', { meaning: '开心得转圈' })
     if (!answered && said.includes('用语音说')) return yield* call('kin_voice', { text: '晚安呀，早点睡', style: '轻声' })
-    return yield* words('💭 Private test reasoning.\n\n' + (answered ? '好，我跟他说啦' : '收到啦～'))
+    return yield* words(replyEnvelope(answered ? '好，我跟他说啦' : '收到啦～'))
   }
 }
 
@@ -265,7 +266,7 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
   await say(ctx, app, '看看小明那边在聊什么')
   arrive({ chat: 'wx-ming', sender: 'wx-ming', text: '你和小光聊了什么' })
   report.looks = await until(() => (chat.looks?.length >= 2 ? chat.looks : undefined), 60_000)
-  // A terminal model error races a platform receipt. The real agent loop must not compact/retry.
+  // A late overflow is buffered: recovery may regenerate, but no failed paragraph reaches the transport.
   const ownerSession = sessions()['wechat:wx-owner'].sessionId
   const { agent: ownerAgent } = await ctx.sessionController.resolveAgent(ownerSession)
   await ownerAgent.whenIdle()
@@ -274,11 +275,10 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
   arrive({ chat: 'wx-owner', sender: 'wx-owner', text: 'synthetic partial failure' })
   await until(() => chat.partialCalls > 0, 60000)
   await ownerAgent.whenIdle()
-  await until(() => wechat.sent.some(s => s.text === 'Synthetic accepted paragraph.'), 10000)
   const partialEvents = ownerAgent.session.snapshotEvents().slice(beforePartial)
   report.partialFailure = { calls: chat.partialCalls, summaries: chat.partialSummaries,
     sent: wechat.sent.filter(s => s.text.startsWith('Synthetic ')),
-    delivery: await until(() => deliveries().find(d => d.parts?.some(p => p.text === 'Synthetic accepted paragraph.') && d.sent?.some(s => s.state === 'accepted')), 10000),
+    delivery: await until(() => deliveries().find(d => d.parts?.some(p => p.text === 'Synthetic regenerated reply.') && d.sent?.some(s => s.state === 'accepted')), 10000),
     ended: partialEvents.filter(e => e.type === 'turn/end').map(e => e.data.reason.kind),
     compactions: partialEvents.filter(e => e.type === 'compaction/start').length,
     attempts: partialEvents.filter(e => e.type === 'assistant/attempt').length }

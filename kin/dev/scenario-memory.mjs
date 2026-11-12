@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Dev-only, mounted by dev/e2e-memory.mjs: her lanes played by a script, a turn in her desktop chat, and a
 // conversation of hers read back as the model saw it (what was said, her recall, her tools' answers).
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -15,13 +16,13 @@ class Memory extends Scripted {
       }
       return yield* super.stream(options)
     }
-    const messages = options.messages ?? []
+    const messages = (options.messages ?? []).filter(m => !m.source?.noteIds)
     // Her own minute's draft: not now.
     if (options.system?.includes('最后只输出一个 JSON 对象')) return yield* reply('{"action":"wait","condition":"review","reason":"先不打扰"}')
-    if (messages.at(-1)?.role === 'tool') return yield* reply('嗯，我想起来了。')
+    if (messages.at(-1)?.role === 'tool') return yield* reply(replyEnvelope('嗯，我想起来了。'))
     const words = textOf(messages.findLast((m) => m.role === 'user' && !/^(（以下是你此刻|这条消息的来源编号)/.test(textOf(m))) ?? { content: [] })
     if (words.includes('还记得')) return yield* call('kin_recall', { about: '出差 杭州 回中国 坐飞机' })
-    return yield* reply('好呀～')
+    return yield* reply(replyEnvelope('好呀～'))
   }
 }
 

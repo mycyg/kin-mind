@@ -10,6 +10,8 @@
  */
 import { OUTPUT_BUDGET, estimateRequestTokens, requestThreshold } from './model-budget.js'
 import { answerText, modelOutput } from './model-output.js'
+import { replyWithCorrection, type ReplyTarget } from './reply-output.js'
+import type {} from './index.js'
 import { modelRequest, rememberRoute } from './model-history.js'
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -48,6 +50,7 @@ export interface LastCall {
 const laneOf = (model: string): Lane => (model === 'task' ? 'task' : 'chat')
 
 export class KinModel extends LlmAdapter {
+  readonly replyTargets = new Map<string, ReplyTarget>()
   readonly last: Partial<Record<Lane, LastCall>> = {}
   private readonly light = new Map<string, Promise<string | undefined>>()
   /** Routes that failed lately: why, and until when they wait behind the others. */
@@ -158,6 +161,8 @@ export class KinModel extends LlmAdapter {
         }
       }
     }
+    const target = options.sessionId && !options.purpose && lane === 'chat' ? this.replyTargets.get(options.sessionId) : undefined
+    if (options.sessionId && !options.purpose && lane === 'chat' && !target) throw new LlmError('会话输出边界尚未就绪，未调用模型', 'REPLY_CONTEXT_MISSING')
     const failed: LastCall['failed'] = []
     let failure: LlmFailure | undefined
     const key = (route: Route) => route.provider + '/' + route.model
@@ -188,9 +193,10 @@ export class KinModel extends LlmAdapter {
       const patience = route.longInputWaitMs && requestEstimate() >= LONG_INPUT_TOKENS
         ? Math.max(normalPatience, Math.min(300_000, route.longInputWaitMs)) : normalPatience
       let firstTokenTimedOut = false
-      const timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
+      let timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
       const held: StreamChunk[] = []
       let answering = false
+      let acceptedEmpty = false
       let finished = false
       failure = undefined
       // A model's own facts that never come are not waited on past a stop or this route's patience.
@@ -211,10 +217,29 @@ export class KinModel extends LlmAdapter {
       try {
         const info = await this.ctx.llm.resolveModelInfo?.(route.provider, route.model, attempt.signal)
         const maxTokens = Math.min(options.maxTokens ?? OUTPUT_BUDGET, info?.defaultMaxTokens ?? OUTPUT_BUDGET)
-        for await (const chunk of modelOutput(observe(this.ctx.llm.stream(modelRequest({
-          ...options, messages, maxTokens, provider: route.provider, model: route.model, signal: attempt.signal,
-          reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
-        }, route))))) {
+        const source = (feedback?: string) => {
+          if (feedback) {
+            clearTimeout(timer)
+            timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
+          }
+          return observe(this.ctx.llm.stream(modelRequest({
+            ...options, messages: feedback ? [...messages, { role: 'user', content: [{ type: 'text', text: feedback }] }] : messages, maxTokens, provider: route.provider, model: route.model, signal: attempt.signal,
+            reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
+          }, route)))
+        }
+        const output = target ? replyWithCorrection(source, {
+          rejected: reason => { failed.push({ route, reason: 'INVALID_REPLY_ENVELOPE: ' + reason }) },
+          signal: attempt.signal, accepted: empty => { acceptedEmpty = empty },
+          save: async (note, reply) => {
+            const { channel: _channel, ...scope } = this.ctx.kin.scopeOf(target.sessionId)
+            const saved = await this.ctx.kin.mind.call<{ state: string }>('private-note-save', {
+              id: target.id, group_id: target.id, ...(target.inputId ? { input_id: target.inputId } : {}),
+              text: note, reply_text: reply, session: target.sessionId, provider: route.provider, model: route.model, ...scope,
+            })
+            if (saved.state !== 'saved') throw new Error('note not saved')
+          },
+        }) : modelOutput(source())
+        for await (const chunk of output) {
           if (chunk.type === 'finish') {
             finished = true
             if (answering && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
@@ -229,7 +254,10 @@ export class KinModel extends LlmAdapter {
               failure = chunk.reason.failure
               break
             }
-            if (chunk.type === 'finish') break
+            if (chunk.type === 'finish') {
+              if (acceptedEmpty) { yield* held; yield rememberRoute(chunk, route) }
+              break
+            }
             // Thinking and incomplete tool arguments have not answered or executed anything yet.
             const visible = (chunk.type === 'text-delta' && Boolean(chunk.text))
               || (chunk.type === 'block-end' && (chunk.block.type === 'tool-call' || (chunk.block.type === 'text' && Boolean(chunk.block.text))))
@@ -244,15 +272,19 @@ export class KinModel extends LlmAdapter {
           yield rememberRoute(chunk, route)
         }
         if (answering && !finished) throw new LlmError('模型开始回复后连接中断，未收到结束确认', 'INCOMPLETE_RESPONSE')
-        if (!answering && !failure) failure = { code: 'NO_RESPONSE', message: '模型没有返回内容' }
+        if (!answering && !acceptedEmpty && !failure) failure = { code: 'NO_RESPONSE', message: '模型没有返回内容' }
       } catch (error) {
+        if ((error as { code?: string }).code === 'REPLY_NOTE_SAVE_FAILED') {
+          this.last[lane] = { at: new Date().toISOString(), answered: null, failed: [...failed, { route, reason: (error as Error).message }] }
+          throw error
+        }
         if (answering) {
           const reason = (error as Error).message
           this.cooling.set(key(route), { until: Date.now() + COOL_MS, reason })
           this.last[lane] = { at: new Date().toISOString(), answered: null, failed: [...failed, { route, reason }] }
           throw error
         }
-        failure = { code: 'ROUTE_FAILED', message: (error as Error).message }
+        failure = { code: (error as { code?: string }).code ?? 'ROUTE_FAILED', message: (error as Error).message }
       } finally {
         clearTimeout(timer)
         options.signal?.removeEventListener('abort', stop)

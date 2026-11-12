@@ -76,6 +76,8 @@ await check('cumulative checkpoint and untouched tail survive replacement and se
     assert.equal(request.tools, undefined); assert.equal(request.toolHistory, undefined)
     assert.equal(request.messages[0].role, 'system')
     assert.match(request.messages[0].content[0].text, /archivist/)
+    assert.match(request.messages[0].content[0].text, /role_note are Kin's subjective feelings and guesses, not the user's statements or verified facts/)
+    assert.match(request.messages[0].content[0].text, /Preserve their speaker and uncertainty/)
     assert.ok(request.messages.slice(1).every(message => message.role === 'user'))
     const source = JSON.stringify(request.messages)
     assert.match(source, /blue notebook/); assert.match(source, /meeting is Saturday/)

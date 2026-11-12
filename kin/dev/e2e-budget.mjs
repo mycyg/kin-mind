@@ -47,10 +47,10 @@ try {
     seed.append('turn/start', { turn })
     seed.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '汉'.repeat(150000) }] }), { surfaceOp: 'append' })
     seed.append('step/start', { turn, step: 1 })
-    seed.append('assistant/message', { turn, step: 1, stream: [], message: createAssistantMessage({ content: [{ type: 'text', text: 'Recorded synthetic answer.' }], source: { provider: 'kin', model: 'chat' } }) }, { surfaceOp: 'append' })
+    seed.append('assistant/message', { turn, step: 1, stream: [], message: createAssistantMessage({ content: [{ type: 'text', text: 'Recorded synthetic answer.' }], source: { provider: 'kin', model: 'task' } }) }, { surfaceOp: 'append' })
     seed.append('step/end', { turn, step: 1 }); seed.append('turn/end', { turn, reason: { kind: 'completed' } })
   }
-  const { agent } = await ctx.agents.create({ sessionId: SessionId('synthetic-budget'), seed: seed.snapshotEvents(), agentOptions: { provider: 'kin', model: 'chat' } })
+  const { agent } = await ctx.agents.create({ sessionId: SessionId('synthetic-budget'), seed: seed.snapshotEvents(), agentOptions: { provider: 'kin', model: 'task' } })
   let contextAdded = false
   ctx.on('agent/pre-step', async (_, next) => {
     const decision = await next()

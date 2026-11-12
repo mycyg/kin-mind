@@ -1,3 +1,4 @@
+import { replyEnvelope } from './reply-fixture.mjs'
 // Request-boundary regressions through KIN, then real DSH adapters over a local provider. No live credentials or user data.
 import assert from 'node:assert/strict'
 import { build } from 'esbuild'
@@ -262,9 +263,11 @@ try {
     const ctx = { llm: {
       resolveModelInfo: async (provider, model) => ({ provider, id: model, context: { contextWindow: 1048576 }, defaultMaxTokens: model.startsWith('gemini') ? 65536 : 384000 }),
       imageRequestPricing: () => undefined, fileRequestText: () => 'expanded file '.repeat(400000),
-      async *stream(request) { requests.push(request); yield { type: 'text-delta', index: 0, text: 'ok' }; yield { type: 'finish', reason: { kind: 'stop' } } },
+      async *stream(request) { requests.push(request); yield { type: 'text-delta', index: 0, text: replyEnvelope('ok') }; yield { type: 'finish', reason: { kind: 'stop' } } },
     } }
     const model = new KinModel(ctx, () => [route('gemini-test'), route('deepseek-test')])
+    ctx.kin = { scopeOf: () => ({}), mind: { call: async () => ({ state: 'saved' }) } }
+    model.replyTargets.set('synthetic', { id: 'note:synthetic:1:1', sessionId: 'synthetic' })
     const info = await model.resolveModel('kin', 'chat')
     assert.equal(info.context.contextWindow, 1048576); assert.equal(info.defaultMaxTokens, 128000)
     for await (const _ of model.stream({ provider: 'kin', model: 'chat', sessionId: 'synthetic', messages: [user()] })) {}
