@@ -1,3 +1,22 @@
+## 2026-11-18 — Audit fixes across memory, channels, health and prompt tone
+
+- Chunk SQLite `IN` queries in `reinforcement.strengths()` so daily temperature runs scale past 32,766 records; surface `last_temperature_run` and unrecovered background job failures in lifecycle health checks.
+- Verify speaker identity in `owner_statement()`, propagate source metadata across trait citations, strip adult-intimacy fields outside `owner_private()` in `read_affective_state`, scope `choose_reply` / `defer` to the active companion, and keep uncoded `Missing` targets visible to repair turns while dropping classified block items.
+- Link memory corrections for forward deletion cascade, reject tombstoned inputs and hide internal provenance in private notes, normalize `owner` / `person:person_a` in `ShareLedger` coverage, scope reservation cancellation by recipient, re-arm updated `needs-review` action events, and lock `prompts.json` writes.
+- Make plugin JSON state writes atomic, apply `modelOutput` filtering and chunk-idle deadlines on native streams, retain completed foreign tool exchanges across reasoning blocks, bound small-window compaction reserves, reject malformed non-empty tool JSON, dedupe same-day proactive openings across all accepted deliveries, preserve `unknown` delivery state on pre-send retry errors, isolate helper steward sessions and block `dataDir` overlap in `delegate()`, and restore failed chat drafts in the desktop UI.
+- Naturalize internal Chinese system/section prompts and tool descriptions (`小光` / `Kin`) while preserving existing behavioral contracts and owner-authored persona files.
+
+## 2026-11-18 — Continue a conversation across channels and report attachment delivery accurately
+
+- Bring the same person's other-channel public dialogue, dated proactive receipts and their source references into a chat turn. Proactive drafts read the recipient’s recent dialogue across channels and skip an already accepted opening on a new draft before the next reply that day.
+- Carry file paths and delivery results into conversation lookup, including native tool attachments. A file can be sent to a bound contact and channel. Detect extensionless image files from their bytes.
+- Return attachment refusals as tool errors and identify the failed attachment in the owner notice. On macOS, a specific WeChat CDN interruption can fall back to a labeled JPEG preview. Explicit original requests retain their original bytes.
+
+## 2026-11-16 — Summarize saved experiences without mandatory evidence
+
+- When usable record links are absent, keep the saved event description or title as its digest instead of failing or excluding the event. No evidence IDs are invented and ordinary sourced summaries are unchanged.
+- Recover the seven historical digest failures from their existing event content.
+
 ## 2026-11-12 — Give short chat requests a full minute to start
 
 - Increase chat routes with a fallback from 30 to 60 seconds for their first real token. Thinking still counts as progress; empty stream headers do not. Keep the task/single-route timeout, configured 300-second long-input patience, cancellation and fallback order unchanged.
@@ -39,15 +58,19 @@
 # Changelog
 
 
-# Changelog
-
-
 ## 2026-11-11
 
 - A shared timed concern now wakes one durable appraisal across recipient checks instead of creating a separate event per recipient.
 - Appraisals validate operational state at commit and rebuild their judgment after shared wishes or concerns change. Direct subjective feelings remain freely editable.
 - KIN compaction uses an isolated cumulative-summary task, with no executable conversation or tools, and rejects conversational, incomplete, empty or truncated output before replacing context.
 - Added regression coverage for cross-recipient timer identity, concurrent stale proposals, retry behavior, checkpoint validation and retained history.
+
+## 2026-11-10 — Repair contact limits, diary browsing and model fallback
+
+- Show the actual daily contact cap and per-recipient host availability in reviews and linked plan execution. Pre-draft holds persist as host facts, not fabricated delivery attempts or Kin decisions; clearing a hold leaves her plan intact.
+- Distinguish diary loading, errors and an empty diary, report the full count, and load older pages with retry and duplicate-click protection. Keep technical outing reports and file locations behind an expandable detail view.
+- Adapt nullable Gemini relay schemas and pair Claude relay tool-call/result IDs at the request boundary. Preserve native replay metadata; completed foreign tool-only exchanges remain explicit historical records when DeepSeek thinking cannot replay them directly. Do not fabricate thinking, change effort, or edit durable history.
+- Verification: Core coverage 1418 passed / 1 skipped; 10 Node checks; 124 integration checks across ten suites; rendered browser regressions, type checking, build and targeted scripts passed. Synthetic real-provider tool round trips passed for Gemini, Claude and DeepSeek. No test messages were sent to real contacts.
 
 ## 2026-11-10 — Validate and release the reviewed runtime
 

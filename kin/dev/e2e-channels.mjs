@@ -160,6 +160,22 @@ checks['wechat: only an explicit unknown retry sends again, with the same client
   && wxCached.state === 'unknown' && noImplicitRetry && wxRetried.state === 'accepted'
   && ilink.state.sent.at(-1).client_id === ilink.state.sent.at(-2).client_id
   && afterRetry === beforeRetry + 1 && ilink.state.sent.length === afterRetry
+const pngPath = join(root, 'files', 'original.png')
+const original = Buffer.concat([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'), Buffer.alloc(65536)])
+writeFileSync(pngPath, original)
+ilink.state.refuseAbove = 32768
+const oldCount = ilink.state.sent.length
+const refusedOriginal = await wechat.send(me, { kind: 'image', file: pngPath, original: true }, 'wx-exact')
+checks['wechat: a request for original bytes reports the CDN refusal without a substitute'] = refusedOriginal.state === 'failed'
+  && refusedOriginal.reason.includes('-5104001') && ilink.state.sent.length === oldCount
+if (process.platform === 'darwin') {
+  const preview = await wechat.send(me, { kind: 'image', file: pngPath }, 'wx-preview')
+  const media = ilink.state.sent.at(-1)?.item_list[0].image_item?.media
+  const recovered = media && decrypt(ilink.state.cdn.get(media.encrypt_query_param), media.aes_key)
+  checks['wechat: refused image becomes an explicitly receipted JPEG preview and leaves the original intact'] =
+    preview.state === 'accepted' && preview.preview && recovered?.subarray(0, 3).toString('hex') === 'ffd8ff'
+    && readFileSync(pngPath).equals(original) && ilink.state.sent.length === oldCount + 1
+}
 await wechat.close()
 ilink.close()
 

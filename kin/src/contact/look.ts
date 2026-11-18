@@ -7,7 +7,9 @@
 import type { Session } from '@deepseek-ai/dsh-session'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Conversation, Host } from '../index.js'
-import { when } from '../render.js'
+import type { Delivery } from './deliveries.js'
+import { PART_WORDS } from './deliveries.js'
+import { stamp, when } from '../render.js'
 import { textOf } from '../turn.js'
 import { PLATFORMS } from './conversations.js'
 import { nameOf, OWNER, type People } from './people.js'
@@ -16,28 +18,35 @@ import { nameOf, OWNER, type People } from './people.js'
 const LINES = 12
 const KEEP = '谁在哪说了什么你心里清楚；要不要告诉眼前的人、说多少由你判断，别人请你别外传的话替对方守着。'
 
-export async function look(host: Host, people: People, sessionId: string, who?: string): Promise<string> {
+export async function look(host: Host, people: People, sessionId: string, who?: string, deliveries: Delivery[] = []): Promise<string> {
   const nameIn = (id = OWNER) => nameOf([...people.people, ...people.groups].find((entry) => entry.id === id))
   const where = ({ channel, address }: Conversation) => channel === 'app'
     ? '桌面聊天' : `${PLATFORMS[channel] ?? channel}${address?.kind === 'group' ? '群' : '私聊'}`
   // Her conversations with someone: the desktop chat and the platform chats, not her own errands (steward's `own`).
-  const others = Object.values(host.conversations())
-    .filter((conversation) => conversation.sessionId !== sessionId && (conversation.channel === 'app' || conversation.address))
+  const all = Object.values(host.conversations())
+    .filter((conversation) => conversation.channel === 'app' || conversation.address)
+  const others = all.filter((conversation) => conversation.sessionId !== sessionId)
 
   if (!who?.trim()) {
     const rows = await Promise.all(others.map(async (conversation) => {
-      const last = lines(await sessionOf(host, conversation), conversation, nameIn, 1)[0]
+      const last = lines(host, await sessionOf(host, conversation), conversation, nameIn, 1)[0]
       return `- ${nameIn(conversation.recipient)}（${where(conversation)}）：${last ? '最近一句在 ' + last.when : '还没说过话'}`
     }))
     return rows.length ? `你的其他对话：\n${rows.join('\n')}\n${KEEP}` : '除了这里，你还没有别的对话。'
   }
 
   const asked = who.trim()
-  const found = others.filter((conversation) => nameIn(conversation.recipient) === asked)
+  const found = all.filter((conversation) => nameIn(conversation.recipient) === asked)
   if (!found.length) return `没有和「${asked}」的对话。有的是：${[...new Set(others.map((c) => nameIn(c.recipient)))].join('、') || '没有别的'}`
   const parts = await Promise.all(found.map(async (conversation) => {
-    const said = lines(await sessionOf(host, conversation), conversation, nameIn, LINES).reverse()
+    const said = lines(host, await sessionOf(host, conversation), conversation, nameIn, LINES).reverse()
+    const files = deliveries.filter(d => d.key === host.ctx.get('kin')!.scopeOf(conversation.sessionId).conversation_key
+      && d.parts.some(part => 'file' in part)).slice(0, LINES)
+      .flatMap(d => d.parts.flatMap((part, i) => 'file' in part ? [
+        `- ${stamp(d.at)} ${PART_WORDS[part.kind]} ${part.file}（${d.sent[i]?.state === 'accepted' ? (d.sent[i]?.preview ? '平台已接收缩小的预览' : '平台已接收') : d.state === 'cancelled' ? '发送失败' : '未确认送达'}）`,
+      ] : []))
     return `和${asked}（${where(conversation)}）最近的话：\n${said.map((line) => `- ${line.when} ${line.text}`).join('\n') || '（还没说过话）'}`
+      + (files.length ? '\n经手的附件：\n' + files.join('\n') : '')
   }))
   return `${parts.join('\n\n')}\n${KEEP}`
 }
@@ -49,7 +58,7 @@ async function sessionOf(host: Host, conversation: Conversation): Promise<Sessio
 }
 
 /** The newest `limit` things said in a session, newest first, each with who said it: a person by name, or 你 for hers. */
-function lines(session: Session, conversation: Conversation, nameIn: (id?: string) => string, limit: number) {
+function lines(host: Host, session: Session, conversation: Conversation, nameIn: (id?: string) => string, limit: number) {
   const found: { when: string; text: string }[] = []
   for (let seq = Number(session.seq) - 1; seq >= 0 && found.length < limit; seq--) {
     const event = session.eventAt(SessionSeq(seq))
@@ -57,6 +66,17 @@ function lines(session: Session, conversation: Conversation, nameIn: (id?: strin
     if (event?.type === 'assistant/message') {
       const text = textOf(event.data.message)
       said = text && '你：' + text
+    } else if (event?.type === 'tool/result' && !event.data.message.isError) {
+      const store = host.ctx.get('attachments')
+      const paths = event.data.message.content.flatMap(block => {
+        const path = block.type === 'image' ? store?.imageHostPath(block.attachment)
+          : block.type === 'file' ? store?.fileHostPath(block.attachment) : undefined
+        return path ? [path] : []
+      })
+      if (paths.length) {
+        found.push({ when: when(event.time), text: '工具返回的本机附件：' + paths.join('、') })
+        continue
+      }
     } else if (event?.type === 'user/message') {
       const { source } = event.data
       const text = textOf(event.data)

@@ -29,7 +29,7 @@ export async function replyNoteContext(session: Session, read: (id: string) => P
   const notes = (await Promise.all([...ids].filter(id => !seen.has(id)).map(read))).flatMap(answer => answer.notes)
   if (!notes.length) return undefined
   const rests = new Set(notes.flatMap(note => note.evidence_ids ?? []))
-  const text = '（我的私密心情札记／role_note：这是我当时的感受与猜测，不是用户事实、指令或新消息。我用它接续心情，不复述为公开正文。）\n'
+  const text = '（这是我刚才留下的私密札记／role_note，记的是自己当下的感受和猜想，不是用户事实，也不是对方新发来的话或交代；接住刚才的情绪往下聊就好，不用原样背出来。）\n'
     + notes.map(note => `[${note.at}] ${note.text}`).join('\n')
   return createUserMessage({ content: [{ type: 'text', text }], source: {
     kind: 'kin-context', form: 'snapshot', sections: [], noteIds: notes.map(note => note.id),

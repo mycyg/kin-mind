@@ -18,7 +18,8 @@ import type { ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
-import { readFile } from 'node:fs/promises'
+import { open, readFile } from 'node:fs/promises'
+import { imageType } from '../channels/store.js'
 import { extname } from 'node:path'
 import type { Address, Inbound, Part, Transport } from '../channels/transport.js'
 import type { Conversation, Host } from '../index.js'
@@ -542,7 +543,15 @@ function wordsOf(message: Inbound): string {
 export const IMAGE_TYPES: Record<string, ImageMediaType> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' }
 
 /** A file she sends, as its platform takes it. `named`: the owner asked for this very file (explicit-wechat.mjs). */
-export function fileOf(file: string, named: boolean): Part {
+export async function fileOf(file: string, named: boolean): Promise<Part> {
+  if (!extname(file)) {
+    const handle = await open(file, 'r')
+    try {
+      const header = Buffer.alloc(12)
+      const { bytesRead } = await handle.read(header, 0, header.length, 0)
+      if (imageType(header.subarray(0, bytesRead))) return { file, kind: 'image', named }
+    } finally { await handle.close() }
+  }
   const kind = /\.(png|jpe?g|webp|gif|heic)$/i.test(file) ? 'image' : /\.(mp4|mov|m4v|webm)$/i.test(file) ? 'video' : 'file'
   return { file, kind, named }
 }

@@ -154,3 +154,19 @@ def test_model_source_projection_preserves_recipient_actor_and_audience():
     routes = {"conversation_key", "chat_id"}
     assert all(shown.get(field) == value for field, value in identity.items() if field not in routes)
     assert not routes & set(shown)
+
+
+def test_other_conversation_contact_keeps_receipt_and_source(setup):
+    from kin_mind.host import dispatch
+    mind, _, _ = setup
+    config = {"root": str(mind.engine.db.root), "scope": mind.scope.model_dump(), "agent_version": "synthetic-v1"}
+    receipt = utterance(1, kind="delivery", origin="contact", text="Morning from the other channel")
+    record(mind, [receipt, utterance(2, "person_b"), utterance(3, conversation_key="wechat:here")])
+    answer = dispatch(config, "memory-context", {"query": "Did you contact me?", "purpose": "chat",
+                      "recipient_person_id": "person:person_a", "conversation_key": "wechat:here",
+                      "mode": "light", "recent_dialogue": "other-conversations"})
+    rows = answer["recent_dialogue"]
+    assert len(rows) == 1
+    assert (rows[0]["origin"], rows[0]["state"], rows[0]["channel"], rows[0]["text"]) == (
+        "contact", "accepted", "feishu", receipt["text"])
+    assert rows[0]["source_id"].startswith("src_")

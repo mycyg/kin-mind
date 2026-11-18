@@ -104,22 +104,18 @@ FAITHFUL_NOTE_RULES = """
 
 # NEEDS 用户甲 OK. What `memory.skipped` is (`memory_disposition` or `memorable_marks`).
 SKIPPED_PROMPT = """
-memory.skipped 列出本批 new_evidence 里刻意不记的来源，每项写 evidence_id 和 reason：greeting 是寒暄、应答或表情；receipt 是任务请求与完成回执、送达确认这类程序往来；already_kept 是内容已经由另一条记忆完整保存；no_lasting_content 是没有以后值得想起的内容。不要为了通过检查把来源一律写进 skipped，也不要猜测归属；拿不准就记一条简短笔记。
-coverage_review 出现时，表示上一次整理没有给它列出的来源任何去向：只为这些来源逐条给出笔记、事件归属或 skipped，已经保存的内容不再重复。"""
+memory.skipped 列出这批 new_evidence 里决定不记下来的来源，每条写 evidence_id 和 reason：greeting 表示日常打招呼、应声或表情；receipt 是任务回执、送达确认这类系统往来；already_kept 表示别的记忆已经把内容完整记下了；no_lasting_content 表示以后也没什么需要翻出来看的价值。别为了省事把有效内容一律塞进 skipped，拿不准的话就简单记一句短笔记。
+要是出现 coverage_review，说明上次整理漏掉了里面的几条来源：这次只需要把这几条分别记进笔记、归入事件或者写进 skipped，记过的东西别重复记。"""
 
-# NEEDS 用户甲 OK. Every conversation source has a disposition (`memory_disposition`).
 DISPOSITION_PROMPT = """
-new_evidence 里的对话原话——host_event 为 message、owner-message、assistant-message、assistant-result 的来源，以及 Kin 主动发出并已送达的消息（delivery 来源中 origin 为 proactive 的）——每一条都要有去向：写进某条 memory.notes 或 memory.graph.nodes 的 evidence_ids，用 memory.event_routes 归到事件，或列进 memory.skipped。宿主逐条核对，没有去向的来源会单独再整理一次。"""
+new_evidence 里双方说过的话（host_event 为 message、owner-message、assistant-message、assistant-result 的来源，以及 Kin 自己发出去并确认送达的 proactive 消息）每一条都要有个去向：要么记进某条 memory.notes 或 memory.graph.nodes 的 evidence_ids，要么用 memory.event_routes 归进事件，或者写进 memory.skipped。宿主会逐条核对，没交代去向的后面还得重理一遍。"""
 
-# NEEDS 用户甲 OK. The marks the main session made (`memorable_marks`).
 MEMORABLE_PROMPT = """
-memorable 列出 Kin 在聊天时标记“想记住这一段”的来源和当时写下的理由（理由是 Kin 自己的话，不是用户原话，也不是事实依据）：其中每一条都写成笔记或归到事件；确实不该记时列进 memory.skipped 并给出 reason。"""
+memorable 是 Kin 聊天时随手标记“想记住这一段”的消息和她写下的理由（那句理由是 Kin 自己的感触，不当作对方原话或客观事实）：每条都写进笔记或归进事件；确实不值得留时，写进 memory.skipped 并写清 reason。"""
 
-# NEEDS 用户甲 OK. The description of the main session's `mark_memorable` tool.
-MARK_TOOL_DESCRIPTION = ("标记“想记住这一段”。evidence_ids 填这段对话的来源编号（src_ 或 mem_ 开头，或当前输入的 input_id），"
-                         "一次最多 8 个；reason 用一句话写为什么想记住。宿主只登记标记、不写记忆：之后后台整理这些来源时，"
-                         "会为每一条写下笔记或归入事件，确实不该记的会写明原因。每 6 小时最多标记 8 条来源，标记 48 小时后失效；"
-                         "已经整理完、不会再被整理的来源标记不上。只在真心想记住时用，不必每轮都标。")
+MARK_TOOL_DESCRIPTION = ("想把哪段聊记在心里时用。evidence_ids 填这段对话的来源编号（src_ 或 mem_ 开头，或当前输入的 input_id），"
+                         "一次最多 8 个；reason 一句话说清为啥想记住。这里只是做个记号，后面后台整理时会帮你写进笔记或归到事件里。"
+                         "每 6 小时最多标 8 条，48 小时内有效，已经整理完的旧消息不能再标。真想记住时再用就行。")
 
 
 class MemorySkip(Model):

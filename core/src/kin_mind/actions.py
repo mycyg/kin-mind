@@ -23,6 +23,21 @@ class ActionEvents:
         # A shared concern has one clock edge, regardless of which recipient checks first.
         parts = [self.mind.scope.key(), kind, key]
         identifier = "action_" + digest(parts if shared else recipient.key(parts))[:32]
+        payload = {**data, "recipient_person_id": recipient.current()}
+        existing = conn.execute("SELECT state,data FROM mind_action_events WHERE id=?", (identifier,)).fetchone()
+        if existing and existing["state"] == "needs-review":
+            old_data = json.loads(existing["data"] or "{}")
+            job_id = old_data.get("job_id")
+            jobs = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_appraisals'").fetchone()
+            job = conn.execute("SELECT state FROM mind_appraisals WHERE id=?", (job_id,)).fetchone() if jobs and job_id else None
+            if (job_id and not job) or (job and job[0] == "needs-repair") or (not job_id):
+                old_comparable = {k: v for k, v in old_data.items() if k not in {"job_id", "source_id"}}
+                if old_comparable != payload or (job_id and not job):
+                    conn.execute(
+                        "UPDATE mind_action_events SET state='pending',created_at=?,data=? WHERE id=?",
+                        (self.mind.clock(), dumps(payload), identifier),
+                    )
+                    return identifier
         conn.execute(
             "INSERT OR IGNORE INTO mind_action_events VALUES(?,?,?,?,?,?)",
             (
@@ -31,7 +46,7 @@ class ActionEvents:
                 kind,
                 self.mind.clock(),
                 "pending",
-                dumps({**data,"recipient_person_id":recipient.current()}),
+                dumps(payload),
             ),
         )
         return identifier

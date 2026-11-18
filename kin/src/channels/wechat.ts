@@ -5,6 +5,10 @@
  * send whose answer was lost, so this transport has no `check`; and it sends a file only when the owner named it.
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { promisify } from 'node:util'
 import { mkdirSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { call, hash, imageType, keep, outcome, preview, sent, Store, type State } from './store.js'
@@ -141,13 +145,30 @@ export class WeChat implements Transport {
     const prior = this.store.value.sent[id]
     if (prior && (prior.state === 'accepted' || (prior.state === 'unknown' && !retryUnknown))) return sent(prior)
     const at = Date.now()
-    const fail = (reason: string) => this.store.settle(id, { chat: to.chat, at, state: 'failed', reason })
+    const fail = (reason: string) => (retryUnknown && prior?.state === 'unknown'
+      ? this.store.settle(id, { ...prior, reason })
+      : this.store.settle(id, { chat: to.chat, at, state: 'failed', reason }))
     if ('file' in part && (part.kind === 'file' || part.kind === 'video') && !part.named) return fail('微信上只发主人点名要的文件')
     const context = this.store.value.contexts[to.chat]
     if (!context) return fail('对方还没在微信上找过她：微信不让她先开口')
     let item: Item
+    let preview = false
     try {
-      item = 'text' in part ? { type: TEXT, text_item: { text: part.text } } : await this.upload(to, part)
+      if ('text' in part) item = { type: TEXT, text_item: { text: part.text } }
+      else {
+        const bytes = readFileSync(part.file)
+        try {
+          preview = prior?.state === 'unknown' && prior.preview === true
+          item = await this.upload(to, part, preview ? await smallPreview(part.file) : bytes)
+        }
+        catch (error) {
+          if (!(error instanceof CdnUploadInterrupted) || part.kind !== 'image' || part.original || prior?.state === 'unknown' || process.platform !== 'darwin') throw error
+          const smaller = await smallPreview(part.file)
+          if (smaller.length >= bytes.length) throw error
+          item = await this.upload(to, part, smaller)
+          preview = true
+        }
+      }
     } catch (error) {
       return fail((error as Error).message)
     }
@@ -156,13 +177,13 @@ export class WeChat implements Transport {
       client_id: 'kin-' + hash(id).slice(0, 32), message_type: BOT, message_state: 2, context_token: context, item_list: [item],
     }
     // On disk before the platform can see it: a stop half way leaves it unknown, never unsent.
-    this.store.settle(id, { chat: to.chat, at, state: 'unknown', reason: 'sending' })
+    this.store.settle(id, { chat: to.chat, at, state: 'unknown', reason: 'sending', ...(preview ? { preview: true } : {}) })
     const answer = await call(this.url('ilink/bot/sendmessage'), {
       method: 'POST', headers: this.headers(), body: JSON.stringify({ msg, base_info: BASE_INFO }),
     }, 15_000)
     // Accepted only with the server's message id: a bare `ret: 0` proves nothing (legacy delivery-receipts.mjs).
     return this.store.settle(id, {
-      chat: to.chat, at,
+      chat: to.chat, at, ...(preview ? { preview: true } : {}),
       ...outcome(answer,
         (body) => {
           const code = [body.ret, body.errcode].find((value) => Number.isInteger(value) && value !== 0)
@@ -220,7 +241,7 @@ export class WeChat implements Transport {
         // A long poll nobody answered is an empty one.
         if ((error as Error).name === 'TimeoutError') continue
         failures++
-        this.current = { state: 'connecting', reason: (error as Error).message }
+        this.current = { state: failures >= 5 ? 'failed' : 'connecting', reason: (error as Error).message }
         await this.pause(failures >= 3 ? 30_000 : 2_000)
       }
     }
@@ -277,8 +298,7 @@ export class WeChat implements Transport {
   }
 
   /** Puts a file on the WeChat CDN, encrypted with a key of its own, and describes it for a message. Voice goes as a file, as it always did. */
-  private async upload(to: Address, part: Exclude<Part, { text: string }>): Promise<Item> {
-    const bytes = readFileSync(part.file)
+  private async upload(to: Address, part: Exclude<Part, { text: string }>, bytes: Buffer): Promise<Item> {
     const key = randomBytes(16)
     const filekey = randomBytes(16).toString('hex')
     const image = part.kind === 'image'
@@ -294,7 +314,10 @@ export class WeChat implements Transport {
       method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: encrypted, signal: AbortSignal.timeout(60_000),
     })
     const param = response.headers.get('x-encrypted-param')
-    if (!response.ok || !param) throw new Error(`微信媒体上传失败：${response.status}`)
+    const code = response.headers.get('x-error-code')
+    if (response.status === 500 && code === '-5104001') throw new CdnUploadInterrupted('微信媒体上传失败：500（' + code + '）')
+    if (!response.ok) throw new Error(`微信媒体上传失败：${response.status}${code ? '（' + code + '）' : ''}`)
+    if (!param) throw new Error('微信媒体上传缺少回执')
     // The key goes as base64 of its hex, the form the receiving side reads.
     const media = { encrypt_query_param: param, aes_key: Buffer.from(key.toString('hex')).toString('base64'), encrypt_type: 1 }
     return image
@@ -349,6 +372,22 @@ export class WeChat implements Transport {
   private cdn() {
     return this.account.cdnBaseUrl.replace(/\/$/, '')
   }
+}
+
+class CdnUploadInterrupted extends Error {}
+
+/** Only after the CDN refused the original upload. The original stays available for explicit full-size delivery. */
+async function smallPreview(file: string) {
+  const dir = await mkdtemp(join(tmpdir(), 'kin-wechat-preview-'))
+  const out = join(dir, 'preview.jpg')
+  try {
+    for (const edge of [960, 640, 400, 256]) {
+      await promisify(execFile)('/usr/bin/sips', ['-Z', String(edge), '-s', 'format', 'jpeg', '-s', 'formatOptions', '52', file, '--out', out], { timeout: 15000 })
+      const bytes = await readFile(out)
+      if (bytes.length <= 24 * 1024 || edge === 256) return bytes
+    }
+    throw new Error('微信图片预览转换失败')
+  } finally { await rm(dir, { recursive: true, force: true }) }
 }
 
 const BASE_INFO = { channel_version: '1.0.2' }

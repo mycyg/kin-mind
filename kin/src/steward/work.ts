@@ -26,8 +26,8 @@ import type {} from '@deepseek-ai/dsh-experimental-agent-team'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
-import { existsSync, statSync } from 'node:fs'
-import { isAbsolute, relative, resolve } from 'node:path'
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, resolve, sep } from 'node:path'
 import type { Host } from '../index.js'
 import { PROVIDER } from '../models.js'
 import { WORKER_PRESET, textOf } from './helpers.js'
@@ -217,10 +217,11 @@ export function work(host: Host, permit: Permit) {
     quiet.delete(item.id)
     briefed.delete(item.id)
     const ending = lastTurn(session)
+    const teamFailed = item.team && roster(item).some((member) => member.status === 'failed') && !ending?.said.trim()
     Object.assign(item, {
       // A stopped team's lead may have ended its own last turn well before the stop.
-      state: stopping.delete(item.id) ? 'stopped' : ENDINGS[ending?.reason.kind ?? ''] ?? 'failed', ended: new Date().toISOString(),
-      result: ending?.said.slice(0, 2000) || undefined, owed: { memory: ending?.reason.kind ?? 'unknown', word: true },
+      state: stopping.delete(item.id) ? 'stopped' : teamFailed ? 'failed' : ENDINGS[ending?.reason.kind ?? ''] ?? 'failed', ended: new Date().toISOString(),
+      result: ending?.said.slice(0, 2000) || undefined, owed: { memory: teamFailed ? 'failed' : ending?.reason.kind ?? 'unknown', word: true },
     })
     save()
     void conclude(item)
@@ -306,8 +307,10 @@ export function work(host: Host, permit: Permit) {
       if (!isAbsolute(folder) || !existsSync(folder) || !statSync(folder).isDirectory()) {
         throw new Error(`没有「${folder}」这个文件夹。问清楚主人要在哪个文件夹做（绝对路径）再交出去。`)
       }
-      if (!relative(host.config.dataDir, resolve(folder)).startsWith('..')) {
-        throw new Error('这是你自己的数据目录，不是干活的地方。问清楚主人要在哪个文件夹做。')
+      const realData = realpathSync(host.config.dataDir)
+      const realFolder = realpathSync(resolve(folder))
+      if (realFolder === realData || realFolder.startsWith(realData + sep) || realData.startsWith(realFolder + sep)) {
+        throw new Error('这是你自己的数据目录（或包含了它），不是干活的地方。问清楚小光要在哪个文件夹做。')
       }
       // A lead needs DSH's team tools. With the owner's own Agent Teams on, every session has them; otherwise her
       // crew preset carries them, when this DSH could load it.

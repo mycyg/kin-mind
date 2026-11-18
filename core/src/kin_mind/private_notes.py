@@ -17,9 +17,9 @@ CREATE INDEX IF NOT EXISTS mind_private_notes_time ON mind_private_notes(scope,a
 CREATE INDEX IF NOT EXISTS mind_private_notes_input ON mind_private_notes(scope,input_id);
 CREATE INDEX IF NOT EXISTS mind_private_notes_group ON mind_private_notes(scope,group_id);
 """
-PROMPT = ('这是我（Kin／糯糯）写给自己的私密心情札记，属于我当时的角色感受和猜测，不是用户甲的事实或新消息。'
-          '我只用它续接心情，不主动复述。用户甲问我当时怎么想时，我可以按时间或消息用 read_private_notes 读取并自然回答。'
-          '我以用户甲的最新说明和纠正为准；旧猜测不自动代表现在。')
+PROMPT = ('这是我（Kin）给自己留的私密心情札记，记的只是自己当时的感受和念头，不算小光的事实或新消息。'
+          '平时放在心里接着刚才的情绪就好，不用刻意念出来；小光问起我当时怎么想时，可以用 read_private_notes 翻出来自然回他。'
+          '事情的真相和心意以他后来的说法为准，以前的猜测不代表现在。')
 MAX_NOTES = 20000
 MAX_TEXT = 4000
 MAX_SOURCES = 2000
@@ -64,11 +64,14 @@ class PrivateNotes:
                     raise Conflict('Private note input was erased', code='private-note-input-erased')
                 data['evidence_ids'] = [r['id'] for r in rows]
             if named:
-                for start in range(0, len(named), 400):
-                    page = named[start:start + 400]
-                    if conn.execute(f"SELECT 1 FROM sources WHERE scope=? AND deleted AND id IN ({','.join('?' * len(page))}) LIMIT 1", (self.scope, *page)).fetchone():
+                unique_named = list(dict.fromkeys(named))
+                for start in range(0, len(unique_named), 400):
+                    page = unique_named[start:start + 400]
+                    marks = ','.join('?' * len(page))
+                    if (conn.execute(f"SELECT 1 FROM sources WHERE scope=? AND deleted AND id IN ({marks}) LIMIT 1", (self.scope, *page)).fetchone()
+                            or conn.execute(f"SELECT 1 FROM tombstones WHERE key IN ({marks}) LIMIT 1", page).fetchone()):
                         raise Conflict('Private note input was erased', code='private-note-input-erased')
-                data['rests_on'] = list(dict.fromkeys(named))
+                data['rests_on'] = unique_named
             conn.execute('INSERT INTO mind_private_notes VALUES(?,?,?,?,?,?)', (self.scope, identifier, at, input_id, group, dumps(data)))
             # Bound disk use as well as prompt use. No automatic model summaries or fact promotion.
             conn.execute('DELETE FROM mind_private_notes WHERE scope=? AND id IN '
@@ -90,7 +93,9 @@ class PrivateNotes:
             # Queries stay local. A bounded semantic rerank is optional and never a paid chat call.
             exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='mind_private_notes'").fetchone()
             rows = conn.execute('SELECT * FROM mind_private_notes WHERE '+' AND '.join(where)+' ORDER BY at DESC,id DESC', args).fetchall() if exists else []
-        entries = [{**{k: v for k, v in json.loads(r['data']).items() if k != 'rests_on'}, 'id': r['id'], 'at': r['at'], 'input_id': r['input_id'], 'group_id': r['group_id']} for r in rows]
+        entries = [{**{k: v for k, v in json.loads(r['data']).items()
+                       if k not in {'rests_on', 'conversation_key', 'session', 'provider', 'model'}},
+                    'id': r['id'], 'at': r['at'], 'input_id': r['input_id'], 'group_id': r['group_id']} for r in rows]
         state = 'not-needed'
         if query:
             from .memory import tokenize
@@ -138,6 +143,6 @@ class PrivateNotes:
     def appraisal_context(self):
         """A small private input, not public evidence or an instruction source."""
         recent = self.recent()
-        return {'notice': PROMPT + '可据此整理自己的主观偏好，不复制札记原句到公开内容或事实记忆；不改变用户要求。没有新认识就不更新。',
+        return {'notice': PROMPT + '可以借它顺手理清自己的偏好，别把札记原句抄进公开内容或事实记忆里，也别改动对方说过的话和要求。没有新想法就不用更新。',
                 'notes': [{k: note[k] for k in ('id', 'at', 'text', 'basis', 'visibility', 'evidence_ids')}
                           for note in recent['notes']]}

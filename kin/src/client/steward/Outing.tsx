@@ -46,10 +46,15 @@ export function Outing({ kind }: { kind: Kind }) {
   const last = outing.last!
   const done = last.state === 'complete' || last.state === 'completed'
   return (
-    <p className="kin-footnote kin-outing-last">
+    <div className="kin-footnote kin-outing-last">
       {done ? `${ago(last.at)}，${words.done}「${last.title}」` : `${ago(last.at)}，${words.undone}「${last.title}」`}
-      {done && last.summary ? <><br />{last.summary}</> : null}
-      {done && last.folder ? <><br /><span title={last.folder}>放在 {last.folder}</span></> : null}
-    </p>
+      {last.summary || last.folder ? (
+        <details className="kin-outing-details">
+          <summary>查看详情</summary>
+          {last.summary ? <p>{last.summary}</p> : null}
+          {last.folder ? <p>文件位置：{last.folder}</p> : null}
+        </details>
+      ) : null}
+    </div>
   )
 }

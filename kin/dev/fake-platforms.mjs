@@ -106,6 +106,10 @@ export async function fakeWeChat() {
       return response.end(state.cdn.get(url.searchParams.get('encrypted_query_param')))
     }
     if (path === '/cdn/upload') {
+      if (state.refuseAbove && raw.length > state.refuseAbove) {
+        response.writeHead(500, { 'x-error-code': '-5104001' })
+        return response.end()
+      }
       const param = 'dl-up-' + state.cdn.size
       state.cdn.set(param, raw)
       response.writeHead(200, { 'x-encrypted-param': param })

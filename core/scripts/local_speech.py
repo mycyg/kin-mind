@@ -50,14 +50,16 @@ def main():
                 if reference_mode:
                     # The selected synthetic recording anchors identity. Base ICL
                     # has no instruct control: expression follows text/punctuation.
-                    if reference is None:
+                    ref_path = Path(request["referenceAudio"])
+                    ref_key = (str(ref_path), ref_path.stat().st_mtime_ns, model.sample_rate)
+                    if reference is None or reference[0] != ref_key:
                         data = subprocess.check_output([
-                            ffmpeg, "-nostdin", "-v", "error", "-i", request["referenceAudio"],
+                            ffmpeg, "-nostdin", "-v", "error", "-i", str(ref_path),
                             "-f", "f32le", "-ac", "1", "-ar", str(model.sample_rate), "pipe:1"],
-                            stderr=subprocess.DEVNULL)
-                        reference = mx.array(np.frombuffer(data, dtype=np.float32).copy())
+                            stderr=subprocess.DEVNULL, timeout=60)
+                        reference = (ref_key, mx.array(np.frombuffer(data, dtype=np.float32).copy()))
                     results = list(model.generate(
-                        text=request["text"], ref_audio=reference, ref_text=request["referenceText"],
+                        text=request["text"], ref_audio=reference[1], ref_text=request["referenceText"],
                         lang_code="Chinese", **generation, verbose=False,
                     ))
                 else:
@@ -68,7 +70,8 @@ def main():
                     ))
                 audio = np.concatenate([np.asarray(result.audio).reshape(-1) for result in results])
                 rate = results[0].sample_rate
-                if not audio.size:
+                duration_ms = round(audio.size / rate * 1000) if rate else 0
+                if not audio.size or duration_ms <= 0:
                     raise ValueError("empty audio")
                 generation_ms = round((time.monotonic() - generation_started) * 1000)
                 file = Path(request["file"])
@@ -78,15 +81,15 @@ def main():
                 sf.write(wav, audio, rate, subtype="PCM_16")
                 subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                                 "-i", str(wav), "-c:a", "libopus", "-b:a", "32k", str(encoded)],
-                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
                 os.replace(encoded, file)
             response = {"ok": True, "cold": cold, "loadMs": load_ms, "generationMs": generation_ms,
-                        "durationMs": round(audio.size / rate * 1000),
+                        "durationMs": duration_ms,
                         "synthesis": {"mode": "reference" if reference_mode else "custom_voice",
                                       "generation": generation, "styleApplied": not reference_mode},
                         "elapsedMs": round((time.monotonic() - started) * 1000)}
-        except Exception:
-            response = {"ok": False, "stage": stage}
+        except Exception as exc:
+            response = {"ok": False, "stage": stage, "error": type(exc).__name__}
         finally:
             for file in temporary:
                 file.unlink(missing_ok=True)

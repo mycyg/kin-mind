@@ -193,6 +193,7 @@ export class Heartbeat {
       for (let round = 0; round < ROUNDS && !this.closed && !this.paused && !(round && this.replying()); round++) {
         // The minute's bookkeeping happens in this call; the answer says whether a review is waiting.
         const due = await this.mind.call<Due>('review-due', {})
+        if (due.daily) this.dailyDue = true
         if (due.action !== true) return this.quiet('review', due)
         this.note('review', { state: 'running' })
         const answer = await this.mind.run<Answer>('review', { unified_targets: await this.reviewTargets() })

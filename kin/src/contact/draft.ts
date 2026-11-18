@@ -4,11 +4,24 @@
  * Whether to send, wait or let it go is hers; nothing here makes up a topic or a phrase. A draft that fails or
  * says nothing usable is tried once more, on the chat lane's next route.
  */
-import { BlockAssembler, type RequestMessage } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, ReasoningEffortId, type RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { Host, Scope } from '../index.js'
 import { PROVIDER, type Lane, type Route } from '../models.js'
-import { renderContext } from '../render.js'
+import { renderContext, stamp } from '../render.js'
+import { PLATFORMS } from './conversations.js'
 import { OWNER } from './people.js'
+
+export interface DialogueTurn {
+  role: string; text: string; occurred_at: string; channel?: string; origin?: string
+  kind?: string; state?: string; recipient_person_id?: string; source_id: string
+}
+
+export function dialogueLine(turn: DialogueTurn, who: string) {
+  const place = PLATFORMS[turn.channel ?? ''] ?? (turn.channel === 'app' ? '桌面' : '')
+  const speaker = turn.role === 'user' ? who : turn.origin === 'contact' ? '你主动联系对方' : '你'
+  const receipt = turn.kind === 'delivery' && turn.state === 'accepted' ? '（平台已接收）' : ''
+  return `${stamp(turn.occurred_at)} ${place} ${speaker}${receipt}：${turn.text}`
+}
 
 export interface Decision {
   action: 'send' | 'wait' | 'abandon'
@@ -36,11 +49,11 @@ export interface Occasion {
 const WAIT = { min: 300, max: 259_200 }
 const NAMED = /\b(?:src|mem)_[0-9a-f]{32}\b/g
 
-const INSTRUCTIONS = `这一刻没有人在等你回话。下面是你此刻的状态、想起来的事、和对方最近说过的话，以及你心里已经准备好的联系愿望。你可以主动给对方发消息，也可以先不。
+const INSTRUCTIONS = `眼下没人在等你回话。下面有你此刻的状态、想起来的事、跟对方最近聊过的话，还有你心里放着的联系愿望。要不要主动找对方、说什么，完全由你决定。
 
-想发，就用你平时说话的样子写，像熟人发消息，可以分几条。想不想说、说什么、说多少，都由你。
-暂时不想说，可以等：到某个时间以后再想（condition 写 time，并写 retry_after_seconds），等对方先开口（owner_reply），等有了新的事（new_evidence），或者下次再想（review）。
-已经不想做这件事了，可以放下（abandon）。
+想聊，就用你平时说话的口吻写，像熟人发消息那样，想分几条发都行；也可以只是问候、撒娇或分享一个小念头。
+现在还不想开口，就先等等：定个时间过会再想（condition 写 time，并写 retry_after_seconds），等对方先开口（owner_reply），等有新动静（new_evidence），或者下次再看（review）。
+真不想做这件事了，也可以直接放下（abandon）。
 
 最后只输出一个 JSON 对象：
 {"action":"send","bubbles":["……"],"desire_ids":["你这次回应的愿望 id，不写表示全部"]}
@@ -53,11 +66,11 @@ export async function draft(host: Host, occasion: Occasion): Promise<{ decision:
   const kin = host.ctx.get('kin')!
   const topic = occasion.wishes.map((wish) => wish.topic ?? wish.content ?? '').join('\n') || occasion.group?.join('\n') || ''
   const { channel: _channel, ...scope } = occasion.scope
-  const memory = await host.mind.call('memory-context', { query: topic, purpose: 'proactive', mode: 'light', recent_dialogue: true, ...scope })
+  const memory = await host.mind.call('memory-context', { query: topic, purpose: 'proactive', mode: 'light', recent_dialogue: 'recipient', ...scope })
   // Only this conversation's own talk: what she and someone else said stays with them.
-  const recent = ((memory.recent_dialogue ?? []) as { role: string; text?: string; recipient_person_id?: string }[])
+  const recent = ((memory.recent_dialogue ?? []) as DialogueTurn[])
     .filter((turn) => (turn.recipient_person_id ?? OWNER) === occasion.scope.recipient_person_id && turn.text)
-    .slice(-12).map((turn) => `${turn.role === 'user' ? occasion.who : '你'}：${turn.text}`)
+    .slice(-12).map((turn) => dialogueLine(turn, occasion.who))
   const facts = [
     `现在是 ${new Date().toLocaleString('zh-CN', { hour12: false })}。对方是${occasion.who}。`,
     host.ctx.get('kinCalendar')?.current() ?? '',
@@ -79,9 +92,16 @@ export async function draft(host: Host, occasion: Occasion): Promise<{ decision:
   return { decision, shown: [...new Set(JSON.stringify([memory, occasion.wishes]).match(NAMED) ?? [])] }
 }
 
-async function ask(host: Host, route: { provider: string; model: string }, system: string, messages: RequestMessage[]) {
+async function ask(host: Host, route: { provider: string; model: string; effort?: string }, system: string, messages: RequestMessage[]) {
   const assembler = new BlockAssembler()
-  for await (const chunk of host.ctx.llm.stream({ ...route, system, messages })) assembler.push(chunk)
+  for await (const chunk of host.ctx.llm.stream({
+    provider: route.provider,
+    model: route.model,
+    ...(route.effort ? { reasoningEffort: ReasoningEffortId(route.effort) } : {}),
+    system,
+    messages,
+    signal: AbortSignal.timeout(host.ms?.(90_000) ?? 90_000),
+  })) assembler.push(chunk)
   const finish = assembler.finish
   if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure.message)
   return assembler.blocks().flatMap((block) => (block.type === 'text' ? [block.text] : [])).join('')

@@ -5,7 +5,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-workspace'
 import z from '@deepseek-ai/schemastery'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -168,7 +168,12 @@ export function apply(ctx: Context, config: Config) {
 
   const file = (name: string) => join(config.dataDir, name)
   const load = <T>(name: string, empty: T): T => (existsSync(file(name)) ? JSON.parse(readFileSync(file(name), 'utf8')) : empty)
-  const save = (name: string, value: unknown) => writeFileSync(file(name), JSON.stringify(value, null, 2) + '\n')
+  const save = (name: string, value: unknown) => {
+    const target = file(name)
+    const tmp = `${target}.tmp.${process.pid}`
+    writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n')
+    renameSync(tmp, target)
+  }
 
   if (!existsSync(file('persona.md'))) writeFileSync(file('persona.md'), DEFAULT_PERSONA)
   let persona = readFileSync(file('persona.md'), 'utf8')
@@ -272,7 +277,7 @@ export function apply(ctx: Context, config: Config) {
     recorded: (sessionId) => recorded[sessionId] ?? 0,
     markRecorded(sessionId, seq) {
       recorded[sessionId] = seq
-      writeFileSync(file('recorded.json'), JSON.stringify(recorded) + '\n')
+      save('recorded.json', recorded)
     },
     replying(sessionId, running) {
       if (running) replying.add(sessionId)
@@ -329,7 +334,11 @@ export function apply(ctx: Context, config: Config) {
   route('/api/kin/chat', { POST: () => conversation('app', { channel: 'app', title: '和 KIN 的聊天' }) })
 
   // Her inner world. Diary replies and sealed letters are the owner's own words, kept as such.
-  route('/api/kin/diary', { GET: () => mind.call('diary', { limit: 30 }) })
+  route('/api/kin/diary', { GET: async (request) => {
+    const cursor = Number(new URL(request.url).searchParams.get('cursor') ?? 0)
+    if (!Number.isSafeInteger(cursor) || cursor < 0) return json({ error: 'Invalid diary cursor' }, 400)
+    return mind.call('diary', { limit: 30, cursor })
+  } })
   route('/api/kin/diary/reply', {
     POST: async (request) => {
       const { reflection_id, text } = await body<{ reflection_id: string; text: string }>(request)

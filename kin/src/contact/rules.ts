@@ -72,7 +72,13 @@ export function hold(rules: Rules, activity: Activity | undefined, now = new Dat
   if (rules.waitForReply && !chime && last && last > activity.heard) return 'waiting-for-reply'
   const latest = Math.max(...(chime ? [last] : [activity.heard, activity.answered, last]).map((at) => (at ? Date.parse(at) : 0)))
   if (now.getTime() - latest < rules.minGapMinutes * 60_000) return 'just-talked'
-  if (reached.filter((at) => day(rules, new Date(at)) === day(rules, now)).length >= rules.maxPerDay) return 'enough-today'
+  if (budget(rules, activity, now).sent_today >= rules.maxPerDay) return 'enough-today'
+}
+
+/** The same per-person daily count the gate enforces, in the owner's configured timezone. */
+export function budget(rules: Rules, activity: Activity | undefined, now = new Date()) {
+  return { max_per_day: rules.maxPerDay,
+    sent_today: (activity?.reached ?? []).filter((at) => day(rules, new Date(at)) === day(rules, now)).length }
 }
 
 export function quiet(rules: Rules, at = new Date()): boolean {
@@ -89,7 +95,7 @@ export function quietEnds(rules: Rules, at = new Date()): Date {
   return new Date(end)
 }
 
-function day(rules: Rules, at: Date) {
+export function day(rules: Rules, at: Date) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: rules.timeZone }).format(at)
 }
 

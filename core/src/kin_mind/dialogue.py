@@ -123,14 +123,22 @@ def redundant_public_summaries(events):
     return redundant
 
 
-def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
+def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True, recipient=None, other_than=None):
     """Page shared history past multi-bubble output, counting each speaker/route separately."""
     with mind.engine.db.connect() as conn:
+        filters, params = [], [mind.scope.key()]
+        if recipient:
+            filters.append("json_extract(data,'$.recipient_person_id')=?")
+            params.append(recipient)
+        if other_than:
+            filters.append("json_extract(data,'$.conversation_key')<>?")
+            params.append(other_than)
         rows = []
         for page in range(16):
             chunk = conn.execute("SELECT seq,data FROM mind_runtime_events WHERE scope=? AND kind IN ('owner-message','assistant-message','delivery') "
                 + ("AND COALESCE(json_extract(data,'$.historical'),0)=0 " if not include_historical else "")
-                + "ORDER BY julianday(occurred_at) DESC,seq DESC LIMIT 128 OFFSET ?", (mind.scope.key(), page*128)).fetchall()
+                + "".join("AND " + clause + " " for clause in filters)
+                + "ORDER BY julianday(occurred_at) DESC,seq DESC LIMIT 128 OFFSET ?", (*params, page*128)).fetchall()
             rows.extend(chunk)
             items = [{**e, "role": "user" if e["kind"] == "owner-message" else "assistant"}
                      for e in (json.loads(r["data"]) for r in reversed(rows)) if e.get("text")]
@@ -140,8 +148,8 @@ def dialogue_rows(mind, *, exchanges=RECENT_EXCHANGES, include_historical=True):
         return rows
 
 
-def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
-    rows = dialogue_rows(mind, exchanges=exchanges)
+def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES, recipient=None, other_than=None):
+    rows = dialogue_rows(mind, exchanges=exchanges, recipient=recipient, other_than=other_than)
     redundant = redundant_public_summaries([json.loads(r['data']) for r in rows])
     with mind.engine.db.connect() as conn:
         prefixes = envelope_prefixes(mind.engine, conn)
@@ -160,7 +168,7 @@ def recent_dialogue(mind, *, exchanges=RECENT_EXCHANGES):
             except (Conflict, Missing, KeyError):
                 continue
             role = "user" if event["kind"] == "owner-message" else "assistant"
-            item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "state", "message_id", "input_id", "bubble_id",
+            item = {k: event[k] for k in ("id", "kind", "text", "at", "source_id", "channel", "origin", "state", "message_id", "input_id", "bubble_id",
                                           "reply_share_id", "reply_bubble_id", "activity_refs", *DIALOGUE_IDENTITY_FIELDS) if k in event}
             resolution = event.get("reply_resolution") or {}
             if resolution.get("state") == "resolved" and len(resolution.get("candidates", [])) == 1:

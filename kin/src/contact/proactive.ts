@@ -11,7 +11,7 @@ import type { Host } from '../index.js'
 import type { Deliveries, Delivery } from './deliveries.js'
 import { draft, type Decision } from './draft.js'
 import { isGroup, nameOf, OWNER, type Group, type People, type Person } from './people.js'
-import { asked, hold, quiet, type Activity, type Hold, type Rules } from './rules.js'
+import { asked, budget, day, hold, quiet, type Activity, type Hold, type Rules } from './rules.js'
 import type { Conversations } from './conversations.js'
 
 const PAUSE_MAX_MINUTES = 120
@@ -86,6 +86,9 @@ export class Reaching {
     if (coming?.length) targets[OWNER]!.calendar = '接下来两天你日程上的事（到点各有各的安排，这里只是让你想事情时心里有数）：\n' + agenda(coming)
     // Who asked her to leave them be for a while, and until when.
     for (const [id, target] of Object.entries(targets)) {
+      const known = [...people, ...groups].find((item) => item.id === id)
+      target.contact_availability = { ...budget(this.rules(), this.activity(id), now),
+        reason: known ? this.held(known, isGroup(id)) ?? null : 'proactive-off', decided_by: 'host' }
       const until = asked(this.activity(id))
       if (until) target.asked_to_wait = `对方说过先别找他，到 ${until.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })} 为止`
     }
@@ -126,6 +129,8 @@ export class Reaching {
       this.host.mind.call<T>(action, { ...args, recipient_person_id: target.id, conversation_key: place?.key ?? 'app' })
     // The rules hold what is new; a message under way or of unknown outcome is its delivery's to finish.
     const held = this.held(target)
+    // Record even a pre-draft hold: linked plans and her next review can see the real blocker.
+    await call('contact-gate', { reason: held ?? null, ...budget(this.rules(), this.activity(target.id)) })
     if (held) return { state: 'waiting', reason: held }
     const epoch = this.activity(target.id).heard ?? ''
     // Waits she set herself (a time, their reply) come round.
@@ -148,6 +153,34 @@ export class Reaching {
       return cancel('draft-failed', { failure: { category: 'model-unavailable', stage: 'contact-draft', code: 'contact-draft-failed', retry_condition: 'backoff' } })
     }
     this.note(target.id, { failures: undefined })
+    if (decision.action === 'send') {
+      const today = day(this.rules(), new Date())
+      const priors = this.deliveries.list().filter(row => row.kind === 'contact' && row.recipient === target.id
+        && (row.acceptedAt ?? row.at) > epoch
+        && day(this.rules(), new Date(row.acceptedAt ?? row.at)) === today
+        && row.sent.some(sent => sent.state === 'accepted'))
+      const acceptedTexts = new Set<string>()
+      for (const row of priors) {
+        const acceptedCount = row.sent.filter(sent => sent.state === 'accepted').length
+        for (const part of row.parts.slice(0, acceptedCount)) {
+          if ('text' in part && part.text.trim()) acceptedTexts.add(part.text.trim())
+        }
+      }
+      // Two separate wishes can produce the same opening or repeat earlier accepted bubbles before the person replies.
+      let remaining = [...decision.bubbles]
+      for (const row of priors) {
+        const acceptedCount = row.sent.filter(sent => sent.state === 'accepted').length
+        let matched = 0
+        for (const part of row.parts.slice(0, acceptedCount)) {
+          if (!('text' in part) || part.text.trim() !== remaining[matched]) break
+          matched++
+        }
+        if (matched) remaining = remaining.slice(matched)
+      }
+      remaining = remaining.filter(bubble => !acceptedTexts.has(bubble.trim()))
+      decision.bubbles = remaining
+      if (!decision.bubbles.length) decision = { ...decision, action: 'wait', condition: 'new_evidence', reason: '这些话已经发给对方了。' }
+    }
     const chosen = decision.desire_ids ? { desire_ids: decision.desire_ids } : {}
     const text = decision.bubbles.join('\n\n')
     const checked = await call('check', { attempt_id: attempt.id, owner_epoch: epoch, ...chosen, ...(text ? { text } : {}) })

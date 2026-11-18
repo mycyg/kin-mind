@@ -14,7 +14,7 @@ const kinFiles = {
   'models.json': { chat: [{ provider: 'kin-test', model: 'chat' }], task: [{ provider: 'kin-test', model: 'scripted' }] },
   'people.json': {
     people: [
-      { id: OWNER, name: '小光', proactive: true, accounts: { wechat: 'wx-owner' } },
+      { id: OWNER, name: '小光', proactive: true, accounts: { wechat: 'wx-owner', feishu: 'fs-owner' } },
       { id: 'person:ming', name: '小明', proactive: true, accounts: { wechat: 'wx-ming' } },
     ],
     groups: [{ id: 'group:family', name: '家庭群', chats: { wechat: 'family@chatroom' }, chime: false }],
@@ -83,6 +83,11 @@ if (report.error) {
 
 const unknownPart = report.mingUnknown?.id + ':0'
 const checks = {
+  'attachment refusal reaches the model as a tool error and the notice identifies the attachment': report.mediaFailure?.error === true && report.mediaFailure.notice.includes('图片未能发到微信'),
+  'another platform can find the original path and send an extensionless image as an image': report.continuedFile?.parts[0].kind === 'image',
+  'an explicit file relay uses the bound destination and observes quiet hours': report.targetedFile?.state === 'pending' && Boolean(report.targetedFile.notBefore),
+  'the next WeChat request includes the same person’s recent Feishu task': report.otherChannelContext?.includes('飞书') && report.otherChannelContext.includes('synthetic continue on Feishu')
+    && report.otherChannelContext.includes('飞书 你主动联系对方（平台已接收）：Synthetic morning greeting.'),
   'buffered late overflow recovers before any delivery and sends the regenerated answer exactly once': report.partialFailure?.calls === 2
     && report.partialFailure.summaries === 1 && report.partialFailure.compactions === 1 && report.partialFailure.attempts === 1
     && report.partialFailure.delivery?.sent.filter(s => s.state === 'accepted').length === 1

@@ -196,7 +196,7 @@ export function renderContext(answer: Answer, dimensions: Record<string, Dimensi
   const affect = items.find((item) => item.id === 'affect')
   const mood = affect?.text ? JSON.parse(affect.text) as Affect : undefined
   const feeling = [
-    answer.moment?.replaceAll('用户甲', name('person:person_a')) || (mood ? renderAffect(mood, dimensions) : ''),
+    answer.moment?.replaceAll('用户甲', name('person:person_a')).replaceAll('小光', name('person:person_a')) || (mood ? renderAffect(mood, dimensions) : ''),
     ...standing(items, mood),
   ].filter(Boolean).join('\n')
   const sections = feeling && feeling !== shown ? [feeling] : []
@@ -210,7 +210,7 @@ export function renderContext(answer: Answer, dimensions: Record<string, Dimensi
   if (answer.omitted_ids?.length) {
     sections.push(`（相关的${sections.length ? '还' : ''}有 ${answer.omitted_ids.length} 条没读到，${sections.length ? '这里不是全部' : '这次一条也没放进来'}；需要时用 kin_recall 说得更具体些再找。）`)
   }
-  const text = sections.length ? '（以下是你此刻的内在状态和想起来的事，只给你自己参考，不要照着念出来。）\n' + sections.join('\n') : ''
+  const text = sections.length ? '（下面这些是你眼下的状态和想起来的事，自己心里有数就好，不必照着念出来。）\n' + sections.join('\n') : ''
   const rests = [...new Set(items.filter((item) => item.id !== 'affect').flatMap((item) => [
     item.id ?? '', ...(item.source_ids ?? []), ...(item.record_ids ?? []),
     ...[item.facts, ...(item.evidence ?? [])].flatMap((facts) => (facts?.sources ?? []).flatMap((source) => source.source_id ?? [])),

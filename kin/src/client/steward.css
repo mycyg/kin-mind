@@ -60,3 +60,8 @@
 }
 .kin-choice[aria-checked="true"] .kin-choice-dot { background: radial-gradient(circle, #fff 0 3.5px, transparent 4px), var(--kin-me); box-shadow: 0 2px 6px rgb(40 20 50 / .2); }
 .kin-choice:focus-visible { outline: 2px solid var(--kin-rose); outline-offset: 2px; border-radius: 12px; }
+
+/* Technical reports stay available without taking over the wishes page. */
+.kin-outing-details { margin-top: .5rem; }
+.kin-outing-details summary { cursor: pointer; }
+.kin-outing-details p { white-space: pre-wrap; overflow-wrap: anywhere; }

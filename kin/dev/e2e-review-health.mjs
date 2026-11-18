@@ -39,6 +39,11 @@ const reaching = new Reaching({ ctx: { get: () => undefined }, mind, conversatio
 const beat = new Heartbeat(mind, () => false, () => {}, 1, () => reaching.reviewTargets())
 try {
   await assert.rejects(realMind.call('companion-targets', { routes: {} }), /not-a-resident-action/)
+  await realMind.call('contact-gate', { recipient_person_id: FRIEND, conversation_key: 'friend', reason: 'enough-today', max_per_day: 3, sent_today: 3 })
+  const friendGate = await realMind.run('companion-host-call', { person_id: FRIEND, conversation_key: 'friend', action: 'read', request: { projection: 'interaction' } })
+  assert.equal(friendGate.state.contact.host_gate.reason, 'enough-today')
+  assert.equal((await realMind.call('read', { projection: 'interaction' })).state.contact.host_gate, undefined)
+  console.log('✓ real resident host scopes daily-limit receipts to their recipient without blocking the owner')
   await beat.start()
   for (let i = 0; i < 1000 && !reviewArgs && beat.beats.review?.state !== 'failed'; i++) await new Promise((r) => setTimeout(r, 10))
   assert.notEqual(beat.beats.review?.state, 'failed', beat.beats.review?.reason)

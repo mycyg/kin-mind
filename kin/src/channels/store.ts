@@ -60,7 +60,7 @@ export class Store<T extends State> {
   }
 }
 
-export const sent = ({ state, platformId, reason }: Receipt): Sent => ({ state, ...(platformId ? { platformId } : {}), ...(reason ? { reason } : {}) })
+export const sent = ({ state, platformId, reason, preview }: Receipt): Sent => ({ state, ...(preview ? { preview } : {}), ...(platformId ? { platformId } : {}), ...(reason ? { reason } : {}) })
 
 /** A received attachment, saved privately under her data dir. */
 export function keep(dir: string, name: string, bytes: Uint8Array) {

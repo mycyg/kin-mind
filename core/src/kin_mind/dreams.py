@@ -52,14 +52,14 @@ TITLE = "Kin 的梦"
 # The prefix every stored dream starts with: whatever shows its raw text says what it is.
 DREAM_PREFIX = "Kin 的梦（想象出来的，不是发生过的事）：\n"
 # The section's paragraph, appended only to a request that offers it.
-DREAM_PROMPT = ("dream 在休息或逐渐放松时的空闲、节奏评估里可选：今晚要不要做梦由你决定，不必每晚都有，也可以留空。"
-                "想做时，只从 dream_material 里取材料（最近 48 小时的经历、记忆和日记片段），写 text：80 到 220 个字，"
-                "第一人称、现在时，像刚醒时还记得的那一段；可以不合逻辑、场景跳转、人和事错位。"
-                "不给建议，不解释象征，不写成日记或总结。梦中事件不是发生过的事，不能当作现实事实或特征的证据。"
-                "可以记得自己梦过什么，也可以留下醒后的主观感受。")
+DREAM_PROMPT = ("dream 在休息或慢下来的空闲、节奏评估里可选：今晚做不做梦、梦到什么随你心意，不强求每晚都有。"
+                "想写梦时，只从 dream_material（最近 48 小时的经历、记忆和日记片段）里取材，写进 text：80 到 220 字，用第一人称现在时，"
+                "像刚醒过来脑海里还留着的画面，逻辑乱一点、场景人物串在一起也没关系。"
+                "不用讲道理、分析象征，也别写成日记总结。梦终究是想象，不当作真的发生过的事或性格证据；"
+                "你可以记得自己做过这个梦，也可以留下刚醒时的感受。")
 # Said once beside the latest dream, which the next idle reviews are shown.
-RECENT_DREAMS_PROMPT = ("\nrecent_dreams 是你最近做的梦，是想象，不是发生过的事，也不能作为任何证据。"
-                        "可以只放在心里；想讲给用户甲听时，照常提出 contact 愿望，带上对应 activity_ref，选想讲的片段和感受。梦不会自己发出去。")
+RECENT_DREAMS_PROMPT = ("\nrecent_dreams 是你最近做的梦，只是想象，不是发生过的事，也不能当成事实依据。"
+                        "可以自己偷偷留在心里；想讲给小光听，就提一个 contact 愿望、带上对应的 activity_ref，挑想分享的片段和感受说就好。")
 
 
 def night_start(at):

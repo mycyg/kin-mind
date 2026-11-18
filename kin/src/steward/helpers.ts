@@ -68,7 +68,7 @@ export function helpers(host: Host, permit: Permit): Helpers {
   })
 
   return async ({ label, prompt, cwd, timeoutMs, signal, outputSchema, onStarted }) => {
-    const conversation = await host.conversation('own', { channel: 'own', title: 'KIN 自己的事：出门和创作' })
+    const conversation = await host.conversation('own-helper', { channel: 'own', title: 'KIN 自己的事：出门和创作' })
     own = conversation.sessionId
     const resolved = await ctx.get('sessionController')!.resolveAgent(own as SessionId)
     if (!('agent' in resolved)) throw new Error('her own conversation is not available: ' + resolved.error.code)

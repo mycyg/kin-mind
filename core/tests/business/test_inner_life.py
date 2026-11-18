@@ -547,3 +547,18 @@ def test_as_production_runs_the_fork_is_asked_for_a_dream_strictly_and_shown_tod
     assert not leaks(context)
     (stored,) = dreams_of(mind)
     assert mind.engine.source(stored["id"], content=True).read_text() == dreams.DREAM_PREFIX + DREAM
+
+
+def test_diary_pages_report_total_and_reach_entries_beyond_first_thirty(env):
+    mind, memory, source, entry, clock = env
+    ids = []
+    for i in range(65):
+        clock[0] += timedelta(seconds=1)
+        ids.append(entry('page-' + str(i), 'Synthetic diary entry ' + str(i)))
+    first = diary.read(mind, limit=30)
+    second = diary.read(mind, limit=30, cursor=first['cursor'])
+    third = diary.read(mind, limit=30, cursor=second['cursor'])
+    assert [page['total'] for page in (first, second, third)] == [65, 65, 65]
+    assert [len(page['entries']) for page in (first, second, third)] == [30, 30, 5]
+    assert [e['source_id'] for page in (first, second, third) for e in page['entries']] == ids[::-1]
+    assert third['cursor'] is None

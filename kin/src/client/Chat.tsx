@@ -198,6 +198,13 @@ export function createChat(ctx: Context) {
       // While she is busy, what is said reaches her at her next step instead of waiting for the whole turn.
       const mode = running ? 'steer' : 'queue'
       const session: ISession = binding.session
+      let restored = false
+      const restore = () => {
+        if (restored) return
+        restored = true
+        setDrafts((now) => [...going, ...now])
+        refused?.()
+      }
       const handle = session.beginSubmission({
         mode, text,
         attachments: going.map((draft) => draft.kind === 'image'
@@ -206,19 +213,21 @@ export function createChat(ctx: Context) {
         // Turned down (her model cannot take pictures, say) or dropped before she read it: back into the box, not lost.
         onRetire: (end) => {
           if (end.reason !== 'failed') return
-          setDrafts((now) => [...going, ...now])
-          refused?.()
+          restore()
         },
       })
       void (async () => {
+        let stage: 'read' | 'send' = 'read'
         try {
           const parts = await Promise.all(going.map(async (draft): Promise<PromptContentPart> => draft.kind === 'image'
             ? { type: 'image', mediaType: draft.file.type as ImageMediaType, data: await base64Of(draft.file), name: draft.file.name || undefined }
             : { type: 'file', receiptId: draft.staged!.receiptId }))
-          void session.prompt([...parts, ...(text ? [{ type: 'text' as const, text }] : [])], mode, undefined, handle.requestId)
+          stage = 'send'
+          await session.prompt([...parts, ...(text ? [{ type: 'text' as const, text }] : [])], mode, undefined, handle.requestId)
         } catch {
           handle.abandon()
-          setNotice('图片读不出来了，重新选一下吧')
+          restore()
+          setNotice(stage === 'read' ? '图片读不出来了，重新选一下吧' : '消息没发出去，再试一次吧')
         }
       })()
       return true

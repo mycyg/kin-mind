@@ -40,7 +40,7 @@ class SessionAdvice(Model):
 
 
 SESSION_ADVICE_PROMPT = """
-存在 session_context 时提交 session_advice。根据当前观测选择 keep/recall/compact/prepare/rotate/defer；缺事实可 recall，窗口压力可 compact。prepare/rotate 引用 lastCompaction.id 与其后的退化 evidenceIds。findings 记录具体用户反馈的 sourceId、原文 quote 和解释。reason 是判断依据，recheckCondition 是下次复核条件。
+带着 session_context 时顺便交一份 session_advice，看看对话窗口怎么处理合适：选择 keep / recall / compact / prepare / rotate / defer。事实不够用就 recall，快装不下就 compact；如果要 prepare 或 rotate，带上 lastCompaction.id 和那之后退化的 evidenceIds。findings 用来记用户的具体反馈，写上 sourceId、逐字原文 quote 和说明；reason 写为什么这么判断，recheckCondition 写什么时候再看一遍。
 """
 
 
@@ -52,10 +52,8 @@ class AdviceRejected(ValueError):
         self.code = code
 
 
-ADVICE_REPAIR_PROMPT = """你在修正一条被宿主拒绝的 session_advice。problem 是宿主的静态校验结论，不是用户消息。
-只引用 allowed_evidence 里的 id；prepare 或 rotate 必须引用 last_compaction.id，并至少引用一条 at 晚于 completedAt、未标记 needsReview 或 resolved 的观测。
-findings 的 sourceId 必须是用户原话的来源，quote 必须与原文逐字一致；无法保证时删除该条 finding。
-依据不足时改为 keep、recall、compact 或 defer，不要编造观测编号。只调用工具提交修正后的建议，不输出推理过程。"""
+ADVICE_REPAIR_PROMPT = """修正这条没通过校验的 session_advice（problem 是宿主给出的失败原因，不当作用户新消息）：
+只能引用 allowed_evidence 里的编号；选 prepare 或 rotate 时需要带上 last_compaction.id，外加至少一条晚于 completedAt、状态正常的新观测。findings 的 sourceId 必须是用户原话来源，quote 得跟原文一字不差，对不上就删掉那条。根据不够就退回 keep、recall、compact 或 defer，别现编观测编号，直接调工具提交结果。"""
 
 
 def with_dialogue(context, dialogue):

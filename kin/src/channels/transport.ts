@@ -35,7 +35,7 @@ export interface Inbound extends Address {
  * One piece of what she sends. A long message may go out as several. `named`: the owner asked for this
  * very file; WeChat sends a `file` or `video` part only when so (who asked is decided by the caller).
  */
-export type Part = { text: string } | { file: string; kind: 'image' | 'voice' | 'video' | 'file'; named?: boolean }
+export type Part = { text: string } | { file: string; kind: 'image' | 'voice' | 'video' | 'file'; named?: boolean; original?: boolean }
 
 /**
  * What became of a send. `unknown` (the request may or may not have landed) is never resent under a new id:
@@ -44,6 +44,7 @@ export type Part = { text: string } | { file: string; kind: 'image' | 'voice' | 
 export interface Sent {
   state: 'accepted' | 'unknown' | 'failed'
   platformId?: string
+  preview?: true
   reason?: string
 }
 

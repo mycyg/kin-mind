@@ -59,10 +59,10 @@ ANNIVERSARIES_SHOWN, TOPIC_CHARS = 3, 40
 ZONE = "Asia/Singapore"
 ERASED = "[已删除]"
 # NEEDS 用户甲 OK: what a request whose facts carry anniversaries is told about them.
-ANNIVERSARY_PROMPT = ("\nautonomy_context.initiative_facts.anniversaries_today 是今天正好满一周、一百天、一个月、三个月、半年或整年的共同时刻"
-                      "（milestone 写满了多久，例如 1-week、100-days、1-month、3-months、6-months、2-years）：moment_id 是那天用户甲说的话，"
-                      "date 是那一天，topic 是你当时给这件事起的标题。它们和其他 initiative_facts 一样只是日期上的事实，不是提醒、任务或联系的理由；"
-                      "要不要提、什么时候提、怎么提，由你结合眼下的心情和最近的聊天决定，不提也完全可以。需要细节时可以用只读记忆工具读 moment_id。")
+ANNIVERSARY_PROMPT = ("\nautonomy_context.initiative_facts.anniversaries_today 是今天刚好满一周、一百天、一个月、三个月、半年或整年的共同时刻"
+                      "（milestone 写满了多久，比如 1-week、100-days、1-month、3-months、6-months、2-years）：moment_id 是那天小光说过的话，"
+                      "date 是那一天，topic 是当时给这件事起的标题。这只是今天日子上的巧合，不算闹钟、任务或非发不可的理由；"
+                      "要不要提、什么时候怎么提，全看你此刻的心情和最近的聊天，不提也很自然。想看细节用只读记忆工具去翻 moment_id 就好。")
 
 
 def _hours(now, value):

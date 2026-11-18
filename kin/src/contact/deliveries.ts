@@ -61,6 +61,7 @@ const MINUTE = 60_000
 /** A file part in words: what it is. */
 export const PART_WORDS = { image: '图片', voice: '语音', video: '视频', file: '文件' }
 const TRIES = 3
+const PERMANENT_FAILURE = /ENOENT|no such file|微信上只发|还没在微信上找过|不支持/
 const KEEP_MS = 7 * 24 * 60 * MINUTE
 const FILE = 'deliveries.json'
 
@@ -188,7 +189,7 @@ export class Deliveries {
         .catch((error: Error) => ({ state: 'unknown', reason: error.message }))
       if (sent.state === 'failed') {
         if (delivery.withdrawn) return this.close(delivery)
-        delivery.tries = (delivery.tries ?? 0) + 1
+        delivery.tries = sent.reason && PERMANENT_FAILURE.test(sent.reason) ? TRIES : (delivery.tries ?? 0) + 1
         delivery.reason = sent.reason
         if (delivery.tries < TRIES) return this.save(), delivery
         return this.finish(delivery, delivery.sent.length ? 'needs-review' : 'cancelled')

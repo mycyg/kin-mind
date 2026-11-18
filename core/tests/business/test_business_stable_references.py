@@ -70,3 +70,21 @@ def test_graph_retry_uses_its_command_id_and_actual_receipt(system):
     with mind.engine.db.connect() as conn:
         assert conn.execute("SELECT digest FROM mind_graph_commands WHERE id=?", (request["command_id"],)).fetchone()[0] == ""
         assert json.loads(conn.execute("SELECT data FROM mind_graph_nodes WHERE id=?", (value["id"],)).fetchone()[0])["title"] == "Corrected title"
+
+
+@pytest.mark.parametrize("description", ["An old experience still describes the blue lamp.", ""])
+def test_event_without_record_links_keeps_its_saved_experience(system, description):
+    mind, memory, _, _ = system
+    memory.configure({"event_lifecycle": True})
+    with mind.engine.db.connect(write=True) as conn:
+        value = memory.graph._put(conn, {"id": "experience-without-links", "kind": "event",
+            "title": "The remembered blue lamp", "text": description, "basis": "inferred"})
+    life = EventLifecycle(mind)
+    apply = life.prepare_digest(value["id"], provider=object())
+    with mind.engine.db.connect(write=True) as conn:
+        apply(conn)
+    result = life.read(value["id"])
+    assert result["state"] == "ready"
+    assert result["data"]["narrative"][0] == {
+        "text": description or "The remembered blue lamp", "record_ids": [], "basis": "inferred"}
+    assert result["data"]["model_receipt"]["model_requests"] == 0

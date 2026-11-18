@@ -131,7 +131,7 @@ def ensure_started(root, endpoint, model):
             def alive():
                 try:
                     response = client.get(url)
-                except httpx.ConnectError:
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
                     return False
                 if response.status_code == 401:
                     # The service reads the credential file on every request, so a refusal
@@ -170,6 +170,12 @@ def ensure_started(root, endpoint, model):
                 if alive():
                     return auth
                 time.sleep(0.1)
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
             raise LocalEmbeddingUnavailable("Local embedding service did not become ready within 30 s")
 
 

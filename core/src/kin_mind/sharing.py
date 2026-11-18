@@ -69,7 +69,7 @@ def activity_share_history(conn, scope, activity):
         units += [r[0] for r in conn.execute(
             "SELECT id FROM mind_graph_nodes WHERE scope=? AND kind='finding' AND state='active' AND json_extract(data,'$.owner_id')=?",
             (scope, activity["id"]))]
-    rows = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient='owner' AND state='accepted' "
+    rows = conn.execute("SELECT data FROM mind_share_coverage WHERE scope=? AND recipient IN ('owner','person:person_a') AND state='accepted' "
         "AND unit_id IN (" + ",".join("?" for _ in units) + ") ORDER BY at DESC,bubble_id", (scope, *units))
     messages = []
     for row in rows:
@@ -199,7 +199,7 @@ class ShareLedger:
             states = [c["state"] for c in children]
             state = "shared" if states and all(s == "shared" for s in states) else "partial" if "shared" in states or "partial" in states else "unconfirmed" if "unconfirmed" in states else "unshared"
             return {"id": identifier, "state": state, "units": children, "total": len(children), "shared": states.count("shared"), "visibility": "unverified"}
-        recipients=[recipient,"owner"] if recipient=="person:person_a" else [recipient]
+        recipients = ["person:person_a", "owner"] if recipient in ("owner", "person:person_a") else [recipient]
         args = (self.scope.key(), *recipients, identifier, unit.get("content_version", 1))
         where = "scope=? AND recipient IN ("+",".join("?" for _ in recipients)+") AND unit_id=? AND version=?"
         total = conn.execute(f"SELECT COUNT(*) FROM mind_share_coverage WHERE {where}", args).fetchone()[0]
@@ -535,7 +535,7 @@ class ShareLedger:
 
     def cancel(self, draft_id):
         with self.engine.db.connect(write=True) as conn:
-            for row in conn.execute("SELECT unit_id,version,draft_id,state,data FROM mind_share_reservations WHERE scope=?", (self.scope.key(),)).fetchall():
+            for row in conn.execute("SELECT recipient,unit_id,version,draft_id,state,data FROM mind_share_reservations WHERE scope=?", (self.scope.key(),)).fetchall():
                 data = json.loads(row["data"])
                 if draft_id not in {row["draft_id"], *data.get("draft_ids", [])}:
                     continue
@@ -544,7 +544,7 @@ class ShareLedger:
                     if states.get(identifier, row["state"] if identifier == row["draft_id"] else "prepared") == "prepared":
                         states[identifier] = "canceled"
                 state = self._aggregate_states(list(states.values()))
-                conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND unit_id=? AND version=?", (state, dumps(data), self.scope.key(), row["unit_id"], row["version"]))
+                conn.execute("UPDATE mind_share_reservations SET state=?,data=? WHERE scope=? AND recipient=? AND unit_id=? AND version=?", (state, dumps(data), self.scope.key(), row["recipient"], row["unit_id"], row["version"]))
         return {"state": "canceled", "draft_id": draft_id}
 
     def decorate(self, node):

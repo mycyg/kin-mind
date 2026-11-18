@@ -49,13 +49,16 @@ export function apply(ctx: Context) {
 
   ctx.tools.register(defineTool({
     name: 'kin_send_file',
-    description: '把本机的一个文件或图片发到这段微信 / 飞书对话里。微信上文件和视频只发主人点名要的，图片照发。',
+    description: '把本机上的图片或文件发给对方。默认发到你现在这段对话里，也可以填收件人或指定渠道（微信、飞书）。微信上只有对方点名要时才发普通文件和视频，图片正常发。',
     parameters: {
-      path: { type: 'string', required: true, description: '文件的完整路径' },
-      asked: { type: 'boolean', description: '对方在这段对话里点名要的就是这个文件' },
+      path: { type: 'string', required: true, description: '本机文件的完整路径' },
+      to: { type: 'string', description: '发给哪个人或群；不填就发到当前对话' },
+      via: { type: 'string', description: '指定走微信还是飞书；跨渠道发送时填写' },
+      original: { type: 'boolean', description: '对方要原图或不能压缩时填 true；否则微信拒收原图时会改发清晰的缩小预览，并告诉你实际发送了哪个版本' },
+      asked: { type: 'boolean', description: '是不是对方在这段对话里点名要的这个文件' },
     },
     output: answer,
-    execute: (args, exec) => contact.send(exec.agent?.session.id ?? '', exec.callId, args.path, args.asked === true),
+    execute: (args, exec) => contact.send(exec.agent?.session.id ?? '', exec.callId, args.path, args.asked === true, args.to, args.via, args.original),
   }))
 
   // When a voice message fits, after the old host's reply presentation (core/adapters/reply-presentation.mjs).
@@ -85,7 +88,7 @@ export function apply(ctx: Context) {
 
   ctx.tools.register(defineTool({
     name: 'kin_conversations',
-    description: '看看你在别处的对话：不填 who 就列出都有哪些（谁、在哪、最近什么时候说过话）；填一个人或群的名字，就看那边最近谁说了什么。'
+    description: '看看你在别处的对话：不填 who 就列出都有哪些（谁、在哪、最近什么时候说过话）；填一个人或群的名字，就看那边最近谁说了什么、发过哪些文件及其路径和状态。'
       + '看到了不等于要转述：说不说、说多少由你判断，别人请你别外传的话替对方守着。',
     parameters: {
       who: { type: 'string', description: '人或群的名字' },

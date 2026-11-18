@@ -155,6 +155,17 @@ CI 首轮发现 contact 合成场景先等主人联系，再确认朋友的未�
 - 仍有配置边界：32K 上下文同时预留 16K 输出与 16K 压缩空间时，压缩会被拒绝；需降低输出上限或更换聊天模型。没有为了测试放宽该保护。
 
 
+## Contact, diary and model compatibility repairs (2026-11-10)
+
+- New contact/diary assertions fail on the original source and pass with the changes. Contact limits are observed before drafting through the real TypeScript Mind / Python resident-host boundary, remain recipient-specific, survive restart, and clear without completing or re-deciding a plan. Timezone day rollover and zero allowance are covered.
+- Diary Core tests reach all 65 synthetic entries over three pages. The HTTP route passes through its cursor and rejects invalid offsets. A real browser covers loading, errors, total count, pagination, retry without losing loaded entries, repeated clicks, Back/reopen, and collapsed/expanded outing details.
+- `kin/dev/check-world.mjs` is the optional rendered-browser regression. Point `KIN_TEST_REACT_MODULES`, `KIN_TEST_PLAYWRIGHT_MODULE` and `KIN_TEST_BROWSER` at installed test dependencies. `KIN_TEST_SOURCE_ROOT` can select an original source export for the negative check. Artifacts stay under `.dev/world-ui`.
+- Model regressions exercise the real DSH adapters over HTTP/SSE: schema projection, paired call/result identifiers, missing-thinking fallback, genuine native signatures, malformed/incomplete results, attachments and durable-history immutability. The original implementation fails the applicable assertions. Gemini's full 67-tool declaration and synthetic real-provider tool/result/next-turn exchanges passed; the tests use no private conversations and execute no business tools.
+- Core full run: 1417 passed / 1 skipped with one environment-only SOCKS dependency failure; the affected 12-test service API file passed after removing the injected SOCKS variables for that local-only test process. Coverage is 1418 passed / 1 skipped. After the final recipient-dispatch fix, 20 affected Core tests and the resident-host integration passed again.
+- The first sandboxed integrations could not complete local model callbacks. With local process access, the unchanged assertions passed: ten suites, 124 checks. Node adapter checks (10), type checking, production build and the three targeted scripts passed. No production proxy settings were changed.
+- Actual delivery to a person and arbitrary future provider behavior are not claimed by the synthetic transport and model checks. Existing memory, persona, contact settings and model selections are preserved by deployment; no historical messages are replayed for verification.
+
+
 ## 2026-11-11 continuity and concurrent review repair
 
 - Nine synthetic regression cases fail against the original source and pass against the repair: one shared timer event across recipient orderings; stale operational proposals rejected and freshly judged in both semantic modes; cross-recipient retries; and a context-assembly revision race. Related Core coverage passes 66 tests.

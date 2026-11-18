@@ -26,6 +26,7 @@ export type Lane = (typeof LANES)[number]
 const NAMES: Record<Lane, string> = { chat: 'KIN 聊天', task: 'KIN 做事' }
 const FIRST_CHUNK_MS = 60_000
 const CHAT_FIRST_CHUNK_MS = 60_000
+const IDLE_CHUNK_MS = 120_000
 const LONG_INPUT_TOKENS = 128_000
 const COOL_MS = 5 * 60_000
 
@@ -192,8 +193,8 @@ export class KinModel extends LlmAdapter {
       const normalPatience = lane === 'chat' && index < order.length - 1 ? CHAT_FIRST_CHUNK_MS : FIRST_CHUNK_MS
       const patience = route.longInputWaitMs && requestEstimate() >= LONG_INPUT_TOKENS
         ? Math.max(normalPatience, Math.min(300_000, route.longInputWaitMs)) : normalPatience
-      let firstTokenTimedOut = false
-      let timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
+      let timedOut: 'first' | 'idle' | undefined
+      let timer = setTimeout(() => { timedOut = 'first'; stop() }, patience)
       const held: StreamChunk[] = []
       let answering = false
       let acceptedEmpty = false
@@ -210,7 +211,10 @@ export class KinModel extends LlmAdapter {
           if (((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && Boolean(chunk.text))
             || (chunk.type === 'tool-call-delta' && Boolean(chunk.argumentsDelta))
             || (chunk.type === 'block-end' && (chunk.block.type === 'tool-call'
-              || ((chunk.block.type === 'text' || chunk.block.type === 'reasoning') && Boolean(chunk.block.text))))) clearTimeout(timer)
+              || ((chunk.block.type === 'text' || chunk.block.type === 'reasoning') && Boolean(chunk.block.text))))) {
+            clearTimeout(timer)
+            timer = setTimeout(() => { timedOut = 'idle'; stop() }, IDLE_CHUNK_MS)
+          }
           yield chunk
         }
       }
@@ -220,12 +224,13 @@ export class KinModel extends LlmAdapter {
         const source = (feedback?: string) => {
           if (feedback) {
             clearTimeout(timer)
-            timer = setTimeout(() => { firstTokenTimedOut = true; stop() }, patience)
+            timedOut = undefined
+            timer = setTimeout(() => { timedOut = 'first'; stop() }, patience)
           }
-          return observe(this.ctx.llm.stream(modelRequest({
+          return modelOutput(observe(this.ctx.llm.stream(modelRequest({
             ...options, messages: feedback ? [...messages, { role: 'user', content: [{ type: 'text', text: feedback }] }] : messages, maxTokens, provider: route.provider, model: route.model, signal: attempt.signal,
             reasoningEffort: effort ? ReasoningEffortId(effort) : undefined,
-          }, route)))
+          }, route))))
         }
         const output = target ? replyWithCorrection(source, {
           rejected: reason => { failed.push({ route, reason: 'INVALID_REPLY_ENVELOPE: ' + reason }) },
@@ -234,11 +239,12 @@ export class KinModel extends LlmAdapter {
             const { channel: _channel, ...scope } = this.ctx.kin.scopeOf(target.sessionId)
             const saved = await this.ctx.kin.mind.call<{ state: string }>('private-note-save', {
               id: target.id, group_id: target.id, ...(target.inputId ? { input_id: target.inputId } : {}),
+              ...(target.sourceIds?.length ? { source_ids: target.sourceIds } : {}),
               text: note, reply_text: reply, session: target.sessionId, provider: route.provider, model: route.model, ...scope,
             })
             if (saved.state !== 'saved') throw new Error('note not saved')
           },
-        }) : modelOutput(source())
+        }) : source()
         for await (const chunk of output) {
           if (chunk.type === 'finish') {
             finished = true
@@ -266,7 +272,6 @@ export class KinModel extends LlmAdapter {
               continue
             }
             answering = true
-            clearTimeout(timer)
             yield* held
           }
           yield rememberRoute(chunk, route)
@@ -300,7 +305,8 @@ export class KinModel extends LlmAdapter {
         this.last[lane] = { at: new Date().toISOString(), answered: route, failed: [...failed, ...resting] }
         return
       }
-      const reason = firstTokenTimedOut ? `${patience / 1000} 秒未收到首个 token（含思考）` : describe(failure)
+      const reason = timedOut === 'first' ? `${patience / 1000} 秒未收到首个 token（含思考）`
+        : timedOut === 'idle' ? '120 秒未收到后续输出' : describe(failure)
       this.cooling.set(key(route), { until: Date.now() + COOL_MS, reason })
       failed.push({ route, reason })
     }

@@ -46,7 +46,7 @@ export interface Wish {
   topic?: string; content?: string; strength?: number; expired?: boolean
 }
 export interface Concern { id: string; status?: string; kind?: string; content?: string; topic?: string; intensity?: number }
-export interface Plan { id: string; title?: string; goal?: string; status: string; updated_at?: string; steps?: { id: string; goal: string; state: string; not_before?: string | null }[] }
+export interface Plan { id: string; title?: string; goal?: string; status: string; updated_at?: string; steps?: { id: string; goal: string; state: string; not_before?: string | null; execution?: { host_gate?: { state: string; reason: string | null; max_per_day: number; sent_today: number } | null } }[] }
 
 export interface Home {
   overview: { affect_layers?: { feeling?: string; undertone?: { text?: string } } }
@@ -84,7 +84,56 @@ export interface DiaryEntry {
   source_id: string; at: string; topic?: string | null; text: string
   replies: { source_id: string; at: string; text: string }[]
 }
-export interface Diary { entries: DiaryEntry[]; replies: 'enabled' | 'disabled' }
+export interface Diary { entries: DiaryEntry[]; replies: 'enabled' | 'disabled'; cursor: number | null; total: number }
+/** Diary pages stay visible on a later failure. A request owns the cursor until it settles. */
+export function useDiary() {
+  const [data, setData] = useState<Diary>()
+  const [error, setError] = useState<string>()
+  const [loading, setLoading] = useState(false)
+  const current = useRef<Diary>()
+  const pages = useRef(1)
+  const busy = useRef(false)
+  const generation = useRef(0)
+  const read = useCallback(async (more = false) => {
+    if (busy.current || (more && current.current?.cursor == null)) return
+    busy.current = true
+    setLoading(true)
+    const version = ++generation.current
+    try {
+      let next: Diary
+      if (more) {
+        const page = await api<Diary>('api/kin/diary?cursor=' + current.current!.cursor)
+        const entries = new Map(current.current!.entries.map((entry) => [entry.source_id, entry]))
+        for (const entry of page.entries) entries.set(entry.source_id, entry)
+        next = { ...page, entries: [...entries.values()] }
+      } else {
+        next = await api<Diary>('api/kin/diary')
+        for (let i = 1; i < pages.current && next.cursor != null; i++) {
+          const page = await api<Diary>('api/kin/diary?cursor=' + next.cursor)
+          const entries = new Map(next.entries.map((entry) => [entry.source_id, entry]))
+          for (const entry of page.entries) entries.set(entry.source_id, entry)
+          next = { ...page, entries: [...entries.values()] }
+        }
+      }
+      if (version !== generation.current) return
+      if (more) pages.current++
+      current.current = next
+      setData(next)
+      setError(undefined)
+    } catch (reason) {
+      if (version === generation.current) setError((reason as Error).message)
+    } finally {
+      if (version === generation.current) { busy.current = false; setLoading(false) }
+    }
+  }, [])
+  useEffect(() => {
+    busy.current = false
+    void read()
+    return () => { generation.current++; busy.current = false }
+  }, [read])
+  return { data, error, loading, reload: () => { void read() }, more: () => { void read(true) } }
+}
+
 export interface Dreams { generation_enabled: boolean; dreams: { source_id: string; at: string; text: string }[] }
 export interface Letter {
   id: string; kind: 'letter' | 'diary'; state: 'sealed' | 'opened'

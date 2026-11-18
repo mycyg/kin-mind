@@ -146,15 +146,18 @@ def project_prompt(name, fallback, root):
     store = PromptStore(Path(root) / 'prompts')
     target = store.document(name)
     default = store.root / '.defaults' / target.relative_to(store.root)
-    default.parent.mkdir(parents=True, exist_ok=True)
-    prior = json.loads(default.read_text()) if default.exists() else None
-    if not prior or prior['text'] != fallback:
-        previous = [t for t in (prior or {}).get('previous_texts', []) if t != (prior or {}).get('text')]
-        temporary = default.with_name(default.name + '.' + uuid.uuid4().hex + '.tmp')
-        temporary.write_text(json.dumps({'name': name, 'version': 1, 'source': 'default', 'text': fallback,
-                                        'previous_texts': [*previous, *([prior['text']] if prior else [])][-MAX_PREVIOUS_TEXTS:],
-                                        'updated_at': datetime.now(timezone.utc).isoformat()}, ensure_ascii=False))
-        os.replace(temporary, default)
+    store.root.mkdir(parents=True, exist_ok=True)
+    with open(store.root / '.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        default.parent.mkdir(parents=True, exist_ok=True)
+        prior = json.loads(default.read_text()) if default.exists() else None
+        if not prior or prior['text'] != fallback:
+            previous = [t for t in (prior or {}).get('previous_texts', []) if t != (prior or {}).get('text')]
+            temporary = default.with_name(default.name + '.' + uuid.uuid4().hex + '.tmp')
+            temporary.write_text(json.dumps({'name': name, 'version': 1, 'source': 'default', 'text': fallback,
+                                            'previous_texts': [*previous, *([prior['text']] if prior else [])][-MAX_PREVIOUS_TEXTS:],
+                                            'updated_at': datetime.now(timezone.utc).isoformat()}, ensure_ascii=False))
+            os.replace(temporary, default)
     return store.read(name)['text']
 
 

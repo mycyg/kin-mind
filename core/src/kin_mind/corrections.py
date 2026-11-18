@@ -21,12 +21,17 @@ def correct(mind, memory_id, correction, evidence_id):
     command = "correction:" + digest([memory_id, correction, evidence_id])[:32]
     with engine.db.connect() as conn:
         # What told her it was wrong is evidence she has: a source of hers, current.
-        if not mind._fresh(conn, mind._evidence(conn, [evidence_id])):
+        refs = mind._evidence(conn, [evidence_id])
+        if not mind._fresh(conn, refs):
             raise ValueError("evidence_id is not a current source")
     if memory_id.startswith("mem_"):
         record = engine.get(memory_id)
         revised = engine.revise(memory_id, RevisionInput(expected_revision=record["revision"], command_id=command,
                                 action="correct", content=record["content"] + line, reason="更正"))
+        with engine.db.connect(write=True) as conn:
+            for ref in refs:
+                if ref["record_id"] != memory_id:
+                    conn.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)", (memory_id, ref["record_id"]))
         return {"state": "corrected", "memory_id": memory_id, "revision": revised["revision"]}
     from .graph import EventGraph
     graph = EventGraph(mind)

@@ -36,11 +36,11 @@ export function exploring(host: Host, run: Helpers): Outing {
 
   host.heartbeat.every('exploration', async () => {
     if (!existsSync(wake)) return
-    rmSync(wake, { force: true })
     rmSync(stopFile, { force: true })
     const begun = Date.now()
     // Nothing ready to explore after all (a wake can outlive the question it was for): an idle minute.
     const context = await host.mind.run('prepare-exploration')
+    rmSync(wake, { force: true })
     if (context.state !== 'ready') return
     current = { title: context.desire?.topic || context.brief, since: new Date().toISOString() }
     host.heartbeat.note('exploration', { state: 'running' })

@@ -85,7 +85,12 @@ export async function selfCheck({ mind }: Host): Promise<Finding[]> {
   if (expired) found.push({ key: 'executions', level: 'warn', title: `${expired} 个计划步骤过了期限还标着在跑`, todo: RESTART_TODO + '，启动时会收拾好' })
   try {
     // A process of its own, as her reviews, diary and dreams run: if this one cannot start, neither can they.
-    const lifecycle = await mind.run<{ digests: Record<string, number>; digest_failures?: Record<string, number> }>('lifecycle-status')
+    const lifecycle = await mind.run<{
+      digests: Record<string, number>
+      digest_failures?: Record<string, number>
+      last_temperature_run?: { state?: string; slot?: string } | null
+      failed_jobs_24h?: Record<string, number>
+    }>('lifecycle-status')
     const failed = lifecycle.digests.failed ?? 0
     const missing = lifecycle.digest_failures?.missing_evidence ?? 0
     const exhausted = lifecycle.digest_failures?.exhausted ?? 0
@@ -95,6 +100,21 @@ export async function selfCheck({ mind }: Host): Promise<Finding[]> {
       todo: '查看摘要任务的具体错误，排除原因后再重试' })
     if (failed > missing + exhausted) found.push({ key: 'digests', level: 'warn', title: `${failed - missing - exhausted} 段经历的摘要没写成`,
       todo: '尚在自动重试范围内；持续失败时查看摘要任务的具体错误和模型路线' })
+    if (lifecycle.last_temperature_run?.state === 'failed') {
+      found.push({
+        key: 'lifecycle-temperature', level: 'warn', title: '记忆热度更新失败',
+        detail: lifecycle.last_temperature_run.slot ? `最近一次（${lifecycle.last_temperature_run.slot}）未完成` : undefined,
+        todo: '查看 Core 日志和记忆库热度任务',
+      })
+    }
+    const failedJobs = Object.entries(lifecycle.failed_jobs_24h ?? {}).filter(([, count]) => count > 0)
+    if (failedJobs.length) {
+      found.push({
+        key: 'lifecycle-jobs', level: 'warn', title: '最近一天有后台记忆任务失败',
+        detail: failedJobs.map(([kind, count]) => `${kind} ×${count}`).join('、'),
+        todo: '查看 DSH 日志与记忆队列状态',
+      })
+    }
   } catch (error) {
     found.push({
       key: 'mind-run', level: 'error', title: '她的后台进程起不来', detail: (error as Error).message,
@@ -179,6 +199,7 @@ function models(model: KinModel): Finding[] {
   return LANES.flatMap((lane): Finding[] => {
     const last = model.last[lane]
     if (!last?.failed.length) return []
+    if (last.answered && last.failed.every((miss) => miss.route.provider === last.answered!.provider && miss.route.model === last.answered!.model)) return []
     const name = lane === 'chat' ? '聊天线' : '做事线'
     const misses = last.failed.map((miss) => `${say(miss.route)}：${miss.reason}`).join('；')
     if (!last.answered) return [{ key: 'model:' + lane, level: 'error', title: `${name}接不上模型`, detail: misses, todo: ROUTE_TODO }]

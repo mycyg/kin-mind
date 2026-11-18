@@ -27,6 +27,7 @@ class FakeWechat {
   async send(to, part, id) {
     if (part.text === 'Synthetic accepted paragraph.') await new Promise(resolve => setTimeout(resolve, 200))
     this.sent.push({ chat: to.chat, text: part.text ?? '', file: part.file, kind: part.kind, named: part.named, id, at: new Date().toISOString() })
+    if (part.file?.endsWith('media-without-extension') && to.chat === 'wx-owner') return { state: 'failed', reason: '微信媒体上传失败：500' }
     if (part.text === this.unknownText) return { state: 'unknown', reason: 'timeout' }
     return { state: 'accepted', platformId: 'wx-' + this.sent.length }
   }
@@ -66,6 +67,16 @@ class Chat extends LlmAdapter {
     // What was said last: the newest words of a person, not her recall block, her own told words or DSH's runtime notes.
     const answered = texts.at(-1)?.role === 'tool'
     const said = texts.findLast((m) => m.role === 'user' && !/^(（|这条消息的来源编号|Current runtime context|Time sampled)/.test(m.text))?.text ?? ''
+    if (!answered && said === 'synthetic attachment request') return yield* call('kin_send_file', { path: this.media })
+    if (!answered && said === 'synthetic continue on Feishu') return yield* call('kin_conversations', { who: '小光' })
+    if (answered && said === 'synthetic continue on Feishu') {
+      const path = /图片 (.+media-without-extension)（发送失败）/.exec(texts.at(-1).text)?.[1]
+      if (path) return yield* call('kin_send_file', { path })
+    }
+    if (!answered && said === 'synthetic send to Feishu') {
+      this.crossContext = texts.filter(m => m.role === 'user').map(m => m.text).join('\n')
+      return yield* call('kin_send_file', { path: this.media, via: '飞书' })
+    }
     if (said.includes('synthetic partial failure')) {
       this.partialCalls = (this.partialCalls ?? 0) + 1
       if (this.partialCalls > 1) return yield* words(replyEnvelope('Synthetic regenerated reply.'))
@@ -134,6 +145,8 @@ export function apply(ctx, config) {
     },
   }), 'kin log for the e2e harness')
   const wechat = new FakeWechat()
+  const feishu = new FakeWechat()
+  feishu.id = 'feishu'
   const listeners = new Set()
   // Her voice and her meme library: a speech worker that writes a short Ogg file, and one sticker of a cat.
   const spoken = []
@@ -141,7 +154,7 @@ export function apply(ctx, config) {
   mkdirSync(dirname(sticker), { recursive: true })
   writeFileSync(sticker, Buffer.from(PNG, 'base64'))
   const fake = {
-    get: (id) => (id === 'wechat' ? wechat : undefined),
+    get: (id) => (id === 'wechat' ? wechat : id === 'feishu' ? feishu : undefined),
     onInbound: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
     async speak(text, id, style) {
       const file = join(config.dataDir, 'voice', id.replace(/[^\w-]/g, '_') + '.ogg')
@@ -282,6 +295,26 @@ async function run(ctx, config, { wechat, chat, arrive, spoken }) {
     ended: partialEvents.filter(e => e.type === 'turn/end').map(e => e.data.reason.kind),
     compactions: partialEvents.filter(e => e.type === 'compaction/start').length,
     attempts: partialEvents.filter(e => e.type === 'assistant/attempt').length }
+  // A file-tool failure on one platform must still leave the original usable on the other.
+  chat.media = join(config.dataDir, 'media-without-extension')
+  writeFileSync(chat.media, Buffer.from(PNG, 'base64'))
+  arrive({ chat: 'wx-owner', sender: 'wx-owner', text: 'synthetic attachment request' })
+  const failed = await until(() => deliveries().find(d => d.parts[0]?.file === chat.media && d.state === 'cancelled'), 30000)
+  const notice = await until(() => deliveries().find(d => d.kind === 'notice' && d.id.endsWith(failed.id) && d.state === 'accepted'), 30000)
+  const tool = ownerAgent.session.snapshotEvents().find(e => e.type === 'tool/result' && e.data.message.content.some(b => b.text?.includes('微信媒体上传失败')))
+  report.mediaFailure = { error: tool?.data.message.isError, notice: notice.parts[0].text }
+
+  arrive({ transport: 'feishu', chat: 'fs-owner', sender: 'fs-owner', text: 'synthetic continue on Feishu' })
+  report.continuedFile = await until(() => deliveries().find(d => d.key === 'feishu:fs-owner' && d.parts[0]?.file === chat.media && d.state === 'accepted'), 30000)
+  // Quiet hours are still active: an explicit cross-platform relay uses its target and waits there.
+  await ctx.kin.mind.call('runtime-event', {
+    id: 'synthetic-feishu-receipt', kind: 'delivery', state: 'accepted', origin: 'contact',
+    channel: 'feishu', recipient_person_id: 'person:person_a', conversation_key: 'feishu:fs-owner',
+    message_id: 'synthetic-morning', at: new Date().toISOString(), text: 'Synthetic morning greeting.',
+  })
+  arrive({ chat: 'wx-owner', sender: 'wx-owner', text: 'synthetic send to Feishu' })
+  report.targetedFile = await until(() => deliveries().find(d => d.kind === 'relay' && d.key === 'feishu:fs-owner' && d.parts[0]?.file === chat.media), 30000)
+  report.otherChannelContext = chat.crossContext
   report.sessions = sessions()
   return report
 }

@@ -7,13 +7,21 @@ import { rmSync } from 'node:fs'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const output = root + '/kin/.regression'
 await build({
-  entryPoints: [root + '/kin/src/models.ts', root + '/kin/src/render.ts', root + '/kin/src/model-output.ts'],
+  entryPoints: [
+    root + '/kin/src/models.ts',
+    root + '/kin/src/render.ts',
+    root + '/kin/src/model-output.ts',
+    root + '/kin/src/model-budget.ts',
+    root + '/kin/src/health/checks.ts',
+  ],
   outdir: output, format: 'esm', platform: 'node', bundle: true, packages: 'external',
 })
 try {
   const { KinModel, probe } = await import(output + '/models.js')
   const { renderContext } = await import(output + '/render.js')
   const { modelOutput, answerText } = await import(output + '/model-output.js')
+  const { requestThreshold } = await import(output + '/model-budget.js')
+  const { watch } = await import(output + '/health/checks.js')
   const expected = '你好呀\n\n今天过得怎么样？'
   const envelopes = [
     '🧠\nPrivate test reasoning.\n🪒' + expected,
@@ -110,7 +118,48 @@ try {
   const shown = renderContext({ moment, rendered_text: '' }, {}, id => id === 'person:person_a' ? '主人' : id)
   assert.match(shown.text, /很想念主人/)
   assert.equal(renderContext({ moment }, {}, () => '主人', { shown: shown.feeling }).text, '')
-  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated')
+
+  // Small-window request threshold remains usable (>= 50%) while preserving large-window reserve behavior.
+  assert.equal(requestThreshold(128_000, 128_000), 76_800)
+  assert.equal(requestThreshold(200_000, 128_000), 120_000)
+  assert.ok(requestThreshold(648_000, 128_000) > 400_000)
+
+  // Health watch suppresses false route-fallback warnings when failed and answered resolved to the same provider/model.
+  const sameRouteFindings = await watch({
+    mind: { call: async () => ({}), memoryWorker: { pid: process.pid, ends: [] }, modelFile: '' },
+    heartbeat: { frozen: true, beats: {}, rounds: new Map() },
+    model: {
+      last: {
+        chat: {
+          answered: { provider: 'p1', model: 'm1', effort: 'high' },
+          failed: [{ route: { provider: 'p1', model: 'm1', effort: 'low' }, reason: 'retry' }],
+        },
+        task: undefined,
+      },
+    },
+    config: { dataDir: output },
+    ctx: { get: () => undefined },
+  })
+  assert.equal(sameRouteFindings.some(f => f.key === 'model:chat'), false)
+
+  const fallbackFindings = await watch({
+    mind: { call: async () => ({}), memoryWorker: { pid: process.pid, ends: [] }, modelFile: '' },
+    heartbeat: { frozen: true, beats: {}, rounds: new Map() },
+    model: {
+      last: {
+        chat: {
+          answered: { provider: 'p2', model: 'm2', effort: 'high' },
+          failed: [{ route: { provider: 'p1', model: 'm1', effort: 'high' }, reason: 'timeout' }],
+        },
+        task: undefined,
+      },
+    },
+    config: { dataDir: output },
+    ctx: { get: () => undefined },
+  })
+  assert.equal(fallbackFindings.find(f => f.key === 'model:chat')?.level, 'warn')
+
+  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated; budget thresholds & health route checks verified')
 } finally {
   rmSync(output, { recursive: true, force: true })
 }

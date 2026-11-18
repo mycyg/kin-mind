@@ -214,27 +214,38 @@ class ConversationHabits:
                         raise Conflict("Reply choice already recorded for this input")
                 return current
             if request["action"] == "defer":
+                from . import recipient
+                from .companions import known, person_a
                 from .state import DesireChange, contact_wait_seconds, timestamp
+                target_person = recipient.current()
+                if target_person == person_a:
+                    src_row = conn.execute("SELECT data FROM sources WHERE id=? AND deleted=0", (row[0],)).fetchone()
+                    if src_row:
+                        src_meta = (json.loads(src_row[0]) or {}).get("metadata") or {}
+                        candidate_person = src_meta.get("recipient_person_id") or src_meta.get("speaker_person_id")
+                        if candidate_person and known(candidate_person):
+                            target_person = candidate_person
                 seconds = contact_wait_seconds(request.get("retry_after_seconds", 1800))
                 state = self.mind._load(conn)
                 eid = "mind_" + digest([self.scope.key(), "reply-deferred", request["input_id"]])[:32]
                 common = {"agent_version": state["agent_version"], "expected_revision": state["revision"],
                           "evidence_ids": [row[0]], "reason": reason}
-                made = self.mind._apply_desire(conn, state, DesireChange(
-                    **common, command_id=eid, action="create", kind="contact", strength=50,
-                    topic="稍后接回对话", content="重新看这条输入及后续对话，再决定怎样接回。" + reason,
-                    completion="结合后续对话回复；已回答或话题已结束时放下，不重复发送。",
-                    expires_at=(timestamp(self.mind.clock()) + timedelta(seconds=seconds, days=3)).isoformat()), eid)
-                self.mind._apply_desire(conn, state, DesireChange(
-                    **common, command_id=eid + ":wait", action="wait", desire_id=made["desire_id"],
-                    wait_condition="time", retry_after_seconds=seconds), eid)
-                # Its own conversation takes it up when the time comes (the host's talk lane), never a contact attempt.
-                state["desires"][made["desire_id"]]["held_reply"] = request["input_id"]
-                state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
-                self.mind._save(conn, state)
-                value.update(desire_id=made["desire_id"], retry_after_seconds=seconds,
-                             retry_at=state["desires"][made["desire_id"]]["contact_wait"]["retry_at"])
-                self.mind._history(conn, eid, state, "reply-deferred", value)
+                with recipient.target_scope(self.mind, target_person):
+                    made = self.mind._apply_desire(conn, state, DesireChange(
+                        **common, command_id=eid, action="create", kind="contact", strength=50,
+                        topic="稍后接回对话", content="重新看这条输入及后续对话，再决定怎样接回。" + reason,
+                        completion="结合后续对话回复；已回答或话题已结束时放下，不重复发送。",
+                        expires_at=(timestamp(self.mind.clock()) + timedelta(seconds=seconds, days=3)).isoformat()), eid)
+                    self.mind._apply_desire(conn, state, DesireChange(
+                        **common, command_id=eid + ":wait", action="wait", desire_id=made["desire_id"],
+                        wait_condition="time", retry_after_seconds=seconds), eid)
+                    # Its own conversation takes it up when the time comes (the host's talk lane), never a contact attempt.
+                    state["desires"][made["desire_id"]]["held_reply"] = request["input_id"]
+                    state.update(revision=state["revision"] + 1, updated_at=self.mind.clock())
+                    self.mind._save(conn, state)
+                    value.update(desire_id=made["desire_id"], retry_after_seconds=seconds,
+                                 retry_at=state["desires"][made["desire_id"]]["contact_wait"]["retry_at"])
+                    self.mind._history(conn, eid, state, "reply-deferred", value)
             conn.execute("INSERT INTO mind_reply_choices VALUES(?,?,?)", (self.scope.key(), request["input_id"], dumps(value)))
             return value
 

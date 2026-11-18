@@ -37,9 +37,9 @@ REPLY_LIMIT = 2000
 EXCERPT = 400
 
 # --- Model-facing wording (NEEDS 用户甲 OK) ----------------------------------------------------------
-REPLY_PROMPT = ("\ndiary_replies 列出这次新证据里用户甲对你日记的回复：reply_id 是用户甲的回复（就在 new_evidence 里，是用户甲本人的话），"
-                "diary 是这条回复所回的那一篇（你当时自己的想法，可以用它的 source_id 引用）；diary 为 null 表示那篇日记已经删掉了。"
-                "用户甲回了你的日记，这是一次真实的新互动，照常评估；用户甲的回复是用户甲的原话，日记仍然只是你当时的想法。")
+REPLY_PROMPT = ("\ndiary_replies 里是小光刚给你日记写的回复：reply_id 对应小光在 new_evidence 里的那句原话，"
+                "diary 是他回的那篇日记（你当时自己的想法，需要时可以用它的 source_id 引用；为 null 说明那篇已经删了）。"
+                "小光回你日记算一次真实互动，照常去想怎么回应就好；他回的是他的原话，日记本身依然只是你当时的念头。")
 
 
 def _thought(text):
@@ -74,6 +74,8 @@ def read(mind, *, cursor=0, limit=20):
         rows = conn.execute("SELECT id,occurred_at,data FROM sources WHERE namespace=? AND scope=? AND deleted=0 "
                             "ORDER BY occurred_at DESC,id DESC LIMIT ? OFFSET ?",
                             (REFLECTIONS, scope, limit + 1, int(cursor))).fetchall()
+        total = conn.execute("SELECT count(*) FROM sources WHERE namespace=? AND scope=? AND deleted=0",
+                             (REFLECTIONS, scope)).fetchone()[0]
         replying = enabled(conn, scope, SWITCH)
         ids = [row["id"] for row in rows[:limit]]
         answered = conn.execute("SELECT id,occurred_at,json_extract(data,'$.metadata.reply_to') AS reply_to FROM sources "
@@ -89,7 +91,7 @@ def read(mind, *, cursor=0, limit=20):
         entry = _entry(engine, row)
         if entry:
             entries.append({**entry, "replies": replies.get(row["id"], [])})
-    return {"entries": entries, "cursor": int(cursor) + limit if len(rows) > limit else None,
+    return {"entries": entries, "total": total, "cursor": int(cursor) + limit if len(rows) > limit else None,
             "replies": "enabled" if replying else "disabled"}
 
 

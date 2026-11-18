@@ -90,8 +90,7 @@ function completedForeignTools(messages: RequestMessage[], route: Route): Reques
   const projected: RequestMessage[] = []
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]
-    if (message.role !== 'assistant' || (message.source?.provider === route.provider && message.source.model === route.model)
-      || message.content.some((block) => block.type === 'reasoning' && block.text.trim())) {
+    if (message.role !== 'assistant' || (message.source?.provider === route.provider && message.source.model === route.model)) {
       projected.push(message)
       continue
     }

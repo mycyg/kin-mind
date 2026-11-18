@@ -137,6 +137,60 @@ try {
     () => ({ heard: receiptAt }), () => {}, recovery, {})
   assert.equal((await reaching.round()).reason, 'nothing-ready')
   assert.equal(candidateChecks, 1, 'a failed receipt writeback must not skip the owner contact decision')
+  // Two different decisions, both addressed to the same person. Only the new paragraph should reach the wire.
+  const newParagraphs = []
+  let claim = 0
+  const draftHost = { ...recoveryHost, replying: () => false,
+    ctx: { get: name => name === 'kin' ? { persona: () => '', dimensions: () => ({}), nameOf: id => id } : undefined,
+      llm: { async *stream() {
+        const text = JSON.stringify({ action: 'send', bubbles: claim === 1 ? ['Morning', 'The file is ready'] : ['Morning', 'The file is ready', 'A new detail'] })
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      } } },
+    mind: { call: async action => action === 'claim' ? { id: 'draft-' + ++claim, state: 'drafting' }
+      : ['candidate', 'check'].includes(action) ? { eligible: true } : {} },
+    load: (_key, empty) => empty, save: () => {},
+  }
+  const sentDrafts = new Deliveries(draftHost, () => ({ send: async (_to, part) => {
+    newParagraphs.push(part.text); return { state: 'accepted', platformId: String(newParagraphs.length) }
+  } }), async () => {})
+  const drafting = new Reaching(draftHost, () => ({ people: [{ id: 'person:person_a', name: 'Owner', proactive: true }], groups: [] }),
+    () => ({ enabled: true, quietStart: 0, quietEnd: 0, minGapMinutes: 0, maxPerDay: 4, waitForReply: false, timeZone: 'UTC' }),
+    () => ({ heard: receiptAt }), () => {}, sentDrafts, { queue: (_key, work) => work() })
+  assert.equal((await drafting.round()).state, 'complete')
+  assert.equal((await drafting.round()).state, 'complete')
+  assert.deepEqual(newParagraphs, ['Morning', 'The file is ready', 'A new detail'])
+  console.log('PASS: distinct proactive drafts send repeated opening paragraphs only once')
+  const gateCalls = []
+  let capped = true
+  const cappedHost = { ...recoveryHost, mind: { call: async (action, facts) => {
+    gateCalls.push({ action, facts })
+    return action === 'candidate' ? { eligible: false, reason: 'nothing-ready' } : {}
+  } } }
+  const cappedRules = { enabled: true, quietStart: 0, quietEnd: 0, minGapMinutes: 0,
+    maxPerDay: 1, waitForReply: false, timeZone: 'UTC' }
+  const gated = new Reaching(cappedHost,
+    () => ({ people: [{ id: 'person:person_a', proactive: true }], groups: [] }),
+    () => cappedRules, () => ({ heard: receiptAt, reached: capped ? [new Date().toISOString()] : [] }),
+    () => {}, recovery, {})
+  assert.equal((await gated.round()).reason, 'enough-today')
+  assert.deepEqual(gateCalls.map(x => x.action), ['contact-gate'], 'blocked contacts neither draft nor create attempts')
+  assert.equal(gateCalls[0].facts.reason, 'enough-today')
+  assert.equal(gateCalls[0].facts.sent_today, 1)
+  assert.equal(gateCalls[0].facts.max_per_day, 1)
+  capped = false
+  await gated.round()
+  assert.equal(gateCalls[1].action, 'contact-gate')
+  assert.equal(gateCalls[1].facts.reason, null, 'a cleared daily budget replaces the old blocker')
+  const { budget, hold } = await import(output + '/rules.js')
+  const boundary = { ...cappedRules, timeZone: 'Asia/Singapore' }
+  const yesterday = { heard: '2026-01-01T12:00:00Z', reached: ['2026-01-01T15:59:59Z'] }
+  assert.equal(budget(boundary, yesterday, new Date('2026-01-01T16:00:00Z')).sent_today, 0)
+  assert.equal(hold(boundary, yesterday, new Date('2026-01-01T16:00:00Z')), undefined)
+  assert.equal(hold({ ...cappedRules, maxPerDay: 0 }, yesterday), 'enough-today')
+  console.log('PASS: pre-draft daily limits reach Core as host receipts, no attempt/send; local-day rollover clears the hold')
   repaired = true
   await recovery.tick(() => true)
   assert.equal(recovery.get('broken-session').remembered, true)

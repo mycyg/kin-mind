@@ -986,9 +986,13 @@ class Mind(Continuity):
                            timezone=live.get("timeZone") or stored.get("timezone"),
                            quiet_start=start if quiet else None, quiet_end=end if quiet else None,
                            minimum_gap_hours=live.get("minimumGapHours"),
+                           max_per_day=live.get("maxPerDay"),
                            wait_for_reply=live.get("waitForReply") if type(live.get("waitForReply")) is bool else stored.get("wait_for_reply"))
             if not live:
                 contact["source"] = "live-policy-unreadable"
+        gate = self.contact_gate(conn)
+        if gate:
+            contact["host_gate"] = gate
         preference = recipient.preferences(state).get("contact_preference")
         if preference:
             contact["wait_for_reply"] = preference["wait_for_reply"]
@@ -1009,6 +1013,33 @@ class Mind(Continuity):
                                     "configured_at": frequency["configured_at"],
                                     "evidence_ids": [r["record_id"] for r in frequency["evidence"]]}
         return contact
+
+    def contact_gate(self, conn):
+        """Last host availability receipt; a constraint, never Kin's decision or a delivery."""
+        key = "kin_mind.contact_gate:" + self.scope.key() + ":" + recipient.current()
+        row = conn.execute("SELECT data FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def observe_contact_gate(self, request):
+        reason = request.get("reason")
+        if reason not in {None, "off", "proactive-off", "not-acquainted", "quiet-hours", "asked-to-wait",
+                          "waiting-for-reply", "just-talked", "enough-today", "paused"}:
+            raise ValueError("Unknown host contact constraint")
+        facts = {"reason": reason, "state": "blocked" if reason else "available", "decided_by": "host"}
+        for key in ("max_per_day", "sent_today"):
+            value = request.get(key)
+            if type(value) is not int or value < 0:
+                raise ValueError("Invalid contact budget")
+            facts[key] = value
+        with self.engine.db.connect(write=True) as conn:
+            previous = self.contact_gate(conn)
+            if previous and all(previous.get(key) == value for key, value in facts.items()):
+                return previous
+            facts["observed_at"] = self.clock()
+            key = "kin_mind.contact_gate:" + self.scope.key() + ":" + recipient.current()
+            conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                         (key, dumps(facts)))
+        return facts
 
     def configure_behavior(self, request):
         """Install sourced expression/contact policy without changing any score."""

@@ -264,7 +264,7 @@ class Traits:
             raise Conflict("A trait observation needs evidence of its own", code="trait-evidence-missing")
         for ref in refs:
             record = self.engine._get(conn, ref["record_id"])
-            cited = [{"namespace": ref["namespace"], "authority": ref["authority"]}]
+            cited = [{"namespace": ref["namespace"], "authority": ref["authority"], "metadata": ref.get("metadata", {})}]
             passes = (owner_statement(record, policy, sources=cited) if found == "owner_statement"
                       else self_statement(record, sources=cited))
             if never_evidence(cited[0]) or not passes:
@@ -513,7 +513,7 @@ class Traits:
         found = []
         for ref in refs:
             record = self.engine._get(conn, ref["record_id"])
-            cited = [{"namespace": ref["namespace"], "authority": ref["authority"]}]
+            cited = [{"namespace": ref["namespace"], "authority": ref["authority"], "metadata": ref.get("metadata", {})}]
             if never_evidence(cited[0]) or not owner_statement(record, policy, sources=cited):
                 continue
             if decision.quote and decision.quote not in (record.get("content") or ""):
@@ -678,7 +678,7 @@ class Traits:
             refs, policy, owner = self.mind._evidence(conn, [request["source_id"]]), self._policy(conn), []
             for ref in refs:
                 if owner_statement(self.engine._get(conn, ref["record_id"]), policy,
-                                   sources=[{"namespace": ref["namespace"], "authority": ref["authority"]}]):
+                                   sources=[{"namespace": ref["namespace"], "authority": ref["authority"], "metadata": ref.get("metadata", {})}]):
                     owner.append(ref)
             revoked = self._tombstone(conn, trait, "trait-revoke:" + trait["id"] + ":" + str(trait["revision"]), at,
                                       reason=request["reason"], basis="owner_correction" if owner else "operator",

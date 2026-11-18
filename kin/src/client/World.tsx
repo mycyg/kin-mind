@@ -5,7 +5,7 @@
  */
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import {
-  activeWish, api, useApi,
+  activeWish, api, useApi, useDiary,
   type Diary, type DiaryEntry, type Dreams, type Explore, type Home, type Letters, type Memory, type Wish,
 } from './api.js'
 import { CalendarView, dayKey, useWeek } from './Calendar.js'
@@ -33,6 +33,7 @@ const WISH_STATES: Record<string, string> = { wanted: '想', waiting: '等时机
 // Memories that are not things that happened say so.
 const BASIS: Record<string, string> = { imagined: '梦里', internal_thought: '她想的' }
 const STEP_STATES: Record<string, string> = { pending: '还没开始', ready: '准备做', running: '正在做', waiting: '等时机', completed: '已完成', abandoned: '已放下' }
+const CONTACT_HOLDS: Record<string, string> = { 'enough-today': '今天主动联系已达上限', 'quiet-hours': '正在安静时段', 'waiting-for-reply': '等对方回复', 'asked-to-wait': '对方请她稍等', 'just-talked': '刚聊过，稍后再联系', off: '主动联系已关闭', 'proactive-off': '此对象未开启主动联系', paused: '模型暂时不可用，稍后重试', 'not-acquainted': '还未建立对话' }
 const PLAN_STATES: Record<string, string> = { active: '进行中', waiting: '等着', done: '做完了', completed: '做完了', paused: '先放着' }
 
 export function World({ home, place, go, openSettings, talk }: {
@@ -74,7 +75,7 @@ function Collection({ home, open }: { home: Home | undefined; open: (place: Plac
   const wishes = home?.state.desires.filter(activeWish) ?? []
   const sealed = letters.data?.items.filter((item) => item.state === 'sealed').length ?? 0
   const dream = dreams.data?.dreams[0]
-  const pages = diary.data?.entries.length ?? 0
+  const pages = diary.data?.total ?? diary.data?.entries.length ?? 0
   const wandered = explore.data?.explorations[0]
   const week = useWeek()
 
@@ -97,7 +98,7 @@ function Collection({ home, open }: { home: Home | undefined; open: (place: Plac
           dream ? `${night(dream.at)}：${clip(dream.text, 34)}` : dreams.data?.generation_enabled === false ? '她还不会做梦' : '还没有梦',
           <><i className="kin-art-moon" /><i className="kin-art-stars" /></>)}
         {tile('letters', sealed ? `${sealed} 封还封着` : '写一封以后才能拆的信', <><i className="kin-art-flap" /><i className="kin-art-seal" /></>)}
-        {tile('diary', pages ? `${pages} 页` : '还没写', <i className="kin-art-frame" />)}
+        {tile('diary', diary.error ? '日记暂时没读出来，点开重试' : !diary.data ? '正在翻日记…' : pages ? `${pages} 页` : '还没写', <i className="kin-art-frame" />)}
         {tile('wishes', '心愿', <strong className="kin-numeral kin-tile-count">{wishes.length}</strong>)}
         {tile('wander', wandered ? clip(wandered.title ?? wandered.text ?? '', 30) : '还没出门探索过', <i className="kin-art-horizon" />)}
         {tile('memories', '她记得你们聊过的事', <Constellation />)}
@@ -160,6 +161,7 @@ function WishesView({ home, toDay }: { home: Home | undefined; toDay: (at: strin
                 {plan.title ?? plan.goal}<span className="kin-dim"> · {PLAN_STATES[plan.status] ?? plan.status}{plan.steps?.some((step) => step.state === 'completed') ? ` · 已完成 ${plan.steps.filter((step) => step.state === 'completed').length}/${plan.steps.length} 步` : ''}</span>
                 {plan.steps?.filter((step) => !['completed', 'abandoned'].includes(step.state)).map((step) => <p key={step.id} className="kin-plan-step">
                   <span className="kin-tag">{STEP_STATES[step.state] ?? step.state}</span>{step.goal}
+                  {step.execution?.host_gate?.state === 'blocked' ? <span className="kin-dim"> · {CONTACT_HOLDS[step.execution.host_gate.reason ?? ''] ?? '暂时无法主动联系'}</span> : null}
                   {step.not_before && !['completed', 'abandoned'].includes(step.state) ? (
                     <> · <button type="button" className="kin-link" aria-label={`在日程上看 ${calendarDay(step.not_before)}`} onClick={() => toDay(step.not_before!)}>{calendarDay(step.not_before)} {clock(step.not_before)}</button></>
                   ) : null}
@@ -205,15 +207,16 @@ function Wander() {
 }
 
 function DiaryView({ openSettings }: { openSettings: () => void }) {
-  const { data, error, reload } = useApi<Diary>('api/kin/diary', 30_000)
-  if (error) return <Failed error={error} retry={reload} />
-  if (!data) return <Quiet>正在翻她的日记本…</Quiet>
+  const { data, error, loading, reload, more } = useDiary()
+  if (!data) return error ? <Failed error={error} retry={reload} /> : <Quiet>正在翻她的日记本…</Quiet>
   const replying = data.replies === 'enabled'
   return (
     <>
       {data.entries.length ? data.entries.map((entry) => (
         <DiaryPage key={entry.source_id} entry={entry} replying={replying} onReplied={reload} />
       )) : <Quiet>她还没写日记。安静下来的时候，她会写下这一天。</Quiet>}
+      {error ? <Failed error={error} retry={data.cursor != null ? more : reload} /> : null}
+      {data.cursor != null ? <p className="kin-footnote"><button type="button" className="kin-btn" disabled={loading} onClick={more}>{loading ? '正在翻下一页…' : '看更早的日记'}</button></p> : null}
       {!replying && data.entries.length ? (
         <p className="kin-footnote">想回她的日记？<button type="button" className="kin-link" onClick={openSettings}>在设置里打开「日记可以回复」</button></p>
       ) : null}
@@ -363,14 +366,19 @@ function Remembered({ memory, onCorrected }: { memory: Memory; onCorrected: () =
 function Recall() {
   const [query, setQuery] = useState('')
   const [found, setFound] = useState<{ query: string; memories: Memory[] }>()
+  const [error, setError] = useState<string>()
   const [busy, setBusy] = useState(false)
   const ask = (value = query) => {
     if (!value.trim()) return
     setQuery(value)
+    setError(undefined)
     setBusy(true)
     api<{ memories: Memory[] }>('api/kin/recall', { query: value.trim() })
       .then(({ memories }) => setFound({ query: value.trim(), memories }))
-      .catch(() => setFound({ query: value.trim(), memories: [] }))
+      .catch((reason: Error) => {
+        setError(reason.message || '回忆读不出来')
+        setFound(undefined)
+      })
       .finally(() => setBusy(false))
   }
   return (
@@ -382,14 +390,15 @@ function Recall() {
           onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) ask() }} />
       </div>
       {busy ? <Quiet>她在想…</Quiet> : null}
-      {!busy && found ? (
+      {!busy && error ? <Failed error={error} retry={() => ask()} /> : null}
+      {!busy && !error && found ? (
         found.memories.length ? (
           <ul className="kin-memories">
             {found.memories.map((memory, i) => <Remembered key={memory.id ?? i} memory={memory} onCorrected={() => ask(found.query)} />)}
           </ul>
         ) : <Quiet>关于「{found.query}」，她没想起什么。</Quiet>
       ) : null}
-      {!found && !busy ? <Quiet>她记得你们聊过的事。输入一个词、一个人或一段时间试试。</Quiet> : null}
+      {!found && !busy && !error ? <Quiet>她记得你们聊过的事。输入一个词、一个人或一段时间试试。</Quiet> : null}
     </>
   )
 }

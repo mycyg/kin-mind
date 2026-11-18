@@ -11,11 +11,11 @@
 import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { readFileSync } from 'node:fs'
-import { extname, relative, resolve, sep } from 'node:path'
+import { basename, extname, relative, resolve, sep } from 'node:path'
 import type { Part, Transport, Transports } from '../channels/transport.js'
 import type { Host } from '../index.js'
 import { Conversations, fileOf, IMAGE_TYPES, partsOf, PLATFORMS } from './conversations.js'
-import { Deliveries, type Delivery } from './deliveries.js'
+import { Deliveries, PART_WORDS, type Delivery } from './deliveries.js'
 import { look } from './look.js'
 import { EMPTY, isGroup, nameOf, OWNER, revise, type People } from './people.js'
 import { Reaching, type Place } from './proactive.js'
@@ -52,7 +52,7 @@ export interface ContactService {
   /** Until when someone asked her to leave them be, in words, while that holds. */
   askedToWait(recipient: string): string | undefined
   /** A file into the WeChat / Feishu conversation she is in; `asked`: the person she is talking with asked for it. */
-  send(sessionId: string, callId: string, file: string, asked: boolean): Promise<string>
+  send(sessionId: string, callId: string, file: string, asked: boolean, to?: string, via?: string, original?: boolean): Promise<string>
   /** Her voice saying `text` (`style`: how she says it), in the conversation she is in. */
   voice(sessionId: string, callId: string, text: string, style?: string): Promise<string>
   /** The sticker from her meme library that best fits `meaning`, in the conversation she is in. */
@@ -70,6 +70,7 @@ const NOTICES = {
   stopped: '刚才这条回复没能完成，原消息还在，不用重复发。',
   unknown: '刚才有一条回复核对并重试了几次，仍未确认送达。你可以看一下有没有收到。',
   partial: '刚才只送达了一部分，已送达的不会重发。',
+  media: '刚才的附件发送失败。',
 }
 const HOUR = 3_600_000
 const MEDIA_TYPES: Record<string, string> = { ...IMAGE_TYPES, '.ogg': 'audio/ogg' }
@@ -108,7 +109,7 @@ export function contact(host: Host) {
   async function settled(delivery: Delivery) {
     const accepted = delivery.sent.filter((sent) => sent.state === 'accepted')
     const ids = accepted.map((sent, index) => sent.platformId ?? `${delivery.id}:${index}`)
-    const words = delivery.parts.slice(0, accepted.length).map((part) => ('text' in part ? part.text : '')).join('\n\n')
+    const words = delivery.parts.slice(0, accepted.length).map((part, index) => ('text' in part ? part.text : `[${PART_WORDS[part.kind]}：${basename(part.file)}${accepted[index]?.preview ? '，缩小的预览' : ''}]`)).join('\n\n')
     const scope = { recipient_person_id: delivery.recipient, conversation_key: delivery.key }
     const told = delivery.state === 'accepted' || (delivery.state === 'needs-review' && accepted.length > 0)
     if (delivery.kind === 'contact') {
@@ -124,10 +125,18 @@ export function contact(host: Host) {
       if (delivery.kind === 'reply' || delivery.kind === 'reminder') {
         const at = delivery.acceptedAt ?? delivery.at
         if (at > (activity(delivery.recipient).answered ?? '')) note(delivery.recipient, { answered: at })
+        if (delivery.kind === 'reply' && delivery.parts.some(part => 'file' in part)) {
+          await host.mind.call('runtime-event', {
+            id: delivery.id, kind: 'delivery', at: delivery.at, text: words, state: 'accepted', message_id: ids[0], message_ids: ids,
+            channel: delivery.transport, delivery_id: delivery.id, origin: 'reply', expected_bubbles: delivery.parts.length, ...scope,
+          })
+        }
       }
       else {
-        const change = reached(activity(delivery.recipient), delivery.id, delivery.acceptedAt ?? delivery.at)
-        if (change) note(delivery.recipient, change)
+        if (delivery.kind === 'contact' || delivery.kind === 'chime') {
+          const change = reached(activity(delivery.recipient), delivery.id, delivery.acceptedAt ?? delivery.at)
+          if (change) note(delivery.recipient, change)
+        }
         // Her words are hers in memory, and the conversation they went to knows she said them.
         await host.mind.call('runtime-event', {
           id: delivery.id, kind: 'delivery', at: delivery.at, text: words, state: 'accepted', message_id: ids[0], message_ids: ids,
@@ -142,9 +151,9 @@ export function contact(host: Host) {
         host.heartbeat.nudge()
       }
     }
-    if (delivery.kind === 'reply' && delivery.recipient === OWNER && delivery.transport !== 'app') {
+    if ((delivery.kind === 'reply' || delivery.kind === 'relay') && delivery.recipient === OWNER && delivery.transport !== 'app') {
       if (delivery.state === 'needs-review') notice(delivery, accepted.length ? 'partial' : 'unknown')
-      if (delivery.state === 'cancelled') notice(delivery, 'stopped')
+      if (delivery.state === 'cancelled') notice(delivery, delivery.parts.some(part => 'file' in part) ? 'media' : 'stopped')
     }
     deliveries.mark(delivery.id, { remembered: true })
   }
@@ -174,10 +183,12 @@ export function contact(host: Host) {
   }
 
   /** A notice to the owner where it happened, under an id of its own so it is said once. */
-  function notice(about: Pick<Delivery, 'id' | 'key' | 'transport' | 'to'>, kind: keyof typeof NOTICES) {
+  function notice(about: Pick<Delivery, 'id' | 'key' | 'transport' | 'to'> & Partial<Pick<Delivery, 'parts'>>, kind: keyof typeof NOTICES) {
+    const media = about.parts?.find(part => 'file' in part)
     const delivery = deliveries.open({
       id: `notice:${kind}:${about.id}`, kind: 'notice', key: about.key, recipient: OWNER, transport: about.transport, to: about.to,
-      parts: [{ text: '【系统通知】' + NOTICES[kind] }],
+      parts: [{ text: '【系统通知】' + (kind === 'media' && media
+        ? `刚才的${PART_WORDS[media.kind]}未能发到${whereOf(about.transport)}。` : NOTICES[kind]) }],
     })
     void conversations.queue(about.key, () => deliveries.send(delivery.id))
   }
@@ -187,27 +198,32 @@ export function contact(host: Host) {
    * a sticker or voice message in her desktop chat is shown there once her turn is over. What a sticker or voice
    * message said joins her memory as her words.
    */
-  async function here(sessionId: string, id: string, part: Part, said?: { words: string; media: 'image' | 'voice' }) {
+  async function here(sessionId: string, id: string, part: Part, said?: { words: string; media: 'image' | 'voice' }, target?: Place & { recipient: string }) {
     const scope = host.ctx.get('kin')!.scopeOf(sessionId)
-    const conversation = host.conversations()[scope.conversation_key]
+    const key = target?.key ?? scope.conversation_key
+    const conversation = host.conversations()[key]
     const remember = () => said && host.mind.call('observe', { id, text: said.words, at: new Date().toISOString(), ...scope })
       .catch((error: Error) => host.log(`contact: ${id} not remembered: ${error.message}`))
     if (!conversation?.address) {
-      if (!said || !('file' in part)) return '这段对话不在微信或飞书上，告诉对方文件在哪就好。'
+      if (!said || !('file' in part)) throw new Error('这段对话没有附件渠道，请指定对方的微信或飞书。')
       const media = { kind: said.media, file: relative(host.config.dataDir, part.file) }
       void conversations.say(sessionId, id, said.words, said.media === 'voice' ? '你发的语音' : '你发的表情', media)
         .then(remember, (error: Error) => host.log(`contact: ${id} not shown: ${error.message}`))
       return '发了。'
     }
-    const delivery = deliveries.open({
-      id, kind: 'reply', key: scope.conversation_key, recipient: scope.recipient_person_id, transport: conversation.channel,
-      to: conversation.address, parts: [part],
+    const relay = key !== scope.conversation_key
+    const pending = 'file' in part && deliveries.list().find(row => row.key === key
+      && (row.state === 'pending' || row.state === 'unknown') && row.parts.some(p => 'file' in p && p.file === part.file && Boolean(p.original) === Boolean(part.original)))
+    const delivery = pending || deliveries.open({
+      id, kind: relay ? 'relay' : 'reply', key, recipient: target?.recipient ?? scope.recipient_person_id, transport: conversation.channel,
+      to: conversation.address, parts: [part], ...(relay && quiet(rules) ? { notBefore: quietEnds(rules).toISOString() } : {}),
     })
-    const sent = await conversations.queue(scope.conversation_key, () => deliveries.send(delivery.id)) as Delivery
+    const sent = pending || await conversations.queue(key, () => deliveries.send(delivery.id, () => reaching.may(delivery))) as Delivery
     if (sent.state === 'accepted' || sent.state === 'unknown') void remember()
-    if (sent.state === 'accepted') return '发过去了。'
+    if (sent.state === 'accepted') return sent.sent[0]?.preview ? '微信已接收缩小的 JPEG 预览，原图仍在本机。' : '发过去了。'
     if (sent.state === 'unknown') return '发出去了，但还没确认对方收到；会按原来的编号核对，不用再发。'
-    return `没能发出去：${sent.reason ?? '对方的平台拒收了'}`
+    if (sent.state === 'pending' && !sent.reason) return '附件还在投递队列里，等渠道可用、允许投递时再发。'
+    throw new Error(`附件未发出：${sent.reason ?? '平台拒收'}${sent.state === 'pending' ? '。原投递会自动重试，无需再提交。' : ''}`)
   }
 
   /** The names she can tell things to: every person and group, as the owner named them. */
@@ -270,9 +286,22 @@ export function contact(host: Host) {
       if (sent.notBefore) return `现在是安静时段，${clock(new Date(sent.notBefore))}以后发给${nameOf(target)}。`
       return `${nameOf(target)}那边的渠道暂时没连上，连上就发。`
     },
-    send(sessionId, callId, file, asked) {
-      const { recipient_person_id: recipient } = host.ctx.get('kin')!.scopeOf(sessionId)
-      return here(sessionId, `file:${sessionId}:${callId}`, fileOf(file, asked && recipient === OWNER))
+    async send(sessionId, callId, file, asked, to, via, original) {
+      const scope = host.ctx.get('kin')!.scopeOf(sessionId)
+      const target = find(to?.trim() || scope.recipient_person_id)
+      if (!target) throw new Error(`找不到联系人：${to}`)
+      let place: Place | undefined
+      if (to || via) {
+        const places = placesOf(target.id).filter(p => p.channel !== 'app')
+        place = via ? places.find(p => [p.channel, whereOf(p.channel)].includes(via.trim()))
+          : places.find(p => p.key === scope.conversation_key) ?? places.find(p => p.key === reaching.placeOf(target.id)?.key)
+            ?? (places.length === 1 ? places[0] : undefined)
+        if (!place) throw new Error(`请指定${nameOf(target)}可用的渠道：${places.map(p => whereOf(p.channel)).join('、') || '暂无'}`)
+      }
+      if (scope.channel === 'own' && host.heartbeat.frozen) throw new Error('后台已冻结。')
+      const part = await fileOf(file, asked && scope.recipient_person_id === OWNER)
+      if ('file' in part && original) part.original = true
+      return here(sessionId, `file:${sessionId}:${callId}`, part, undefined, place && { ...place, recipient: target.id })
     },
     async voice(sessionId, callId, text, style) {
       const id = `voice:${sessionId}:${callId}`
@@ -311,7 +340,7 @@ export function contact(host: Host) {
       const until = asked(activity(recipient))
       return until && clock(until)
     },
-    look: (sessionId, who) => look(host, people, sessionId, who),
+    look: (sessionId, who) => look(host, people, sessionId, who, deliveries.list()),
     names: () => everyone().map(nameOf),
   } satisfies ContactService)
 

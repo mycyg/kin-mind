@@ -81,8 +81,8 @@ MODEL_FACING = frozenset({"memory-context", "read", "ingest", "state-overview", 
 # recipient's view of the one store, as `companion-host-call` runs them. A runtime event keeps both
 # names, which its delivery record carries; the others are given the view instead.
 RECIPIENT_ACTIONS = frozenset({"ingest", "observe", "memory-context", "runtime-event", "review-due", "review",
-                               "candidate", "reconsider", "claim", "check", "settle", "sharing-preflight",
-                               "private-notes", "private-note-save", "chat-tool"})
+                               "candidate", "contact-gate", "reconsider", "claim", "check", "settle", "sharing-preflight",
+                               "private-notes", "private-note-save", "chat-tool", "reply-choice"})
 
 
 def dispatch(config, action, request):
@@ -483,8 +483,15 @@ def _dispatch(config, action, request):
         built = {**Contexts(mind).build(**request), "clock": clock_context(mind.clock())}
         if recent:
             from .dialogue import recent_dialogue
-            built["recent_dialogue"] = [{k: turn[k] for k in ("role", "text", "occurred_at", "source_id", "speaker_person_id", "recipient_person_id") if k in turn}
-                                        for turn in recent_dialogue(mind)]
+            fields = ("role", "text", "occurred_at", "source_id", "speaker_person_id", "recipient_person_id")
+            view = ACTIVE_VIEW.get()
+            scoped = recent in ("recipient", "other-conversations")
+            if scoped:
+                fields += ("channel", "origin", "kind", "state")
+            turns = [] if scoped and not view else recent_dialogue(
+                mind, recipient=view.person if scoped else None,
+                other_than=view.conversation if recent == "other-conversations" else None)
+            built["recent_dialogue"] = [{k: turn[k] for k in fields if k in turn} for turn in turns]
         return built
     if action == "state-overview":
         return Contexts(mind).affective(request.get("query", ""))
@@ -771,6 +778,8 @@ def _dispatch(config, action, request):
             budget_seconds=int(request.get("budget_seconds") or prepared["budget_seconds"]),
             web=web,
         )
+    if action == "contact-gate":
+        return mind.observe_contact_gate(request)
     if action == "candidate":
         return mind.contact_candidate()
     if action == "reconsider":
@@ -875,7 +884,7 @@ UNDO_ACTIONS = (MIGRATION_ACTION, "slim-evidence-refs")
 # request that may take a native review keep their own process, executor and lease.
 RESIDENT_ACTIONS = frozenset({
     "private-note-save", "private-notes",
-    "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "reconsider", "claim",
+    "reply-status", "reply-choices", "ingest", "runtime-event", "observe", "read", "candidate", "contact-gate", "reconsider", "claim",
     "check", "settle", "energy-configure", "energy-activity", "plan-started", "plan-claim", "plan-renew", "plan-interrupt", "plan-deferral", "model-lease",
     "memory-compact-ack", "memory-injection-ack", "operational-status", "session-review", "session-snapshot",
     "context-delivery-begin", "context-delivery-ack", "context-delivery-uncertain", "context-delivery-pending",

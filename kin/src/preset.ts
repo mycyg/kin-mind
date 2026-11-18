@@ -14,6 +14,7 @@ import { agenda } from './calendar.js'
 import * as calendarTools from './calendar-tools.js'
 import { OWNER } from './contact/people.js'
 import { PLATFORMS } from './contact/conversations.js'
+import { dialogueLine, type DialogueTurn } from './contact/draft.js'
 import * as contact from './contact/preset.js'
 import { MindError } from './mind.js'
 import { replyNoteContext } from './reply-context.js'
@@ -71,7 +72,13 @@ export function apply(ctx: Context) {
   ctx.on('agent/request', async ({ agent, turn, step }, next) => {
     const request = await next()
     const input = heard(agent).at(-1)
-    kin.replyTargets.set(agent.session.id, { id: `note:${agent.session.id}:${turn}:${step}`, sessionId: agent.session.id, ...(input ? { inputId: input.id } : {}) })
+    const sourceIds = [...restsOf(agent.session)].filter(id => !kin.erased.has(id) && /^(?:src|mem)_/.test(id)).slice(-200)
+    kin.replyTargets.set(agent.session.id, {
+      id: `note:${agent.session.id}:${turn}:${step}`,
+      sessionId: agent.session.id,
+      ...(input ? { inputId: input.id } : {}),
+      ...(sourceIds.length ? { sourceIds } : {}),
+    })
     return request
   })
 
@@ -152,9 +159,12 @@ export function apply(ctx: Context) {
     let receipt: { id: string; epoch: string; marker: string } | undefined
     let rests: string[] = []
     let feeling: string | undefined
+    let elsewhere: DialogueTurn[] = []
     const [recalled] = await Promise.all([
-      kin.mind.call('memory-context', { query, purpose: 'chat', mode: 'light', session, ...scope })
+      kin.mind.call('memory-context', { query, purpose: 'chat', mode: 'light', session, ...scope,
+        ...(channel !== 'own' && said ? { recent_dialogue: 'other-conversations' } : {}) })
         .then(async (answer) => {
+          elsewhere = (answer.recent_dialogue ?? []).slice(-8)
           if (answer.injection?.state === 'prepared') {
             const { id, epoch, marker } = answer.injection
             const begun = await kin.mind.call('context-delivery-begin', { session, epoch, id })
@@ -190,13 +200,16 @@ export function apply(ctx: Context) {
     // They asked her to leave them be for a while: she may be here on a reminder, and they may be the one to take it back.
     const wait = step === 1 && channel !== 'own' && ctx.get('kinContact')?.askedToWait(scope.recipient_person_id)
     const asked = wait && `（对方说过先别找他，到 ${wait} 为止。）`
-    const text = [step === 1 && here, days, away, asked, recalled, work, source && `这条消息的来源编号：${source}`].filter(Boolean).join('\n')
+    const continuity = elsewhere.length ? '和这个人在其他对话里最近的记录（按原时间）：\n'
+      + elsewhere.map(turn => dialogueLine({ ...turn, text: turn.text.slice(0, 500) }, kin.nameOf(scope.recipient_person_id))).join('\n')
+      + '\n接着办之前的事时，kin_conversations 可查原对话和文件路径。' : ''
+    const text = [step === 1 && here, days, away, asked, recalled, continuity, work, source && `这条消息的来源编号：${source}`].filter(Boolean).join('\n')
     if (!text) return { ...decision, messages: withNotes(decision.messages) }
     const block = createUserMessage({
       content: [{ type: 'text', text }],
       source: {
         kind: 'kin-context', form: 'snapshot', sections: [{ name: 'kin-context', text }],
-        ...(recalled && receipt ? { receipt } : {}), ...(recalled && rests.length ? { rests } : {}),
+        ...(recalled && receipt ? { receipt } : {}), ...((rests.length || elsewhere.length) ? { rests: [...rests, ...elsewhere.map(turn => turn.source_id)] } : {}),
       },
     })
     if (recalled && feeling) showing.set(session, { message: block.id, feeling })

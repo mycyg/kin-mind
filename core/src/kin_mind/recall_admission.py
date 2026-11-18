@@ -74,14 +74,15 @@ REASONS = ("below_threshold", "no_score", "no_query", "quota", "seen", "covered"
 
 # Model-facing (NEEDS 用户甲 OK): the one line an automatic context carries when its recall items
 # could not be scored, so none were taken.
-ADMISSION_MORE_NOTE = "本轮未能按相关性筛选旧记忆，因此没有自动带入；需要时可用 read_continuity_context 查询。"
+ADMISSION_MORE_NOTE = "这轮没按相关性挑旧记忆，所以没自动带进来；需要的话自己用 read_continuity_context 找。"
 
-# Model-facing (NEEDS 用户甲 OK): the main session's tool for a quiet mark (kin_mind.mcp). The host offers
+# Model-facing: the main session's tool for a quiet mark (kin_mind.mcp). The host offers
 # it only once `set_memory_quiet` is in its chat-permissions.json.
 QUIET_TOOL_DESCRIPTION = (
-    "用户甲明确说某件旧事以后不要主动提起时使用，也可以按用户甲的话撤回。需要 command_id、item_id（记录或图谱节点编号）、"
-    "quiet（true 为不主动提起，false 为撤回）、evidence_ids（用户甲说这句话的消息编号）和 reason。"
-    "设置后自动带入的背景资料不再包含这一项；用户甲问起或你主动查询时照常可以读取。")
+    "小光明确说过某件旧事以后别主动提起时用它记一下，或者按他的话撤回。需要 command_id、item_id（记忆或图谱节点编号）、"
+    "quiet（true 为以后不主动提，false 为撤回）、evidence_ids（他说这句话的消息编号）和 reason。"
+    "标上后自动带出的背景里不再放这一条，不过他自己问起或者你去查时还是能看。"
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mind_recall_observations(

@@ -59,6 +59,14 @@ def owner_statement(record, policy=None, *, sources=()):
     if not isinstance(record, dict) or any(never_evidence(s) for s in sources):
         return False
     attributes = record.get("attributes") or {}
+    attr_speaker = str(attributes.get("speaker_person_id") or "").strip()
+    if attr_speaker and attr_speaker != "person:person_a":
+        return False
+    for s in sources:
+        if isinstance(s, dict):
+            src_speaker = str((s.get("metadata") or {}).get("speaker_person_id") or s.get("speaker_person_id") or "").strip()
+            if src_speaker and src_speaker != "person:person_a":
+                return False
     if attributes.get("self_knowledge") or host_envelope(record.get("content") or ""):
         # A self-claim and a host block stored as an owner turn are not the owner speaking.
         return False

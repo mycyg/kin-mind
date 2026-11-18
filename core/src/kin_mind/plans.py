@@ -321,9 +321,9 @@ class AutonomousPlans:
         try:
             plan = self.manage({
                 "command_id": "defer-task:" + task_id, "action": "create", "key": "deferred-task:" + task_id,
-                "goal": goal, "motivation": "用户甲交给我的事，我决定晚点再做", "reason": reason,
+                "goal": goal, "motivation": "小光交给我的事，我决定晚点再做", "reason": reason,
                 "evidence_ids": evidence, "next_review_at": not_before if future else None,
-                "steps": [{"id": "return", "actor": "contact", "goal": "回到用户甲交给我的事：" + goal,
+                "steps": [{"id": "return", "actor": "contact", "goal": "回到小光交给我的事：" + goal,
                            "completion": "我已回到这件事，并如实说明做到哪一步",
                            **({"not_before": not_before} if future else {}), "owner_request_id": task_id}]})
         except Conflict as error:
@@ -558,6 +558,9 @@ class AutonomousPlans:
                                 "AND json_extract(data,'$.plan_id')=?", (self.scope, plan_id)).fetchall():
             data = json.loads(row["data"])
             state = conn.execute("SELECT state FROM mind_appraisals WHERE id=?", (data["job_id"],)).fetchone() if jobs and data.get("job_id") else None
+            if state and state[0] == "needs-repair":
+                dead.add(row["id"])
+                continue
             if state and state[0] not in {"pending", "running"}:
                 continue
             try:
@@ -737,7 +740,8 @@ class AutonomousPlans:
                            checkpoint_retained=data.get("checkpoint_retained", False))
         did = step.get("desire_id") or (plan.get("desire_id") if len(plan["steps"]) == 1 else None)
         wish = self.mind._desire(conn, state, did) if did else None
-        return {"plan_run": run,
+        return {**({"host_gate": self.mind.contact_gate(conn)} if step["actor"] == "contact" else {}),
+                "plan_run": run,
                 "linked_wish": {"id": did, "status": wish.get("status") if wish else None} if did else None,
                 "receipt_count": len(receipts),
                 "latest_outcome": {k: v for k, v in receipts[-1].items() if k in

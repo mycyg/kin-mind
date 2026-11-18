@@ -95,15 +95,20 @@ export class Feishu implements Transport {
     const prior = this.store.value.sent[id]
     if (prior && (prior.state === 'accepted' || (prior.state === 'unknown' && !retryUnknown))) return sent(prior)
     this.store.value.chats[to.chat] ??= { kind: to.kind, covered: Date.now() }
-    let message: { msg_type: string; content: string }
+    const existing = retryUnknown && prior?.state === 'unknown' && prior.request && typeof prior.request === 'object'
+      ? prior.request as { receive_id: string; msg_type: string; content: string; uuid: string }
+      : undefined
+    let message: { msg_type: string; content: string } | undefined
     try {
-      message = 'text' in part ? { msg_type: 'text', content: JSON.stringify({ text: part.text }) } : await this.upload(part)
+      if (!existing) message = 'text' in part ? { msg_type: 'text', content: JSON.stringify({ text: part.text }) } : await this.upload(part)
       await this.tenant()
     } catch (error) {
-      return this.store.settle(id, { chat: to.chat, at: Date.now(), state: 'failed', reason: (error as Error).message })
+      return this.store.settle(id, retryUnknown && prior?.state === 'unknown'
+        ? { ...prior, reason: (error as Error).message }
+        : { chat: to.chat, at: Date.now(), state: 'failed', reason: (error as Error).message })
     }
     // The same delivery id always gives the same uuid: Feishu makes at most one message of it within the hour.
-    const request = { receive_id: to.chat, ...message, uuid: hash(id).slice(0, 32) }
+    const request = existing ?? { receive_id: to.chat, ...message!, uuid: hash(id).slice(0, 32) }
     const receipt = { chat: to.chat, at: Date.now(), request }
     // On disk before the platform can see it: a stop half way leaves it unknown, never unsent.
     this.store.settle(id, { ...receipt, state: 'unknown', reason: 'sending' })

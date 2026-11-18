@@ -14,7 +14,10 @@ export const HEADROOM_TOKENS = 32_768
 
 /** Reserve the requested completion and a margin before a model starts producing visible output. */
 export function requestThreshold(window: number, output: number): number {
-  return Math.max(0, Math.floor(Math.min(CONTEXT_WINDOW * PRESSURE_RATIO, window - output - HEADROOM_TOKENS)))
+  if (window <= 0) return 0
+  const reserve = output + HEADROOM_TOKENS
+  const boundedReserve = window < 320_000 ? Math.min(reserve, Math.floor(window * 0.4)) : reserve
+  return Math.max(window < 320_000 ? Math.floor(window * 0.5) : 0, Math.floor(Math.min(CONTEXT_WINDOW * PRESSURE_RATIO, window - boundedReserve)))
 }
 
 /**

@@ -68,12 +68,13 @@ export async function apply(ctx: Context) {
         return input ? '好，等下一句。' : '好。'
       }
       const action = choice === 'later' ? 'defer' : 'silent'
+      const view = viewOf(session.id)
       const answer = await kin.mind.call('reply-choice', {
-        input_id: input.id, action, reason, ...(choice === 'later' && minutes ? { retry_after_seconds: minutes * 60 } : {}),
+        input_id: input.id, action, reason, ...(choice === 'later' && minutes ? { retry_after_seconds: minutes * 60 } : {}), ...view,
       }).catch((error: Error) => ({ refused: error.message }))
       if ('refused' in answer) return `没能这样做（${answer.refused}），这条还是回吧。`
       // Several messages in this turn: the earlier ones go with the last.
-      for (const { id } of inputs.slice(0, -1)) await kin.mind.call('reply-choice', { input_id: id, action: 'merged', merged_into: input.id, reason })
+      for (const { id } of inputs.slice(0, -1)) await kin.mind.call('reply-choice', { input_id: id, action: 'merged', merged_into: input.id, reason, ...view })
       if (action === 'defer') {
         kinTalk.hold({
           inputId: input.id, sessionId: session.id, text: input.text, sourceId: answer.source_id, desireId: answer.desire_id,
@@ -88,8 +89,8 @@ export async function apply(ctx: Context) {
   // Notes to herself (Core's private notes): never sent, recalled later with the rest of what she remembers.
   ctx.tools.register(defineTool({
     name: 'kin_note',
-    description: '给自己留心情札记：用第一人称“我”写自然口语的心情、想念、猜测或没说出口的话。只保存参数 text，不外发；不要另写普通文字旁白。不要写分析步骤、回复计划或复制模型隐藏推理。没有想记的就不用；公开回复封套的 private_note 也可保存札记，不要重复记同一笔。',
-    parameters: { text: { type: 'string', required: true, description: '第一人称、自然口语的心情札记，最多 4000 字符' } },
+    description: '心里记一笔私密札记：用第一人称自然写出此刻的心情、想念、猜想或没说出口的话，只有你自己留着，不会发出去。这里只记真情实感，不要写回复打算、工具安排或思考步骤；公开回复的 private_note 也能留札记，别同一件事记两遍，没话想记就不用调用。',
+    parameters: { text: { type: 'string', required: true, description: '第一人称的心情札记，自然口语就好，最多 4000 字' } },
     output: text,
     async execute(args, exec) {
       const input = heard(exec.agent!).at(-1)
@@ -130,7 +131,7 @@ export async function apply(ctx: Context) {
     if (!waiting?.length || !next || waiting.some(({ id }) => id === next.id)) return
     merging.delete(agent.session.id)
     for (const { id, reason } of waiting) {
-      kin.mind.call('reply-choice', { input_id: id, action: 'merged', merged_into: next.id, reason }).catch(warn('merge not kept'))
+      kin.mind.call('reply-choice', { input_id: id, action: 'merged', merged_into: next.id, reason, ...viewOf(agent.session.id) }).catch(warn('merge not kept'))
     }
   })
 }

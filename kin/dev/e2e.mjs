@@ -35,6 +35,7 @@ while (!existsSync(out) && Date.now() < deadline && dsh.exitCode === null) {
 
 // The page's routes, called the way the browser calls them: the login link mints a cookie.
 const pages = {}
+let diaryNext, badDiaryCursor
 if (existsSync(out)) {
   const login = await fetch(await url, { redirect: 'manual' })
   const cookie = login.headers.getSetCookie().map((value) => value.split(';')[0]).join('; ')
@@ -47,6 +48,8 @@ if (existsSync(out)) {
     const response = await fetch(new URL('api/kin/' + route, await url), { headers: { cookie } })
     pages[route] = { status: response.status, body: await response.json().catch(() => null) }
   }
+  diaryNext = await fetch(new URL('api/kin/diary?cursor=30', await url), { headers: { cookie } }).then(r => r.json())
+  badDiaryCursor = (await fetch(new URL('api/kin/diary?cursor=-1', await url), { headers: { cookie } })).status
 }
 dsh.kill('SIGTERM')
 await Promise.race([new Promise((done) => dsh.once('exit', done)), new Promise((done) => setTimeout(done, 5000))])
@@ -91,6 +94,9 @@ const checks = {
     const last = pages.settings?.body?.models?.lanes?.chat?.last
     return last?.failed?.[0]?.route.provider === 'nowhere' && last?.answered?.provider === 'deepseek-official'
   })(),
+  'diary route carries total and cursor, reads the next page and rejects invalid offsets': Number.isInteger(pages.diary?.body?.total)
+    && Array.isArray(diaryNext?.entries) && !diaryNext.entries.some(entry => pages.diary.body.entries.some(first => first.source_id === entry.source_id))
+    && badDiaryCursor === 400,
   'every page route answers': Object.values(pages).length === 6 && Object.values(pages).every((page) => page.status === 200 && !page.body?.error),
   // Token use: light thinking for chat, no tools she cannot use, her mood said once while it stays the same.
   'KIN chats at low effort, coding keeps its own': (() => {

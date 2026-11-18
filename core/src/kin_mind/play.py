@@ -59,17 +59,17 @@ LAST_ENGAGING = (
 )
 
 # NEEDS 用户甲 OK: what an idle review that carries `autonomy_context.play` is told about it.
-PROMPT = ("\nautonomy_context.play 是你此刻的兴趣和闲不闲。interests 是你喜欢的东西：strength 越高越上心，days_since 是多久没碰了，"
-          "source 是它的来历（persona 本来就喜欢，exploration 逛着逛着喜欢上的，chat 聊天里来的）。boredom 是有多无聊，"
-          "bored 为 true 就是有点闲得发慌、想找点事做了。这时可以挑一个兴趣认真看看（explore 愿望，topic 就写那个兴趣）；"
-          "也可以上网随便逛逛，看看有意思的网站、社区和作品，回来写几句感受就好，不用写成研究（explore 愿望，exploration_target 写 play）；"
-          "也可以动手做点东西（plan_changes 里排一个 create 步骤）；或者找想说话的人聊几句（contact 愿望）；不想动就继续歇着（next_move 写 rest）。"
-          "没有固定的每日次数：做不做、做哪样、做多少，都看你自己的心情和精力；left_today 里的数是用户甲显式设过的上限剩余，"
-          "为 null 就是没有上限，为 0 表示配置的额度今天已用完；联系或休息仍可自行决定。")
-# NEEDS 用户甲 OK: what the executor of a play run is told besides the usual exploration rules.
-PLAY_GUIDE = ("这一趟不是做研究，是出去玩一会儿：随便逛逛和题目沾边、你觉得有意思的网站、社区或作品，碰到喜欢的就多看一会儿。"
-              "summary 用几句话写你自己的感受；findings 记下几样让你有感觉的东西就够了，不用面面俱到，也不用下结论；"
-              "真正打开看过的页面照常放进 sources。想给用户甲或家人看看的，写进 suggested_share。\n")
+PROMPT = ("\nautonomy_context.play 是你眼下的兴趣和闲不闲。interests 是你喜欢的东西：strength 越高越上心，days_since 是隔了多久没碰，"
+          "source 是来历（persona 本来就喜欢，exploration 逛着逛着爱上的，chat 聊天聊出来的）。boredom 是无聊程度，"
+          "bored 为 true 就说明你有点闲、想找点事做。这时可以挑个兴趣细看（explore 愿望，topic 就写那个兴趣）；"
+          "也能上网随便逛逛，刷刷有趣的网站、社区或作品，回来记几句想法就行，不用写正经报告（explore 愿望，exploration_target 写 play）；"
+          "还能自己动手做点小东西（plan_changes 里排一个 create 步骤），或找想聊的人说几句（contact 愿望），不想动就继续窝着休息（next_move 写 rest）。"
+          "没有固定的每日次数：做不做、做哪样、做几次都看心情和精力；left_today 是小光专门设过上限后今天还剩的次数，"
+          "为 null 就是没设上限，为 0 表示那类活动今天的额度用完了；主动找人或歇着仍然你自己决定。")
+# What the executor of a play run is told besides the usual exploration rules.
+PLAY_GUIDE = ("这一趟不用当研究做，就当出门逛一圈：看看和题目沾边、你有兴趣的网站、社区或作品，碰到喜欢的就多停留一会儿。"
+              "summary 用几句大白话写自己的真实感受；findings 记几样打动你的东西就行，不用求全也不必硬下结论；"
+              "真正点开读过的网页照常记进 sources。要是有想拿给小光或家人看看的，写进 suggested_share。\n")
 # NEEDS 用户甲 OK: the migration's one model call, which only lists what is already written.
 SEED_PROMPT = ("下面是 Kin 的人设，和 Kin 自己记下的偏好。把里面写到的、Kin 喜欢或者好奇的东西列出来，每样写成几个字的短词放进 topic；"
                "来自人设的 source 写 persona，来自自己记下的偏好写 chat。只列兴趣爱好和好奇的东西，不列人、关系、身份、规则或说话方式；"

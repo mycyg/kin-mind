@@ -69,7 +69,7 @@ export function health(host: Host) {
     for (const covered of COVERS[depth]) state.checked[covered] = at
     if (day) {
       const problems = Object.values(state.problems)
-      const ok = !problems.some((problem) => problem.level === 'error')
+      const ok = problems.length === 0
       state.days = [...state.days, { at, ok, problems: problems.map((problem) => problem.title), reviews: day.reviews }].slice(-14)
       logger.info('health: daily check %s', ok ? 'passed' : 'found: ' + problems.map((problem) => problem.title).join('; '))
     }
@@ -118,7 +118,8 @@ export function health(host: Host) {
   host.route('/api/kin/health', { GET: async () => view() })
   host.route('/api/kin/health/check', {
     POST: async () => {
-      await check('self')
+      const needsDaily = Object.values(state.problems).some((problem) => problem.from === 'daily') || state.days.at(-1)?.ok === false
+      await check(needsDaily ? 'daily' : 'self')
       return view()
     },
   })

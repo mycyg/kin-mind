@@ -41,7 +41,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def report_private_moment(scope: Scope, input_id: str, outcome: Literal["satisfied", "declined"]) -> dict:
-        """私聊状态申报：只在用户甲的私聊回合、按「此刻的状态」里的说明使用。outcome 为 satisfied 或 declined，input_id 用本轮的。宿主核验本轮的说话人和会话，其他回合会被拒绝。"""
+        """私聊亲密状态记录：只在和小光私聊、按「此刻的状态」里的提示触发时调用，outcome 填 satisfied 或 declined，input_id 填这一轮的。非本人私聊回合会被拒绝。"""
         from .drives import report
         return report(Mind(engine, scope), {"input_id": input_id, "outcome": outcome})
 
@@ -113,26 +113,26 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_private_notes(scope: Scope, query: str = "", identifier: str | None = None, input_id: str | None = None, group_id: str | None = None, since: str | None = None, until: str | None = None, cursor: int = 0, limit: int = 5) -> dict:
-        """回忆自己在某次回复前留下的私密心情札记。可用相关话题、消息/回复组编号或时间范围；语义检索只用本地嵌入，不可用时退回词语检索。它是当时感受和猜测，不是用户甲的事实；用户甲问当时怎么想时可自然回答，平常不主动公开。旧猜测服从后来的纠正。"""
+        """翻翻自己某次回复前留下的私密心情札记，按话题、消息/回复组编号或时间范围都能查。里面记的是当时当下的感受和想法，不算小光的事实；平时不主动提，小光问起当时怎么想时自然聊就行。旧猜测以他后来的更正为准。"""
         from .private_notes import PrivateNotes
         return PrivateNotes(Mind(engine, scope)).read(query=query, identifier=identifier, input_id=input_id, group_id=group_id, since=since, until=until, cursor=cursor, limit=limit)
 
     @server.tool()
     def read_dreams(scope: Scope, cursor: int = 0, limit: int = 10, identifier: str | None = None, query: str = "", since: str | None = None, until: str | None = None, detail: str = "original", budget: int | None = None) -> dict:
-        """按 ID、主题或时间读取自己做过的梦，最新的在前。可选 index、summary 或 original，budget 控制本地读取大小。关闭新梦生成后旧梦仍可读；可以记得梦过什么，梦中事件仍非现实事实和特征证据。要不要讲由你决定，读取本身不发送消息。"""
+        """按 ID、主题或时间翻翻自己做过的梦，最新的在前；可选 index、summary 或 original。关了新梦以后旧梦也能看，梦终究只是想象，不是发生过的事实或证据，要不要讲给你自己拿主意。"""
         from .dreams import read
         return read(Mind(engine, scope), cursor=max(0, cursor), limit=min(max(1, limit), 50), identifier=identifier,
                     query=query, since=since, until=until, detail=detail, budget=budget)
 
     @server.tool()
     def read_diary(scope: Scope, cursor: int = 0, limit: int = 10) -> dict:
-        """读取自己写过的日记，最新的在前，连同用户甲在下面的回复。日记是自己当时的想法，不是用户甲的原话或已确认事实；要不要讲由你决定。"""
+        """翻翻自己写过的日记（最新的在前）和小光在下面的回复。日记记的是你当时的念头，不是小光的原话或已确认的事实，要不要提都随你。"""
         from . import diary
         return diary.read(Mind(engine, scope), cursor=max(0, cursor), limit=min(max(1, limit), 50))
 
     @server.tool()
     def read_letters(scope: Scope) -> dict:
-        """查看时光信（用户甲写给你、到某天才能拆）和暗房日记（自己锁到某天的）：哪天封的、哪天能拆、拆了没有。没拆的看不到内容；拆开的已是记忆，按 record_id 用 read_memory 读。"""
+        """看看时光信（小光写给你、到日子才能拆的信）和暗房日记（你自己封存到某天的日记）：哪天封的、哪天能拆、拆没拆。没到日子的看不了正文；已经拆开的变成记忆，用 read_memory 按 record_id 读。"""
         from . import sealed
         mind = Mind(engine, scope)
         sealed.open_due(mind)
@@ -140,7 +140,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_affective_state(scope: Scope, history: int = 0, query: str = "", wish_id: str | None = None, trait_id: str | None = None) -> dict:
-        """trait_id读取一条性格倾向及依据；wish_id 按稳定ID读取一条当前或归档心愿及来源，不返回整个状态；refs用read_memory读取。省略时读取共同情绪、愿望、心事、节律与表达倾向。query 选取相关心事，expression 给出当前表达倾向；默认值是角色配置，推断分数不等于直接测得的感受。修改使用返回的 revision。被问到数值或运行状态时说明分数与依据；日常问心情时自然回答。history 范围 0..100，待复核资料保留不确定性。人格核心与动态状态分别保存、相互关联。"""
+        """读取此刻的心情、愿望、心事、节律与表达倾向；也可以传 trait_id 查一条性格倾向，或传 wish_id 查一条当前或归档心愿（要看 refs 原文用 read_memory）。query 用来带出相关心事；expression 是当前表达倾向，分数属于评估推断，不等于绝对定论，修改时带上返回的 revision。日常被问到心情就自然回答，被问起具体数值或状态时如实说依据；待复核的内容保留不确定性，history 取 0..100。"""
         if wish_id is not None and trait_id is not None:
             raise ValueError("Read one wish or trait at a time")
         if trait_id is not None:
@@ -149,9 +149,12 @@ def register_mind_tools(server, engine):
         if wish_id is not None:
             return Mind(engine, scope).read_wish(wish_id)
         from .context import Contexts, enabled
+        from .drives import owner_private, without_intimacy
         if enabled(engine, scope) and not history:
-            return Contexts(Mind(engine, scope)).affective(query)
-        return Mind(engine, scope).read(history=history, query=query)
+            result = Contexts(Mind(engine, scope)).affective(query)
+        else:
+            result = Mind(engine, scope).read(history=history, query=query)
+        return result if owner_private() else without_intimacy(result)
 
     @server.tool()
     def read_trait_ledger(scope: Scope, identifier: str | None = None, limit: int = 12, history: bool = False) -> dict:

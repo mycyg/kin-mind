@@ -630,6 +630,6 @@ CI checks affected components once. Python 3.11 compatibility is run for release
 
 A completed exploration stores its report and observed sources in the shared memory, with a stable exploration ID and separately tracked content units. Storing it does not mean it has been shared. Kin chooses share, defer or keep. When she wants to share later, she uses an existing contact plan step with a not-before window and a next-review time; the due review considers the latest conversation before sending, rescheduling or dropping the idea. An immediate contact wish is only for contact she wants to initiate now.
 
-Event digests whose actual member records are all excluded by the experience read policy finish as excluded without a model call. Missing or stale evidence still follows its existing failure path. Excluded digests contain no summary; the previous derived view is archived, and new membership or source changes make the event eligible for review again.
+Event digests without currently usable member records retain the saved event description, or its title when the description is empty, as a ready summary. This path makes no model call and invents no record references; new membership or source changes still make the event eligible for review again.
 
 Health audit calls retain DeepSeek high, with a 16,384-token output budget and three-minute deadline. Output exhaustion is a failed review, never a successful empty report. Failure state records a static collect/review/record stage without raw exception content.

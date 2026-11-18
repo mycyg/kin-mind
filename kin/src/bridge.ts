@@ -163,11 +163,11 @@ function toAnthropic(block: ContentBlock): Block[] {
 }
 
 function parseArguments(raw: string): unknown {
+  if (!raw.trim()) return {}
   try {
     return JSON.parse(raw)
   } catch {
-    // Core validates the input against its schema and repairs or retries; an unreadable one is empty.
-    return {}
+    return { __invalid_json__: raw.slice(0, 200) }
   }
 }
 

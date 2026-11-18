@@ -50,13 +50,15 @@ def strengths(conn, scope, identifiers, at):
     if not identifiers:
         return {}
     result = {i: {"uses": 0, "decayed_uses": 0., "strength": 0., "last_used_at": None, "weight_version": VERSION} for i in identifiers}
-    placeholders = ",".join("?" for _ in identifiers)
-    for row in conn.execute(f"SELECT identifier,at FROM mind_reinforcement WHERE scope=? AND identifier IN ({placeholders})", [scope, *identifiers]):
-        item = result[row["identifier"]]
-        days = max(0., (timestamp(at) - timestamp(row["at"])).total_seconds() / 86400)
-        item["uses"] += 1
-        item["decayed_uses"] += math.exp2(-days / 30)
-        item["last_used_at"] = max(item["last_used_at"] or row["at"], row["at"])
+    for start in range(0, len(identifiers), 900):
+        page = identifiers[start:start + 900]
+        placeholders = ",".join("?" for _ in page)
+        for row in conn.execute(f"SELECT identifier,at FROM mind_reinforcement WHERE scope=? AND identifier IN ({placeholders})", [scope, *page]):
+            item = result[row["identifier"]]
+            days = max(0., (timestamp(at) - timestamp(row["at"])).total_seconds() / 86400)
+            item["uses"] += 1
+            item["decayed_uses"] += math.exp2(-days / 30)
+            item["last_used_at"] = max(item["last_used_at"] or row["at"], row["at"])
     for item in result.values():
         item["strength"] = math.log1p(item["decayed_uses"])
     return result

@@ -1,15 +1,15 @@
 /** Public conversation output has an explicit boundary; no ordinary model text bypasses it. */
 import { BlockAssembler, LlmError, type ReplayEnvelope, type StreamChunk } from '@deepseek-ai/dsh-llm'
 
-export const REPLY_INSTRUCTION = '我（Kin）的普通文字只用一个完整 JSON 对象，只有 private_note、action、bubbles 三个字段：'
-  + '{"private_note":"我有点惦记眼前这件小事。","action":"send","bubbles":[{"text":"我想当面对方说的话"}]}。不加代码围栏，不在 JSON 外写旁白。'
-  + 'private_note 是我写给自己的心情札记。我每次公开回应前都留下札记，用第一人称自然口语记下此刻的心情、想念、猜测或没说出口的话；'
-  + '我不刻意压缩、缩写或凑字数，心情可以舒展开；语气词、停顿和小剧场自然出现。'
-  + '即使没有强烈情绪，也记一句我此刻的想法。它不是分析步骤、回复方案、工具安排，也不是模型的隐藏推理，我不把这些过程抄进札记。'
-  + '札记单独保存，只有 bubbles 会成为公开正文。bubbles 每项是只有 text 字符串字段的对象，表示一条完整的公开气泡；我按自己的性格自然说话。'
-  + '这轮不想说话时，我用 {"private_note":"","action":"silent","bubbles":[]}，也可以在 private_note 留下心情。'
-  + '我调用工具仍走原生工具接口，不把工具调用写成 JSON 正文；纯工具轮可以没有文字、不另写札记。若同时有文字，我也遵守同一个封套。'
-  + '做事前想先跟对方说一句，我把那句放进 bubbles，不在封套外写分析、札记或工作旁白。'
+export const REPLY_INSTRUCTION = '写给对方看的普通文字，只交一个完整的 JSON 对象，包含 private_note、action、bubbles 三个字段，像这样：'
+  + '{"private_note":"我有点惦记眼前这件小事。","action":"send","bubbles":[{"text":"我想当面对方说的话"}]}。不用代码块围栏，也别在 JSON 外面加旁白。\n'
+  + 'private_note 是我留给自己的心情札记，每次开口前顺手用第一人称自然记下此刻的感受、想念、猜测或没说出口的话；'
+  + '不刻意压缩或凑字数，怎么想就怎么写，语气词、停顿和小念头都可以。就算当时心里平平淡淡，也随便留一句此刻的想法。'
+  + '这里只写心情，不要把思考步骤、工具安排或隐藏推理抄进来。\n'
+  + '札记只自己留着，对方看到的只有 bubbles（每一条是一个仅含 text 字符串的对象，分成几条气泡按我平时说话的感觉来）。'
+  + '这轮想保持安静，就交 {"private_note":"","action":"silent","bubbles":[]}，也可以照样在 private_note 留一句心绪。\n'
+  + '调工具直接走原生工具接口，不要把工具调用塞进 JSON 正文里；光调工具不说话时可以留空、不用另记札记；如果既要调工具又要开口，文字部分同样交这个 JSON。'
+  + '要花一阵去做事前想先跟对方打个招呼，就把那句放进 bubbles，别在外面写工作旁白或分析。'
 
 export const REPLY_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['private_note', 'action', 'bubbles'],
@@ -23,7 +23,7 @@ export const REPLY_SCHEMA = {
   ],
 } as const
 
-export interface ReplyTarget { id: string; sessionId: string; inputId?: string }
+export interface ReplyTarget { id: string; sessionId: string; inputId?: string; sourceIds?: string[] }
 export interface ReplyEnvelope { private_note: string; action: 'send' | 'silent'; bubbles: { text: string }[] }
 const invalid = (reason: string): never => { throw new LlmError('公开回复封套无效：' + reason, 'INVALID_REPLY_ENVELOPE') }
 
@@ -111,10 +111,10 @@ export async function* replyWithCorrection(
       const message = (error as Error).message
       options.rejected(message)
       if (attempt) throw error
-      feedback = '本步输出被本地 JSON 契约校验拒绝：' + message
-        + '。本步没有公开文字、保存札记或执行任何工具。请只纠正本步输出，遵守原有 private_note/action/bubbles 契约；'
-        + '每个 bubbles 项为 {"text":"公开正文"}，send 前 private_note 须非空。不要重做历史中已经完成的工具。'
-        + '不要解释这次校验错误，不要在 JSON 外加文字；仍需工具时使用原生工具调用。'
+      feedback = '刚才这段没发出去（' + message
+        + '），也没有保存札记或跑任何工具。请只把这一步重说一遍，照原来的 {"private_note","action","bubbles"} 格式交一个完整 JSON：'
+        + 'bubbles 每项是 {"text":"公开正文"}，action 为 send 时 private_note 不能为空。不要重做历史中已经完成的工具。'
+        + '也不用解释这次出错，JSON 外面别加字；还要调工具就直接调。'
     }
   }
 }
