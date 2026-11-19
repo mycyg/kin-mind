@@ -53,13 +53,12 @@ TITLE = "Kin 的梦"
 DREAM_PREFIX = "Kin 的梦（想象出来的，不是发生过的事）：\n"
 # The section's paragraph, appended only to a request that offers it.
 DREAM_PROMPT = ("dream 在休息或慢下来的空闲、节奏评估里可选：今晚做不做梦、梦到什么随你心意，不强求每晚都有。"
-                "想写梦时，只从 dream_material（最近 48 小时的经历、记忆和日记片段）里取材，写进 text：80 到 220 字，用第一人称现在时，"
+                "想写梦时，从 dream_material（最近 48 小时的经历、记忆和日记片段）里取材，写进 text：80 到 220 字，用第一人称现在时，"
                 "像刚醒过来脑海里还留着的画面，逻辑乱一点、场景人物串在一起也没关系。"
-                "不用讲道理、分析象征，也别写成日记总结。梦终究是想象，不当作真的发生过的事或性格证据；"
-                "你可以记得自己做过这个梦，也可以留下刚醒时的感受。")
+                "不用讲道理、分析象征，也别写成日记总结，记下自己做过的梦和刚醒时的感受就好。")
 # Said once beside the latest dream, which the next idle reviews are shown.
-RECENT_DREAMS_PROMPT = ("\nrecent_dreams 是你最近做的梦，只是想象，不是发生过的事，也不能当成事实依据。"
-                        "可以自己偷偷留在心里；想讲给小光听，就提一个 contact 愿望、带上对应的 activity_ref，挑想分享的片段和感受说就好。")
+RECENT_DREAMS_PROMPT = ("\nrecent_dreams 是你最近做的梦。可以自己偷偷留在心里；"
+                        "想讲给小光听，就提一个 contact 愿望、带上对应的 activity_ref，挑想分享的片段和感受说就好。")
 
 
 def night_start(at):

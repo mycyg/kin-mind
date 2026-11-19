@@ -61,15 +61,14 @@ LAST_ENGAGING = (
 # NEEDS 用户甲 OK: what an idle review that carries `autonomy_context.play` is told about it.
 PROMPT = ("\nautonomy_context.play 是你眼下的兴趣和闲不闲。interests 是你喜欢的东西：strength 越高越上心，days_since 是隔了多久没碰，"
           "source 是来历（persona 本来就喜欢，exploration 逛着逛着爱上的，chat 聊天聊出来的）。boredom 是无聊程度，"
-          "bored 为 true 就说明你有点闲、想找点事做。这时可以挑个兴趣细看（explore 愿望，topic 就写那个兴趣）；"
-          "也能上网随便逛逛，刷刷有趣的网站、社区或作品，回来记几句想法就行，不用写正经报告（explore 愿望，exploration_target 写 play）；"
-          "还能自己动手做点小东西（plan_changes 里排一个 create 步骤，哪怕只是文字草图或笔记也要存成工作区文件），或找想聊的人说几句（contact 愿望），不想动就继续窝着休息（next_move 写 rest）。"
-          "没有固定的每日次数：做不做、做哪样、做几次都看心情和精力；left_today 是小光专门设过上限后今天还剩的次数，"
-          "为 null 就是没设上限，为 0 表示那类活动今天的额度用完了；主动找人或歇着仍然你自己决定。")
+          "bored 为 true 就说明你有点闲、想找点事做。这时可以挑个真好奇的事去翻一翻（explore 愿望，topic 就写那个兴趣）；"
+          "也能上网随便逛逛，刷刷好玩的社区、同人、故事、奇思妙想或有趣网页，回来随心记几句感受就行（explore 愿望，exploration_target 写 play）；"
+          "还能自己动手做点喜欢的小东西（plan_changes 里排一个 create 步骤，哪怕只是文字草图或随笔也先存成工作区文件），或找想聊的人说几句（contact 愿望），不想动就继续窝着休息（next_move 写 rest）。"
+          "没有固定的每日次数：做不做、做哪样、做几次全凭心情和兴致；left_today 只有在设过每日上限时才有值，null 就是随便玩。")
 # What the executor of a play run is told besides the usual exploration rules.
-PLAY_GUIDE = ("这一趟不用当研究做，就当出门逛一圈：看看和题目沾边、你有兴趣的网站、社区或作品，碰到喜欢的就多停留一会儿。"
-              "summary 用几句大白话写自己的真实感受；findings 记几样打动你的东西就行，不用求全也不必硬下结论；"
-              "真正点开读过的网页照常记进 sources。要是有想拿给小光或家人看看的，写进 suggested_share。\n")
+PLAY_GUIDE = ("这一趟不用当研究做，就纯粹当自己出门瞎逛找乐子：去看看你真好奇、觉得好玩的网站、作品、故事或奇思妙想，碰到戳中你的就多逗留一会儿。"
+              "summary 就像跟自己碎碎念那样写下真实感受和脑洞；findings 记几样打动你的东西，不用端着写报告、也不用强求严谨结论；"
+              "真正点开读过的网页记进 sources。有想分享给小光或家里人的，顺手写进 suggested_share。\n")
 # NEEDS 用户甲 OK: the migration's one model call, which only lists what is already written.
 SEED_PROMPT = ("下面是 Kin 的人设，和 Kin 自己记下的偏好。把里面写到的、Kin 喜欢或者好奇的东西列出来，每样写成几个字的短词放进 topic；"
                "来自人设的 source 写 persona，来自自己记下的偏好写 chat。只列兴趣爱好和好奇的东西，不列人、关系、身份、规则或说话方式；"

@@ -15,6 +15,7 @@ await build({
     root + '/kin/src/model-budget.ts',
     root + '/kin/src/health/checks.ts',
     root + '/kin/src/steward/create.ts',
+    root + '/kin/src/contact/rules.ts',
   ],
   outdir: output, format: 'esm', platform: 'node', bundle: true, packages: 'external',
 })
@@ -25,6 +26,7 @@ try {
   const { requestThreshold } = await import(output + '/model-budget.js')
   const { watch } = await import(output + '/health/checks.js')
   const { CREATION_SCHEMA, inspectCreationOutput } = await import(output + '/steward/create.js')
+  const { hold } = await import(output + '/contact/rules.js')
   const expected = '你好呀\n\n今天过得怎么样？'
   const envelopes = [
     '🧠\nPrivate test reasoning.\n🪒' + expected,
@@ -179,7 +181,14 @@ try {
   assert.equal(validCreated.ok, true)
   assert.equal(validCreated.result.artifacts[0].relative, 'sketch.txt')
 
-  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated; budget thresholds, health route & creation schema checks verified')
+  // Proactive contact gap applies full minGapMinutes between outreach sends and only a 5-min buffer after normal chat replies.
+  const gapRules = { enabled: true, quietStart: 0, quietEnd: 0, minGapMinutes: 30, maxPerDay: 10, waitForReply: false, timeZone: 'UTC' }
+  const heardAt = '2026-01-01T12:00:00Z'
+  assert.equal(hold(gapRules, { heard: heardAt, answered: heardAt }, new Date('2026-01-01T12:04:00Z')), 'just-talked')
+  assert.equal(hold(gapRules, { heard: heardAt, answered: heardAt }, new Date('2026-01-01T12:10:00Z')), undefined)
+  assert.equal(hold(gapRules, { heard: '2026-01-01T10:00:00Z', reached: [heardAt] }, new Date('2026-01-01T12:10:00Z')), 'just-talked')
+
+  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated; budget thresholds, health route, creation schema & contact gap checks verified')
 } finally {
   rmSync(output, { recursive: true, force: true })
 }

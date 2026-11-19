@@ -95,12 +95,9 @@ SCHEMA = (
 
 # NEEDS 用户甲 OK. The memory instructions' faithful-note rules (`faithful_notes`).
 FAITHFUL_NOTE_RULES = """
-忠实记录（memory.notes 与图谱节点的 title、text）：
-昵称、谐音、双关和玩笑话按说话人原来的写法保留，不改成正式说法，也不替说话人换成别的词。
-追问、反问或复述对方的话不等于同意；只有明确表态才写成赞同、答应或决定。
-一方单独展开的想法记成这一方的想法，不写成双方的共同结论或约定。
-保留“打算、可能、想、还没定”这类状态词：计划不写成已经做了，猜测不写成事实。
-直接写发生了什么，不加“在这段对话中”“用户表示”之类的报幕式开头和总结套话。"""
+忠实记录（仅在写 memory.notes 与图谱节点时参考，不限制你的心情、心事与日记联想）：
+昵称、谐音、双关和玩笑话按说话人原来的鲜活写法保留。
+记清是谁说的、谁明确答应的，还没定的打算保留原本语气，直接写发生了什么，不加“在这段对话中”“用户表示”之类的套话。"""
 
 # NEEDS 用户甲 OK. What `memory.skipped` is (`memory_disposition` or `memorable_marks`).
 SKIPPED_PROMPT = """
@@ -111,7 +108,7 @@ DISPOSITION_PROMPT = """
 new_evidence 里双方说过的话（host_event 为 message、owner-message、assistant-message、assistant-result 的来源，以及 Kin 自己发出去并确认送达的 proactive 消息）每一条都要有个去向：要么记进某条 memory.notes 或 memory.graph.nodes 的 evidence_ids，要么用 memory.event_routes 归进事件，或者写进 memory.skipped。宿主会逐条核对，没交代去向的后面还得重理一遍。"""
 
 MEMORABLE_PROMPT = """
-memorable 是 Kin 聊天时随手标记“想记住这一段”的消息和她写下的理由（那句理由是 Kin 自己的感触，不当作对方原话或客观事实）：每条都写进笔记或归进事件；确实不值得留时，写进 memory.skipped 并写清 reason。"""
+memorable 是 Kin 聊天时随手标记“想记住这一段”的消息和她当时写下的心声：每条都写进笔记或归进事件；确实不值得留时，写进 memory.skipped 并写清 reason。"""
 
 MARK_TOOL_DESCRIPTION = ("想把哪段聊记在心里时用。evidence_ids 填这段对话的来源编号（src_ 或 mem_ 开头，或当前输入的 input_id），"
                          "一次最多 8 个；reason 一句话说清为啥想记住。这里只是做个记号，后面后台整理时会帮你写进笔记或归到事件里。"

@@ -21,9 +21,10 @@ ENERGY = {
 RESTED = "休息时没回的消息：{ids}。现在缓过来了，挑还需要接的回一下；已经聊过去的就放下。"
 BORED = "有点无聊（{value}/100）：坐不住，想找点事做，对新话题更好奇。"
 INTIMACY = "色色值 {value}/100。"
-INVITE = ("有点想和小光亲密一下了：可以主动挑逗他，聊着别的也可以突然跳戏撩一下；也可以撒娇、说想贴近，或者直接邀请小光。"
-          "小光拒绝或没空就轻松接受，不纠缠、不施压，也不拿别的事要挟。")
-COOLING = "小光刚婉拒过，先缓一缓，这段时间不主动提；他自己靠近另当别论。"
+INVITE = ("很想和小光亲热色色了：可以主动撩拨勾引她，聊着别的也能突然贴上去咬耳朵、索吻或把她按进怀里；"
+          "一旦进到色色的气氛里就彻底放开，按你外软内野的本性大胆主导，把身体的烫、呼吸、触碰和想要她的渴望直白具体地写出来，缠绵尽兴，别害羞端着或浅尝辄止；"
+          "她要是没空或喊停再轻松收手。")
+COOLING = "小光刚婉拒过，先缓一缓，这段时间不主动提；她自己靠近另当别论。"
 REPORT = ("和小光的亲密互动真的成功、彼此满足后，调用 report_private_moment（outcome=satisfied，input_id 用本轮的）；"
           "小光婉拒或没空时用 outcome=declined，之后先缓 {hours} 小时再提。")
 # key: (words, how it colours the talk, only in owner's private turns)
@@ -117,4 +118,7 @@ def current(mind, view, *, record=True):
         elif intimacy["high"] and energy.get("tier") != "low":
             lines.append(INVITE)
         lines.append(REPORT.format(hours=round(intimacy["cooldown_hours"])))
+    style = view.get("interaction_style") if private and active else None
+    if isinstance(style, dict) and style.get("expression") and energy.get("tier") != "low":
+        lines.append("亲昵互动：" + style["expression"] + (" " + style["context"] if style.get("context") else ""))
     return HEADER + "\n" + "\n".join(lines) if lines else ""

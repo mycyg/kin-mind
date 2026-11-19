@@ -70,8 +70,14 @@ export function hold(rules: Rules, activity: Activity | undefined, now = new Dat
   const reached = activity.reached ?? []
   const last = reached.at(-1)
   if (rules.waitForReply && !chime && last && last > activity.heard) return 'waiting-for-reply'
-  const latest = Math.max(...(chime ? [last] : [activity.heard, activity.answered, last]).map((at) => (at ? Date.parse(at) : 0)))
-  if (now.getTime() - latest < rules.minGapMinutes * 60_000) return 'just-talked'
+  const gapMs = rules.minGapMinutes * 60_000
+  if (last && gapMs > 0 && now.getTime() - Date.parse(last) < gapMs) return 'just-talked'
+  if (!chime && gapMs > 0) {
+    // Allow spontaneous follow-ups minutes after chatting while still avoiding mid-burst collisions.
+    const replyBufferMs = Math.min(rules.minGapMinutes, 5) * 60_000
+    const talk = Math.max(...[activity.heard, activity.answered].map((at) => (at ? Date.parse(at) : 0)))
+    if (now.getTime() - talk < replyBufferMs) return 'just-talked'
+  }
   if (budget(rules, activity, now).sent_today >= rules.maxPerDay) return 'enough-today'
 }
 

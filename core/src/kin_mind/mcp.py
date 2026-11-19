@@ -113,7 +113,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_private_notes(scope: Scope, query: str = "", identifier: str | None = None, input_id: str | None = None, group_id: str | None = None, since: str | None = None, until: str | None = None, cursor: int = 0, limit: int = 5) -> dict:
-        """翻翻自己某次回复前留下的私密心情札记，按话题、消息/回复组编号或时间范围都能查。里面记的是当时当下的感受和想法，不算小光的事实；平时不主动提，小光问起当时怎么想时自然聊就行。旧猜测以他后来的更正为准。"""
+        """翻翻自己某次回复前留下的私密心情札记，按话题、消息/回复组编号或时间范围都能查。里面记的是你当时的真实感受、欲望和心声；小光问起时自然聊就行。"""
         from .private_notes import PrivateNotes
         return PrivateNotes(Mind(engine, scope)).read(query=query, identifier=identifier, input_id=input_id, group_id=group_id, since=since, until=until, cursor=cursor, limit=limit)
 
@@ -126,7 +126,7 @@ def register_mind_tools(server, engine):
 
     @server.tool()
     def read_diary(scope: Scope, cursor: int = 0, limit: int = 10) -> dict:
-        """翻翻自己写过的日记（最新的在前）和小光在下面的回复。日记记的是你当时的念头，不是小光的原话或已确认的事实，要不要提都随你。"""
+        """翻翻自己写过的日记（最新的在前）和小光在下面的回复。里面记的是你当时的心绪和想法，要不要提都随你。"""
         from . import diary
         return diary.read(Mind(engine, scope), cursor=max(0, cursor), limit=min(max(1, limit), 50))
 

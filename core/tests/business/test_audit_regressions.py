@@ -332,3 +332,38 @@ def test_create_step_guidance_and_empty_artifacts_reason(tmp_path):
     )
     assert settled["state"] == "failed"
     assert settled["result"]["reason"] == "empty-artifacts"
+
+
+def test_appraisal_prompts_avoid_self_interrogation_and_defensive_trait_rules():
+    from kin_mind import appraisal
+
+    for phrase in ("推翻旧猜测", "单纯撤回自己的误判"):
+        assert phrase not in appraisal.SYSTEM
+    assert "不用自我审查或检讨" in appraisal.SYSTEM
+    assert "不要把某次没看清、搞混细节或工具报错的教训写成约束自己的规矩或自我检讨" in appraisal.TRAIT_OBSERVATIONS_PROMPT
+    assert "不要把某次没看清、搞混细节或工具报错的教训写成约束自己的规矩或自我检讨" in appraisal.TRAIT_DECISIONS_PROMPT
+
+
+def test_affectionate_direct_style_only_renders_in_owner_private_moment(tmp_path):
+    from kin_mind import drives, energy, moment
+
+    mind, receive, _ = _setup(tmp_path)
+    energy.configure(mind, {"enabled": True, "initial": 80, "night_penalty": 0})
+    drives.configure(mind, {"enabled": True, "intimacy_initial": 85})
+    src = receive("pref-1", "私密相处时放开主导")
+    mind.configure_behavior({
+        "command_id": "pref-1",
+        "agent_version": "synthetic-v1",
+        "expected_revision": mind.read()["revision"],
+        "style": "affectionate-direct",
+        "evidence_ids": [src],
+        "reason": "owner private intimacy",
+    })
+    view = mind.read()
+    with companion_scope(CompanionView(mind.engine, mind.scope, "person:person_a", "owner-chat")):
+        owner_block = moment.current(mind, view, record=False)
+    assert "亲昵互动：" in owner_block and "彻底放开" in owner_block
+    for person, chat in (("person:companion_b", "other-chat"), ("group:family", "family-chat")):
+        with companion_scope(CompanionView(mind.engine, mind.scope, person, chat)):
+            other_block = moment.current(mind, view, record=False)
+        assert "亲昵互动：" not in other_block and "色色" not in other_block and "彻底放开" not in other_block

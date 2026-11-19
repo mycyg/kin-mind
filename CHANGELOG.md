@@ -1,3 +1,9 @@
+## 2026-11-19 — Soften self-auditing prompts, surface owner intimacy style and relax outreach cooldowns
+
+- Soften background appraisal, trait, private-note, diary, dream and creation review prompts in Core so empathetic associations and playful reflections are no longer self-interrogated as factual fabrications unless an explicit factual correction arrives; prevent defensive self-censorship lessons from being saved as recurring traits.
+- Surface explicit `affectionate-direct` `interaction_style` guidance and bolder intimacy wording exclusively in `小光` private `moment.current()` and `contact/draft.ts` owner-private prompts while keeping all non-owner and group contexts free of intimacy cues.
+- Decouple the proactive `minGapMinutes` cooldown from ordinary chat replies (keeping a capped 5-minute buffer after normal replies while retaining the full gap between outreach sends), widen `People.tsx` outreach presets (`maxPerDay` up to 20, `minGapMinutes` from 15m), relax `private_note` wording, and remove the offline restriction from autonomous `create` briefs.
+
 ## 2026-11-19 — Require workspace files for creation steps and report empty artifacts clearly
 
 - Clarify in `PlanStep`, play guidance and the creator brief/schema that `create` steps always write at least one non-empty file inside their isolated workspace, even for plain-text sketches or notes.

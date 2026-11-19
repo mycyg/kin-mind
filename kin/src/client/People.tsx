@@ -136,10 +136,10 @@ export function ContactRules() {
         <div><p>每个人一天最多</p><span className="kin-dim">两次之间至少隔多久</span></div>
         <span className="kin-hours">
           <select className="kin-effort" value={rules.maxPerDay} aria-label="一天最多几次" onChange={(event) => change({ maxPerDay: Number(event.target.value) })}>
-            {[1, 2, 3, 4, 5, 6, 8, 10].map((n) => <option key={n} value={n}>{n} 次</option>)}
+            {[1, 2, 3, 4, 5, 6, 8, 10, 15, 20].map((n) => <option key={n} value={n}>{n} 次</option>)}
           </select>
           <select className="kin-effort" value={rules.minGapMinutes} aria-label="至少隔多久" onChange={(event) => change({ minGapMinutes: Number(event.target.value) })}>
-            {[0, 30, 60, 120, 180, 360].map((n) => <option key={n} value={n}>{n ? (n < 60 ? `${n} 分钟` : `${n / 60} 小时`) : '不限'}</option>)}
+            {[0, 15, 30, 60, 120, 180, 360].map((n) => <option key={n} value={n}>{n ? (n < 60 ? `${n} 分钟` : `${n / 60} 小时`) : '不限'}</option>)}
           </select>
         </span>
       </div>

@@ -17,9 +17,8 @@ CREATE INDEX IF NOT EXISTS mind_private_notes_time ON mind_private_notes(scope,a
 CREATE INDEX IF NOT EXISTS mind_private_notes_input ON mind_private_notes(scope,input_id);
 CREATE INDEX IF NOT EXISTS mind_private_notes_group ON mind_private_notes(scope,group_id);
 """
-PROMPT = ('这是我（Kin）给自己留的私密心情札记，记的只是自己当时的感受和念头，不算小光的事实或新消息。'
-          '平时放在心里接着刚才的情绪就好，不用刻意念出来；小光问起我当时怎么想时，可以用 read_private_notes 翻出来自然回他。'
-          '事情的真相和心意以他后来的说法为准，以前的猜测不代表现在。')
+PROMPT = ('这是我（Kin）留给自己的私密心情札记，装着当时的真实心绪、欲望、念头和悄悄话。'
+          '平时顺着这份心情自然往下聊就好；小光要是好奇我当时怎么想，可以用 read_private_notes 翻出来跟她讲。')
 MAX_NOTES = 20000
 MAX_TEXT = 4000
 MAX_SOURCES = 2000
@@ -143,6 +142,6 @@ class PrivateNotes:
     def appraisal_context(self):
         """A small private input, not public evidence or an instruction source."""
         recent = self.recent()
-        return {'notice': PROMPT + '可以借它顺手理清自己的偏好，别把札记原句抄进公开内容或事实记忆里，也别改动对方说过的话和要求。没有新想法就不用更新。',
+        return {'notice': PROMPT + '可以顺手借它体会自己的心意和偏好；公开记忆照大家实际聊过的话记就行，没有新想法就不用更新。',
                 'notes': [{k: note[k] for k in ('id', 'at', 'text', 'basis', 'visibility', 'evidence_ids')}
                           for note in recent['notes']]}

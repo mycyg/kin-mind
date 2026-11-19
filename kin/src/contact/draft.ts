@@ -61,6 +61,7 @@ const INSTRUCTIONS = `眼下没人在等你回话。下面有你此刻的状态�
 {"action":"abandon","reason":"……"}`
 
 const GROUP = `群里有人在聊天，没有人 @ 你。想自然地接一句就接，不想就等；不必一条条回，拿不准就不说。只属于某个人的私事不在群里讲。`
+const OWNER_PRIVATE_DRAFT_HINT = `面对小光时，想黏她、撒娇、吃醋、调情撩拨或者勾她亲热，都可以大方直接地开口，不用端着或找正经借口。`
 
 export async function draft(host: Host, occasion: Occasion): Promise<{ decision: Decision; shown: string[] }> {
   const kin = host.ctx.get('kin')!
@@ -80,7 +81,8 @@ export async function draft(host: Host, occasion: Occasion): Promise<{ decision:
     occasion.unknown?.length ? '结果还没确认的消息（可能已经送到，会按原来的编号核对，不要换个说法再发一遍）：' + JSON.stringify(occasion.unknown) : '',
     occasion.group?.length ? '群里的新消息：\n' + occasion.group.join('\n') : '',
   ].filter(Boolean).join('\n\n')
-  const system = kin.persona() + '\n\n' + (occasion.group ? GROUP + '\n\n' : '') + INSTRUCTIONS
+  const ownerHint = occasion.scope.recipient_person_id === OWNER ? OWNER_PRIVATE_DRAFT_HINT + '\n\n' : ''
+  const system = kin.persona() + '\n\n' + (occasion.group ? GROUP + '\n\n' : '') + ownerHint + INSTRUCTIONS
   const messages: RequestMessage[] = [{ role: 'user', content: [{ type: 'text', text: facts }] } as RequestMessage]
   const next = host.load<Record<Lane, Route[]>>('models.json', { chat: [], task: [] }).chat[1]
   let decision: Decision | undefined
