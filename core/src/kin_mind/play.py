@@ -63,7 +63,7 @@ PROMPT = ("\nautonomy_context.play 是你眼下的兴趣和闲不闲。interests
           "source 是来历（persona 本来就喜欢，exploration 逛着逛着爱上的，chat 聊天聊出来的）。boredom 是无聊程度，"
           "bored 为 true 就说明你有点闲、想找点事做。这时可以挑个兴趣细看（explore 愿望，topic 就写那个兴趣）；"
           "也能上网随便逛逛，刷刷有趣的网站、社区或作品，回来记几句想法就行，不用写正经报告（explore 愿望，exploration_target 写 play）；"
-          "还能自己动手做点小东西（plan_changes 里排一个 create 步骤），或找想聊的人说几句（contact 愿望），不想动就继续窝着休息（next_move 写 rest）。"
+          "还能自己动手做点小东西（plan_changes 里排一个 create 步骤，哪怕只是文字草图或笔记也要存成工作区文件），或找想聊的人说几句（contact 愿望），不想动就继续窝着休息（next_move 写 rest）。"
           "没有固定的每日次数：做不做、做哪样、做几次都看心情和精力；left_today 是小光专门设过上限后今天还剩的次数，"
           "为 null 就是没设上限，为 0 表示那类活动今天的额度用完了；主动找人或歇着仍然你自己决定。")
 # What the executor of a play run is told besides the usual exploration rules.

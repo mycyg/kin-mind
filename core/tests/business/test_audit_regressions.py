@@ -7,12 +7,17 @@ from eventmem.core import Engine
 from eventmem.core.db import Conflict, Missing, dumps
 from eventmem.core.models import RecordInput, Scope, SourceInput
 
+from kin_mind import play
 from kin_mind.actions import ActionEvents
+from kin_mind.autonomy_models import PlanStep
 from kin_mind.companion_view import CompanionView, companion_scope
 from kin_mind.corrections import correct
+from kin_mind.creation import accept_result
 from kin_mind.evidence_classes import owner_statement
 from kin_mind.mcp import register_mind_tools
+from kin_mind.memory import MemoryContinuity
 from kin_mind.memory_items import Items
+from kin_mind.plans import AutonomousPlans
 from kin_mind.private_notes import PrivateNotes
 from kin_mind.reinforcement import strengths
 from kin_mind.sharing import ShareLedger
@@ -266,3 +271,64 @@ def test_memory_items_drops_classified_missing_without_hiding_unknown_target(tmp
                     if go:
                         raise Missing("person:person_a")
             unknown_items.run(apply_unknown)
+
+
+def test_create_step_guidance_and_empty_artifacts_reason(tmp_path):
+    assert "文件" in PlanStep.model_json_schema()["properties"]["actor"]["description"]
+    assert "存成工作区文件" in play.PROMPT
+
+    mind, receive, _ = _setup(tmp_path)
+    MemoryContinuity(mind).configure({
+        "records": True,
+        "semantic_actions": True,
+        "autonomous_plans": True,
+        "creative_execution": True,
+    })
+    ev_src = receive("sketch-idea", "Draw a synthetic text sketch")
+    plans = AutonomousPlans(mind)
+    plan = plans.manage({
+        "command_id": "create:sketch",
+        "action": "create",
+        "key": "synthetic-sketch",
+        "goal": "Create a small text sketch",
+        "motivation": "Synthetic creative test",
+        "reason": "Sourced idea",
+        "evidence_ids": [ev_src],
+        "steps": [{
+            "id": "make",
+            "actor": "create",
+            "goal": "Write sketch.txt in workspace",
+            "completion": "Non-empty file created",
+        }],
+    })
+    with mind.engine.db.connect(write=True) as conn:
+        refs = mind._evidence(conn, [ev_src])
+        plans.decide(
+            conn,
+            {
+                "plan_id": plan["id"],
+                "step_id": "make",
+                "expected_revision": plan["revision"],
+                "action": "execute",
+                "reason": "Execute now",
+                "evidence_ids": [ev_src],
+            },
+            "decision:exec:1",
+            {"provider": "deepseek", "reasoning": "high", "agent_version": "synthetic-v1"},
+            refs,
+        )
+    claimed = plans.claim("create", "worker")
+    assert claimed["state"] == "claimed"
+    run = claimed["run"]
+    settled = accept_result(
+        mind,
+        {"creation_directory": str(tmp_path), "agent_version": "synthetic-v1"},
+        {
+            "run_id": run["id"],
+            "owner": "worker",
+            "fence": run["fence"],
+            "result": {"state": "failed", "reason": "empty-artifacts", "receipt": {"workspace": str(tmp_path)}},
+        },
+    )
+    assert settled["state"] == "failed"
+    assert settled["result"]["reason"] == "empty-artifacts"

@@ -1,3 +1,8 @@
+## 2026-11-19 — Require workspace files for creation steps and report empty artifacts clearly
+
+- Clarify in `PlanStep`, play guidance and the creator brief/schema that `create` steps always write at least one non-empty file inside their isolated workspace, even for plain-text sketches or notes.
+- Report `empty-artifacts` instead of a generic `invalid-result-shape` when a completed creator run returns an empty `artifacts` list.
+
 ## 2026-11-18 — Audit fixes across memory, channels, health and prompt tone
 
 - Chunk SQLite `IN` queries in `reinforcement.strengths()` so daily temperature runs scale past 32,766 records; surface `last_temperature_run` and unrecovered background job failures in lifecycle health checks.

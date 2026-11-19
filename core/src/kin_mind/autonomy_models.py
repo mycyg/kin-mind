@@ -10,7 +10,9 @@ from .companions import Recipient
 
 class PlanStep(Model):
     id: str = Field(min_length=1, max_length=100)
-    actor: Literal["explore", "create", "contact", "owner"]
+    actor: Literal["explore", "create", "contact", "owner"] = Field(
+        description="create 步骤由隔离工作区子代理执行，必须产出至少 1 个非空工作区文件（纯文字草稿也须写成 .md/.txt），不要在 goal 里写不写文件。"
+    )
     goal: str = Field(min_length=1)
     completion: str = Field(min_length=1)
     depends_on: list[str] = Field(default_factory=list, max_length=24)

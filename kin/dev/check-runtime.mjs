@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { build } from 'esbuild'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
-import { rmSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const output = root + '/kin/.regression'
@@ -13,6 +14,7 @@ await build({
     root + '/kin/src/model-output.ts',
     root + '/kin/src/model-budget.ts',
     root + '/kin/src/health/checks.ts',
+    root + '/kin/src/steward/create.ts',
   ],
   outdir: output, format: 'esm', platform: 'node', bundle: true, packages: 'external',
 })
@@ -22,6 +24,7 @@ try {
   const { modelOutput, answerText } = await import(output + '/model-output.js')
   const { requestThreshold } = await import(output + '/model-budget.js')
   const { watch } = await import(output + '/health/checks.js')
+  const { CREATION_SCHEMA, inspectCreationOutput } = await import(output + '/steward/create.js')
   const expected = '你好呀\n\n今天过得怎么样？'
   const envelopes = [
     '🧠\nPrivate test reasoning.\n🪒' + expected,
@@ -159,7 +162,24 @@ try {
   })
   assert.equal(fallbackFindings.find(f => f.key === 'model:chat')?.level, 'warn')
 
-  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated; budget thresholds & health route checks verified')
+  // Creator schema complies with DSH object-root subset and classifies empty artifacts distinctly.
+  assertObjectJsonSchema(CREATION_SCHEMA)
+  const ws = join(output, 'creator-ws')
+  mkdirSync(ws, { recursive: true })
+  writeFileSync(join(ws, 'sketch.txt'), '..\n##\n')
+  assert.deepEqual(
+    inspectCreationOutput({ summary: 'text only', artifacts: [], verification: [], remaining: [] }, ws, 'r1', {}),
+    { ok: false, reason: 'empty-artifacts' },
+  )
+  assert.deepEqual(
+    inspectCreationOutput({ artifacts: ['sketch.txt'] }, ws, 'r1', {}),
+    { ok: false, reason: 'invalid-result-shape' },
+  )
+  const validCreated = inspectCreationOutput({ summary: 'cat sketch', artifacts: ['sketch.txt'], verification: [], remaining: [] }, ws, 'r1', {})
+  assert.equal(validCreated.ok, true)
+  assert.equal(validCreated.result.artifacts[0].relative, 'sketch.txt')
+
+  console.log('PASS: fallback before usable output; abandoned reasoning discarded; Core moment retained and deduplicated; budget thresholds, health route & creation schema checks verified')
 } finally {
   rmSync(output, { recursive: true, force: true })
 }
