@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import math
 import os
 import re
 import secrets
@@ -18,6 +19,10 @@ from .providers import ProviderError
 
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
 MODEL_REVISION = "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+QUERY_INSTRUCTION = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+RERANKER_REVISION = "e61197ed45024b0ed8a2d74b80b4d909f1255473"
+RERANK_INSTRUCTION = "Given a message in an ongoing personal conversation, retrieve memory passages that are directly relevant and helpful for replying"
 # The index a vector belongs to is named partly by its preprocessing label; a label that names
 # a Qwen3 revision must name this one, or vectors of two models would share an index (E2-13).
 REVISION_MARK = MODEL_REVISION[:8]
@@ -179,14 +184,14 @@ def ensure_started(root, endpoint, model):
             raise LocalEmbeddingUnavailable("Local embedding service did not become ready within 30 s")
 
 
-def create_app(root, loader=None):
+def create_app(root, loader=None, rerank_loader=None):
     from fastapi import FastAPI, Header, HTTPException
     from pydantic import BaseModel, Field
 
     app = FastAPI()
     token(root)
     guard = threading.Lock()
-    state = {"model": None}
+    state = {"model": None, "reranker": None}
     from .integrity import loaded_revision
 
     source = {"root": str(Path(__file__).resolve().parents[2]), "revision": loaded_revision()}
@@ -198,33 +203,29 @@ def create_app(root, loader=None):
         if not secrets.compare_digest((value or "").encode(), expected):
             raise HTTPException(401, "Authentication required")
 
-    def load():
+    def cached_dir(repo_id, revision, required):
         # The model comes from the local cache only; a service never downloads it (E2-13).
         os.environ["HF_HUB_OFFLINE"] = "1"
-        import torch
         from huggingface_hub import snapshot_download
         from huggingface_hub.errors import LocalEntryNotFoundError
-        from sentence_transformers import SentenceTransformer
 
-        model_path = MODEL
         try:
-            cached = Path(
-                snapshot_download(MODEL, revision=MODEL_REVISION, local_files_only=True)
-            )
-            required = (
-                "model.safetensors",
-                "config.json",
-                "modules.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "1_Pooling/config.json",
-            )
+            cached = Path(snapshot_download(repo_id, revision=revision, local_files_only=True))
             if all((cached / name).is_file() for name in required):
-                model_path = str(cached)
+                return str(cached)
         except LocalEntryNotFoundError:
             pass
-        if model_path == MODEL:
-            raise RuntimeError("Qwen3-Embedding-0.6B at the pinned revision is not complete in the local cache")
+        raise RuntimeError(f"{repo_id} at the pinned revision is not complete in the local cache")
+
+    def load():
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        model_path = cached_dir(
+            MODEL,
+            MODEL_REVISION,
+            ("model.safetensors", "config.json", "modules.json", "tokenizer.json", "tokenizer_config.json", "1_Pooling/config.json"),
+        )
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         model = SentenceTransformer(
             model_path,
@@ -236,10 +237,37 @@ def create_app(root, loader=None):
         model.max_seq_length = 8192
         return model
 
+    def load_reranker():
+        import torch
+        from sentence_transformers import CrossEncoder
+
+        model_path = cached_dir(
+            RERANKER_MODEL,
+            RERANKER_REVISION,
+            ("model.safetensors", "config.json", "modules.json", "tokenizer.json", "tokenizer_config.json", "1_LogitScore/config.json"),
+        )
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        return CrossEncoder(
+            model_path,
+            revision=RERANKER_REVISION,
+            device=device,
+            local_files_only=True,
+            max_length=1024,
+            model_kwargs={"dtype": torch.float16} if device == "mps" else {},
+        )
+
     class Input(BaseModel):
         model: str
         input: str | list[str]
         dimensions: int = Field(default=1024, ge=32, le=1024)
+        input_type: str | None = None
+        input_types: list[str] | None = None
+
+    class RerankInput(BaseModel):
+        model: str = RERANKER_MODEL
+        query: str
+        documents: list[str]
+        instruction: str | None = None
 
     @app.get("/health")
     def health(authorization: str | None = Header(default=None)):
@@ -249,6 +277,8 @@ def create_app(root, loader=None):
             "loaded": state["model"] is not None,
             "model": MODEL,
             "model_revision": MODEL_REVISION,
+            "reranker_loaded": state["reranker"] is not None,
+            "reranker_model": RERANKER_MODEL,
             "pid": os.getpid(),
             "source": source,
         }
@@ -267,6 +297,14 @@ def create_app(root, loader=None):
             raise HTTPException(
                 400, "Expected 1-16 nonempty texts of at most 1000000 characters"
             )
+        if request.input_types is not None:
+            if len(request.input_types) != len(texts):
+                raise HTTPException(400, "input_types length must match input")
+            encoded_texts = [QUERY_INSTRUCTION + text if kind == "query" else text for text, kind in zip(texts, request.input_types)]
+        elif request.input_type == "query":
+            encoded_texts = [QUERY_INSTRUCTION + text for text in texts]
+        else:
+            encoded_texts = texts
         # Only one load/inference touches the model at once; MPS allocation is
         # bounded. A failure discards the model so the next retry can reload it.
         with guard:
@@ -274,8 +312,8 @@ def create_app(root, loader=None):
                 if state["model"] is None:
                     state["model"] = (loader or load)()
                 vectors = state["model"].encode(
-                    texts,
-                    batch_size=1,
+                    encoded_texts,
+                    batch_size=min(16, len(encoded_texts)),
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
@@ -299,6 +337,48 @@ def create_app(root, loader=None):
                 # Do not send document text, provider URLs or exception bodies.
                 raise HTTPException(
                     503, "Local embedding model unavailable: " + type(exc).__name__
+                ) from None
+
+    @app.post("/v1/rerank")
+    def rerank(request: RerankInput, authorization: str | None = Header(default=None)):
+        authorize(authorization)
+        if request.model != RERANKER_MODEL:
+            raise HTTPException(400, "Unsupported reranker model")
+        if not request.query.strip() or len(request.query) > 4000:
+            raise HTTPException(400, "Expected nonempty query of at most 4000 characters")
+        if (
+            not request.documents
+            or len(request.documents) > 16
+            or any(not doc.strip() or len(doc) > 16000 for doc in request.documents)
+        ):
+            raise HTTPException(400, "Expected 1-16 nonempty documents of at most 16000 characters")
+        with guard:
+            try:
+                if state["reranker"] is None:
+                    state["reranker"] = (rerank_loader or load_reranker)()
+                pairs = [(request.query, doc) for doc in request.documents]
+                raw = state["reranker"].predict(
+                    pairs,
+                    prompt=request.instruction or RERANK_INSTRUCTION,
+                    batch_size=min(8, len(pairs)),
+                    show_progress_bar=False,
+                )
+                scores = [float(x) for x in raw]
+                if len(scores) != len(pairs) or any(not math.isfinite(s) for s in scores):
+                    raise ValueError("Invalid rerank score")
+                probs = [1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, s)))) for s in scores]
+                return {
+                    "object": "list",
+                    "model": RERANKER_MODEL,
+                    "results": [
+                        {"index": i, "relevance_score": round(prob, 6)}
+                        for i, prob in enumerate(probs)
+                    ],
+                }
+            except Exception as exc:  # noqa: BLE001 - sanitize inference failures and reset model
+                state["reranker"] = None
+                raise HTTPException(
+                    503, "Local reranker model unavailable: " + type(exc).__name__
                 ) from None
 
     return app

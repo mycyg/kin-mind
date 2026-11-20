@@ -502,3 +502,135 @@ def test_association_is_one_neighbour_one_hop_and_passes_the_gate_like_any_item(
     shown = {entry["id"] for entry in packed["index"]}
     assert (neighbours[0] in shown) == (scores[neighbours[0]] >= .6)
     assert node["walk"] in shown and node["far"] not in shown
+
+
+def test_two_stage_reranker_scores_and_gracefully_falls_back(system, monkeypatch):
+    mind, memory, source, _, sources, records = system
+
+    class HybridTransport:
+        def __init__(self):
+            self.rerank_fail = False
+            self.rerank_calls = 0
+
+        def __call__(self, *args, **kwargs):
+            parent = self
+
+            class Client:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def post(self, url, headers=None, json=None, **kwargs):
+                    if url.endswith("/rerank"):
+                        parent.rerank_calls += 1
+                        if parent.rerank_fail:
+                            return httpx.Response(503, json={"detail": "unavailable"})
+                        results = []
+                        for i, doc in enumerate(json["documents"]):
+                            prob = 0.91 if "cat" in doc else 0.15
+                            results.append({"index": i, "relevance_score": prob})
+                        return httpx.Response(200, json={"results": results})
+                    return httpx.Response(200, json={"data": [{"index": i, "embedding": vector(t)} for i, t in enumerate(json["input"])]})
+
+            return Client()
+
+    transport = HybridTransport()
+    monkeypatch.setattr(providers.httpx, "Client", transport)
+    admission(memory, "on", recall_reranker=True, recall_rerank_threshold=0.7)
+    packed = build(mind, automatic=True)
+    assert recall_ids(packed, records) == {"cat"}
+    row = observations(mind)[-1]
+    assert row["threshold"] == 0.7 and row["timings"]["reranked"] == 3 and transport.rerank_calls == 1
+
+    transport.rerank_fail = True
+    fallback = build(mind, automatic=True)
+    assert recall_ids(fallback, records) == {"planned", "lantern"}
+    row_fb = observations(mind)[-1]
+    assert row_fb["timings"]["rerank_fallback"] == "rerank:ProviderError"
+
+
+def test_light_mode_uses_vector_index_for_semantic_recall(tmp_path, monkeypatch):
+    pytest.importorskip("lancedb")
+    from eventmem.core import vectors
+
+    clock = [datetime(2026, 9, 20, 4, tzinfo=timezone.utc)]
+    engine = Engine(tmp_path / "db")
+    mind = Mind(engine, SCOPE, clock=lambda: clock[0].isoformat(timespec="microseconds"))
+    memory = MemoryContinuity(mind)
+    init = engine.receive(SourceInput(namespace="synthetic", key="init", text="fixture init", scope=SCOPE,
+                                      authority="explicit", occurred_at=mind.clock(), extract=False))["id"]
+    mind.initialize(agent_version="fixture-v1", evidence_ids=[init])
+    memory.configure({"records": True, "context": True, "manifests": True, "recall_admission": "on",
+                      "recall_admission_threshold": 0.6})
+    # Target has zero lexical overlap with query "weekend sea breeze".
+    sea_sid = engine.receive(SourceInput(namespace="kin-owner-input", key="coast", text="Sunday waves on the coast",
+                                         scope=SCOPE, authority="explicit", occurred_at=mind.clock(), extract=False,
+                                         metadata={"role": "user", "host_event": "message"}))["id"]
+    sea_rid = engine.source(sea_sid)["record_ids"][0]
+    engine.settings("models", {"embedding": {"endpoint": "http://127.0.0.1:8321/v1", "model": local_embedding.MODEL,
+                                             "local_embedding": True, "dimensions": 4, "preprocessing": f"qwen3-{local_embedding.REVISION_MARK}-test"}})
+    (engine.db.root / "embedding-token").write_text("synthetic-token")
+    idx_id = vectors.VectorIndex.register(engine, local_embedding.MODEL, 4, f"qwen3-{local_embedding.REVISION_MARK}-test")
+    idx = vectors.VectorIndex(engine, idx_id)
+    idx.upsert([{"id": sea_rid, "scope": SCOPE.key(), "revision": 1, "vector": [1.0, 0.0, 0.0, 0.0]}])
+    idx.build()
+
+    query_embeds = 0
+
+    class ClientFactory:
+        def __call__(self, *args, **kwargs):
+            class Client:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def post(self, url, headers=None, json=None, **kwargs):
+                    nonlocal query_embeds
+                    if "input_types" in json or json.get("input_type") == "query":
+                        query_embeds += 1
+                    data = [{"index": i, "embedding": [1.0, 0.0, 0.0, 0.0] if ("waves" in t or "breeze" in t) else [0.0, 1.0, 0.0, 0.0]}
+                            for i, t in enumerate(json["input"])]
+                    return httpx.Response(200, json={"data": data})
+
+            return Client()
+
+    monkeypatch.setattr(local_embedding, "ensure_started", lambda *a, **k: "synthetic-token")
+    monkeypatch.setattr(providers.httpx, "Client", ClientFactory())
+    packed = Contexts(mind).build("weekend sea breeze", purpose="chat", mode="light", automatic=True)
+    assert sea_rid in {e["id"] for e in packed["index"]}
+    assert "Sunday waves on the coast" in packed["rendered_text"]
+    assert query_embeds == 1
+
+
+def test_concern_and_trait_revisions_do_not_reinject_when_global_state_ticks(system):
+    mind, memory, source, service, sources, records = system
+    memory.configure({"manifests": True, "recall_admission": "on", "recall_admission_threshold": 0.6})
+    with mind.engine.db.connect(write=True) as conn:
+        refs = mind._evidence(conn, [sources["planned"]])
+        state = mind._load(conn)
+        state.setdefault("concerns", {})["c-match"] = {
+            "id": "c-match", "status": "active", "kind": "care", "topic": "harbour",
+            "content": "thinking of the harbour", "basis": "inferred", "evidence": refs, "intensity": 60, "revision": 2,
+        }
+        state["concerns"]["c-unrelated"] = {
+            "id": "c-unrelated", "status": "active", "kind": "care", "topic": "tax",
+            "content": "unrelated errand", "basis": "inferred", "evidence": refs, "intensity": 90, "revision": 1,
+        }
+        mind._save(conn, state)
+
+    first = Contexts(mind).build(QUERY, purpose="chat", session="s-rev", event_id="t1", automatic=True)
+    first_ids = {e["id"] for e in first["index"]}
+    assert "c-match" in first_ids and "c-unrelated" not in first_ids
+
+    with mind.engine.db.connect(write=True) as conn:
+        state = mind._load(conn)
+        state["revision"] += 5
+        mind._save(conn, state)
+
+    second = Contexts(mind).build(QUERY, purpose="chat", session="s-rev", event_id="t2", automatic=True)
+    second_ids = {e["id"] for e in second["index"]}
+    assert "c-match" not in second_ids and "c-unrelated" not in second_ids

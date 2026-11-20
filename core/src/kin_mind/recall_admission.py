@@ -53,10 +53,12 @@ PURPOSES = frozenset({"chat", "proactive"})
 EXEMPT_ROUTES = frozenset({"constraint", "exact", "pinned"})
 # How many candidates of each route are scored at most, in the order the lane found them. One
 # beyond is dropped as `pool`: never scored, never admitted.
-POOL = {"lexical": 10, "graph": 6, "neighbor": 1, "work": 3, "share": 5, "deep": 40}
+POOL = {"lexical": 12, "graph": 8, "neighbor": 1, "work": 3, "share": 5, "deep": 40}
 DEFAULT_THRESHOLD = 0.55
+DEFAULT_RERANK_THRESHOLD = 0.5
 DEFAULT_QUOTA = 4
 DEFAULT_TIMEOUT_MS = 3000
+TOP_RERANK = 8
 QUOTA_RANGE = (1, 16)
 TIMEOUT_RANGE = (200, 20000)
 OBSERVATIONS_KEPT = 500
@@ -129,6 +131,9 @@ def settings_valid(config):
     threshold = config.get("recall_admission_threshold", DEFAULT_THRESHOLD)
     if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
         raise ValueError("recall_admission_threshold is a number from 0 to 1")
+    rerank_threshold = config.get("recall_rerank_threshold", DEFAULT_RERANK_THRESHOLD)
+    if type(rerank_threshold) not in (int, float) or not 0 <= rerank_threshold <= 1:
+        raise ValueError("recall_rerank_threshold is a number from 0 to 1")
     quota = config.get("recall_admission_quota", DEFAULT_QUOTA)
     if type(quota) is not int or not QUOTA_RANGE[0] <= quota <= QUOTA_RANGE[1]:
         raise ValueError(f"recall_admission_quota is a whole number, {QUOTA_RANGE[0]}..{QUOTA_RANGE[1]}")
@@ -206,7 +211,10 @@ def embed(engine, scope, entries, deadline):
             raise Unavailable("deadline")
 
         def call(page=page, remaining=remaining):
+            types = ["query" if entries[i][0] in (None, "query") else "document" for i in page]
             payload = {"model": config.model, "input": [entries[i][1] for i in page]}
+            if "query" in types:
+                payload["input_types"] = types
             if config.dimensions:
                 payload["dimensions"] = config.dimensions
             return Providers(engine, timeout=remaining).request("embedding", "embeddings", json_=payload)
@@ -222,6 +230,81 @@ def embed(engine, scope, entries, deadline):
         for index, row in zip(page, rows):
             out[index] = array("f", row["embedding"])
     return out, len(missing)
+
+
+def _active_vector_index(engine, config):
+    import sqlite3
+
+    try:
+        with engine.db.connect() as conn:
+            rows = conn.execute("SELECT id, data FROM vector_indexes").fetchall()
+    except sqlite3.OperationalError:
+        return None
+    for row in rows:
+        meta = json.loads(row[1])
+        if meta.get("state") == "ready" and (meta.get("rows") or 0) > 0 and meta.get("model") == config.model:
+            if not config.dimensions or meta.get("dimensions") == config.dimensions:
+                return row[0]
+    return None
+
+
+def embed_query(engine, scope, query, deadline):
+    """Query vector paired with a populated local vector index, or None if no local index has rows."""
+    from eventmem.core.db import recording
+    from eventmem.core.providers import NotConfigured, Providers
+
+    if not recording() or not (query or "").strip():
+        return None
+    try:
+        config = Providers(engine).role("embedding")
+    except NotConfigured:
+        return None
+    if not config.local_embedding:
+        return None
+    index_id = _active_vector_index(engine, config)
+    if not index_id:
+        return None
+    vectors, _ = embed(engine, scope, [(None, query[:QUERY_CHARS])], deadline)
+    return list(vectors[0]), index_id
+
+
+def rerank(engine, query, documents, deadline):
+    """Cross-encoder relevance probabilities from the local reranker endpoint."""
+    from eventmem.core.db import recording
+    from eventmem.core.local_embedding import RERANKER_MODEL
+    from eventmem.core.providers import NotConfigured, Providers
+
+    from .adaptive_recall import bounded
+
+    if not recording():
+        raise Unavailable("session-required")
+    try:
+        config = Providers(engine).role("embedding")
+    except NotConfigured:
+        raise Unavailable("reranker-not-configured") from None
+    if not config.local_embedding:
+        raise Unavailable("reranker-not-local")
+    remaining = deadline - time.monotonic()
+    if remaining <= .05:
+        raise Unavailable("deadline")
+
+    def call(remaining=remaining):
+        return Providers(engine, timeout=remaining).request(
+            "embedding",
+            "rerank",
+            json_={"model": RERANKER_MODEL, "query": query[:QUERY_CHARS], "documents": documents},
+        )
+
+    try:
+        response = bounded(call, remaining)
+    except TimeoutError as error:
+        raise Unavailable("capacity" if "capacity" in str(error) else "deadline") from None
+    except Exception as error:  # noqa: BLE001 - a code, never the provider's body
+        raise Unavailable("rerank:" + type(error).__name__) from None
+    rows = sorted(response.get("results") or [], key=lambda r: r.get("index", 0))
+    if len(rows) != len(documents):
+        raise Unavailable("rerank-incomplete")
+    return [float(row["relevance_score"]) for row in rows]
 
 
 # --- the decision -----------------------------------------------------------------------------------
@@ -278,7 +361,7 @@ class Admission:
         self.contexts, self.mind, self.engine = contexts, contexts.mind, contexts.engine
         ensure(self.engine)
 
-    def run(self, query, candidates, *, settings, seen, deep=None, notes=None, record=True):
+    def run(self, query, candidates, *, settings, seen, deep=None, notes=None, record=True, query_vector=None):
         """Score the candidates and decide. Returns the decision and its observation."""
         started = time.monotonic()
         threshold = float(settings.get("recall_admission_threshold", DEFAULT_THRESHOLD))
@@ -292,7 +375,7 @@ class Admission:
             (scored if pool_counts[route] <= POOL.get(route, 0) else beyond).append((item, route))
         beyond_ids = {item["id"] for item, _ in beyond}
         kept = [(item, route) for item, route in candidates if item["id"] not in beyond_ids]
-        scores, state, embedded, cached = {}, "scored", 0, 0
+        scores, state, embedded, cached, reranked, rerank_fallback = {}, "scored", 0, 0, 0, None
         selected = None
         if deep is not None:
             selected = deep.get("selected") if deep.get("state") == "ranked" else None
@@ -307,15 +390,60 @@ class Admission:
                     if not record:
                         # A look asks no model, not even for an embedding (CR3-MM-04).
                         raise Unavailable("session-required")
-                    vectors, embedded = embed(self.engine, self.mind.scope.key(), [entries[i] for i in usable],
-                                              time.monotonic() + timeout)
-                    cached = len(usable) - embedded
-                    by_index = dict(zip(usable, vectors))
+                    if query_vector is not None:
+                        if 0 not in usable:
+                            raise Unavailable("empty-query")
+                        by_index = {0: array("f", query_vector)}
+                        cand_indices = [index for index in usable if index > 0]
+                        if cand_indices:
+                            vectors, emb_cand = embed(
+                                self.engine, self.mind.scope.key(), [entries[i] for i in cand_indices],
+                                time.monotonic() + timeout,
+                            )
+                            for index, vec in zip(cand_indices, vectors):
+                                by_index[index] = vec
+                            embedded = emb_cand + 1
+                        else:
+                            embedded = 1
+                        cached = 0
+                    else:
+                        vectors, embedded = embed(self.engine, self.mind.scope.key(), [entries[i] for i in usable],
+                                                  time.monotonic() + timeout)
+                        cached = len(usable) - embedded
+                        by_index = dict(zip(usable, vectors))
                     if 0 not in by_index:
                         raise Unavailable("empty-query")
                     for index, (item, _) in enumerate(scored, start=1):
                         if index in by_index:
                             scores[item["id"]] = round(_cosine(by_index[0], by_index[index]), 4)
+                    if settings.get("recall_reranker") and deep is None and scores and state == "scored":
+                        prefloor = min(0.38, threshold * 0.7)
+                        text_by_id = {entries[i][0]: entries[i][1] for i in usable if i > 0}
+                        top_items = [
+                            it for it, _ in sorted(
+                                ((it, rt) for it, rt in scored if scores.get(it["id"], 0.0) >= prefloor and it["id"] in text_by_id),
+                                key=lambda pair: -scores[pair[0]["id"]],
+                            )[:TOP_RERANK]
+                        ]
+                        if top_items:
+                            if (started + timeout) - time.monotonic() < 0.2:
+                                rerank_fallback = "deadline"
+                            else:
+                                try:
+                                    r_scores = rerank(
+                                        self.engine, query, [text_by_id[it["id"]] for it in top_items], started + timeout,
+                                    )
+                                    r_thresh = float(settings.get("recall_rerank_threshold", DEFAULT_RERANK_THRESHOLD))
+                                    cap = max(0.0, round(r_thresh - 0.0001, 4))
+                                    for item_id in list(scores):
+                                        if scores[item_id] >= r_thresh:
+                                            scores[item_id] = min(scores[item_id], cap)
+                                    for it, r_score in zip(top_items, r_scores):
+                                        scores[it["id"]] = round(r_score, 4)
+                                    threshold = r_thresh
+                                    reranked = len(top_items)
+                                except Unavailable as err:
+                                    rerank_fallback = str(err)
                 except Unavailable as error:
                     # The deep ranking's selection still stands for its own items; the rest go unscored.
                     scores, state = {}, ("ranked:" if state == "ranked" else "unavailable:") + str(error)
@@ -336,7 +464,9 @@ class Admission:
             "exempt": [item["id"] for item in exempt],
             "dropped": [{"id": identifier, "reason": reason} for identifier, reason in dropped],
             "timings": {"score_ms": round((time.monotonic() - started) * 1000, 1), "scored": len(scores),
-                        "embedded": embedded, "cached": cached},
+                        "embedded": embedded, "cached": cached,
+                        **({"reranked": reranked} if reranked else {}),
+                        **({"rerank_fallback": rerank_fallback} if rerank_fallback else {})},
         }
         # Nothing went in because nothing could be scored: the context says so, in one line.
         unscored = (not admitted and state.split(":")[0] in {"unavailable", "no_query"}

@@ -158,7 +158,7 @@ export const name = 'kin'
 export const inject = ['connection', 'llm', 'workspaceRegistry']
 
 /** The inner-life switches the settings page offers; each is a Core memory setting. */
-const FEATURES = ['dreams', 'diary_replies', 'sealed_entries', 'anniversaries', 'window_notes'] as const
+const FEATURES = ['dreams', 'diary_replies', 'sealed_entries', 'anniversaries', 'window_notes', 'recall_admission'] as const
 
 export function apply(ctx: Context, config: Config) {
   const log = (message: string) => ctx.logger('kin').info(message)
@@ -505,10 +505,10 @@ export function apply(ctx: Context, config: Config) {
         mind.call('read', { projection: 'settings' }),
         getCatalog(refresh),
       ])
-      const settings = (read.memory?.settings ?? {}) as Record<string, boolean>
+      const settings = (read.memory?.settings ?? {}) as Record<string, unknown>
       return {
         persona: personaText(persona),
-        features: Object.fromEntries(FEATURES.map((key) => [key, settings[key] === true])),
+        features: Object.fromEntries(FEATURES.map((key) => [key, key === 'recall_admission' ? settings[key] === 'on' : settings[key] === true])),
         models: {
           budget: {
             inputWindow: CONTEXT_WINDOW, compactAt: Math.floor(CONTEXT_WINDOW * PRESSURE_RATIO),
@@ -541,8 +541,20 @@ export function apply(ctx: Context, config: Config) {
   route('/api/kin/features', {
     POST: async (request) => {
       const changes = await body<Record<string, boolean>>(request)
-      const allowed = Object.fromEntries(Object.entries(changes)
-        .filter(([key, value]) => (FEATURES as readonly string[]).includes(key) && typeof value === 'boolean'))
+      const allowed: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(changes)) {
+        if (!(FEATURES as readonly string[]).includes(key) || typeof value !== 'boolean') continue
+        if (key === 'recall_admission') {
+          allowed.recall_admission = value ? 'on' : 'off'
+          if (value) {
+            allowed.recall_reranker = true
+            allowed.recall_quiet_marks = true
+            allowed.context_usage_hint = true
+          }
+        } else {
+          allowed[key] = value
+        }
+      }
       await mind.call('configure-memory', allowed)
       return { saved: true }
     },

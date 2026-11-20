@@ -34,6 +34,7 @@ const FEATURES: { key: Feature; title: string; hint: string }[] = [
   { key: 'sealed_entries', title: '时光信与暗房', hint: '写一封到某天才能拆的信；她也能把日记锁到某天' },
   { key: 'anniversaries', title: '记得纪念日', hint: '记得你们之间重要的日子' },
   { key: 'window_notes', title: '这一段的我们', hint: '一段聊天过去后，她给这一段写个小记' },
+  { key: 'recall_admission', title: '记忆精准把关', hint: '用本地向量与精排模型筛掉不沾边的旧事，每轮只带最相关的几条' },
 ]
 
 export function Settings() {

@@ -215,7 +215,7 @@ export interface Settings {
   }
   dataDir: string
 }
-export type Feature = 'dreams' | 'diary_replies' | 'sealed_entries' | 'anniversaries' | 'window_notes'
+export type Feature = 'dreams' | 'diary_replies' | 'sealed_entries' | 'anniversaries' | 'window_notes' | 'recall_admission'
 
 /** Concerns and wishes that are still with her. */
 export const openConcern = (concern: Concern) => !['resolved', 'archived'].includes(concern.status ?? '')

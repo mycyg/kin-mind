@@ -149,7 +149,7 @@ class Providers:
                 headers["x-api-key"] = os.environ[config.api_key_env]
         local = config.local_embedding
         if local:
-            if role != "embedding" or route != "embeddings":
+            if role != "embedding" or route not in {"embeddings", "rerank"}:
                 raise ValueError("Local wake-up is only available for embeddings")
             from .local_embedding import check_endpoint, check_preprocessing, ensure_started, token
 
@@ -340,7 +340,7 @@ class Providers:
         )
         return json_object(response["choices"][0]["message"]["content"])
 
-    def embed(self, texts, role="embedding"):
+    def embed(self, texts, role="embedding", *, input_type=None):
         config = self.role(role)
         if config.protocol != "openai":
             raise NotConfigured(
@@ -349,6 +349,8 @@ class Providers:
         payload = {"model": config.model, "input": texts}
         if config.dimensions:
             payload["dimensions"] = config.dimensions
+        if input_type and config.local_embedding:
+            payload["input_type"] = input_type
         response = self.request(role, "embeddings", json_=payload)
         vectors = [
             r["embedding"] for r in sorted(response["data"], key=lambda r: r["index"])

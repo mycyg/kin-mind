@@ -1013,11 +1013,13 @@ class Contexts:
                             "facts": {k: trait["facts"].get(k) for k in FACTS}} for trait in traits.get(side, [])]
         if any(shown.values()):
             payload = {"ledger": "traits-of-this-history", **shown}
-            items.append({"id": "self-traits", "revision": view.get("revision", 1), "text": dumps(payload),
+            rev = sum((i + 1) * int(t.get("revision") or 1) for i, t in enumerate([*shown["established"], *shown["candidate"]])) * 100 + len(shown["established"]) * 10 + len(shown["candidate"])
+            items.append({"id": "self-traits", "revision": rev or 1, "text": dumps(payload),
                           "basis": "self_knowledge"})
         if ledger.get("corrections"):
             payload = {"ledger": "owner-corrections", "items": ledger["corrections"]}
-            items.append({"id": "trait-corrections", "revision": view.get("revision", 1), "text": dumps(payload),
+            rev = sum((i + 1) * int(c.get("revision") or 1) for i, c in enumerate(ledger["corrections"])) * 100 + len(ledger["corrections"])
+            items.append({"id": "trait-corrections", "revision": rev or 1, "text": dumps(payload),
                           "basis": "self_knowledge"})
         return items
 
@@ -1194,7 +1196,14 @@ class Contexts:
         activities = self.activity_items(activity_focus=activity_focus, query=query,
                                          detail="original" if activity_focus else "summary", activity_query=activity_query, activity_query_at=activity_query_at) if activity_focus or activity_recall or activity_query is not None else []
         items.extend(activities)
-        state_ids.update(i["id"] for i in items)
+        explicit_activity = bool(activity_focus or activity_query is not None)
+        state_ids.update(
+            i["id"] for i in items
+            if explicit_activity or admission != "on" or not str(i.get("id", "")).startswith("activity:")
+        )
+        if admission == "on" and not explicit_activity:
+            for item in activities:
+                recalled_as(item, "graph")
         view = self.mind.read(query=query)
         dynamic = affect_projection(view)
         affect_item = {"id": "affect", "revision": view.get("revision", 1), "text": dumps(dynamic), "basis": "inferred"}
@@ -1251,18 +1260,32 @@ class Contexts:
         state_ids.update(["affect", *(i["id"] for i in ledger)])
         for kind, limit in (("work", 3), ("share", 5)):
             items.extend(recalled_as(self.node_item(n, policy=policy), kind) for n in self.memory.history(kind, query=query, limit=limit)["items"] if not n["needs_review"])
+        query_vector, query_index = None, None
         if query and not adaptive_deep:
             recall_started = time.monotonic()
             # Only the lexical query has a compact keyword projection. The full
             # question is retained for semantic compression and explicit reads.
             from eventmem.core.db import tokenize
+            from .recall_admission import DEFAULT_TIMEOUT_MS, QUERY_CHARS, Unavailable, embed_query, note_facts
             lookup = query if len(query) <= 4000 else " ".join(list(dict.fromkeys(tokenize(query).split()))[:80])
-            request = RecallRequest(scope=self.mind.scope, query=lookup, scenario="companion", mode="fast", history=history, recall_purpose=recall_purpose)
+            if gate and record:
+                try:
+                    found_vec = embed_query(
+                        self.engine, self.mind.scope.key(), query[:QUERY_CHARS],
+                        time.monotonic() + int(settings.get("recall_admission_timeout_ms", DEFAULT_TIMEOUT_MS)) / 1000,
+                    )
+                    if found_vec is not None:
+                        query_vector, query_index = found_vec
+                except Unavailable:
+                    query_vector, query_index = None, None
+            request = RecallRequest(
+                scope=self.mind.scope, query=lookup, scenario="companion", mode="fast",
+                history=history, recall_purpose=recall_purpose, vector=query_vector, index=query_index,
+            )
             docs, _, _ = candidates(self.engine, request, full_lexical=True, policy=policy)
             # The policy decides about host envelopes; the prefix rule stands only with its switch off.
             eligible = [r for r in docs if valid(r, request, policy) is None and
                         not (settings["adaptive_recall"] and not policy.enabled and host_envelope(r["content"]))]
-            from .recall_admission import note_facts
             for r in eligible[:24]:
                 items.append(recalled_as(self.record_item(r, historical=history, policy=policy),
                                          "constraint" if (r.get("attributes") or {}).get("constraint")
@@ -1274,11 +1297,35 @@ class Contexts:
         recall_info["local_recall_ms"] = round(local_recall_seconds * 1000, 3)
         if settings.get("manifests"):
             from .continuity_manifest import ContinuityManifest
-            linked = ContinuityManifest(self.mind, contexts=self).select(query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy, activity_focus=activity_focus, activity_recall=activity_recall, activity_items=activities)
-            state_ids.update(i["id"] for i in linked["items"])
-            # Keep runtime first, then indivisible facts (authorship, coverage,
-            # conditions), ahead of older broad lexical summaries.
-            items = [*[i for i in items if i["id"] in {"host-runtime", "current-intent"}], *linked["items"], *items]
+            linked = ContinuityManifest(self.mind, contexts=self).select(
+                query, tasks=tasks or [], pending=pending or [], intent=intent, policy=policy,
+                activity_focus=activity_focus, activity_recall=activity_recall,
+                activity_items=activities, gated=(admission == "on"),
+            )
+            if admission == "on":
+                manifest_direct_ids = {
+                    i["id"] for i in linked["items"]
+                    if i.get("priority", 2) <= 0
+                    or "state_dependency" in i
+                    or "pending_dependency" in i
+                    or ("activity_dependency" in i and explicit_activity)
+                }
+                state_ids.update(manifest_direct_ids)
+                for i in linked["items"]:
+                    if i["id"] not in manifest_direct_ids:
+                        recalled_as(
+                            i,
+                            "work" if i["id"].startswith("work_")
+                            else "share" if i["id"].startswith("share_")
+                            else "graph",
+                        )
+            else:
+                state_ids.update(i["id"] for i in linked["items"])
+            # Keep runtime and current standing state first, then indivisible facts (authorship,
+            # coverage, conditions), ahead of older broad lexical summaries.
+            lead_ids = {"host-runtime", "current-intent"} if explicit else {"host-runtime", "current-reply-context", "current-intent", "affect", HABITS_ITEM, "self-traits", "trait-corrections"}
+            head = [i for i in items if i["id"] in lead_ids or str(i.get("id", "")).startswith("replied-share:")]
+            items = [*head, *linked["items"], *items]
         if explicit and adaptive_deep:
             # A paged evidence read prioritizes the question's ranked evidence;
             # broad background and affect stay available on later pages.
@@ -1315,7 +1362,7 @@ class Contexts:
             quiet_dropped = [(item["id"], "quiet") for item, _ in considered if item["id"] in quiet_ids]
             considered = [(item, route) for item, route in considered if item["id"] not in quiet_ids]
             decision = Admission(self).run(query, considered, settings=settings, seen=window["seen"], deep=deep_admission,
-                                           notes=notes, record=record)
+                                           notes=notes, record=record, query_vector=query_vector)
             decision["observation"]["dropped"] += [{"id": i, "reason": r} for i, r in quiet_dropped]
             recall_class = {item["id"] for item, route in considered if route not in EXEMPT_ROUTES}
         if admission == "on":

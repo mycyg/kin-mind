@@ -24,7 +24,7 @@ class ContinuityManifest:
             contexts = Contexts(mind)
         self.ctx, self.mind, self.memory = contexts, mind, contexts.memory
 
-    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None, activity_focus=None, activity_recall=False, activity_items=None):
+    def select(self, query='', *, tasks=(), pending=(), intent=None, limit=12, policy=None, activity_focus=None, activity_recall=False, activity_items=None, gated=False):
         """Bounded candidate expansion, with open matters independent of recency."""
         if policy is None:
             from eventmem.core.read_policy import ReadPolicy
@@ -53,12 +53,14 @@ class ContinuityManifest:
                 active = [d for d in state.get(kind, {}).values() if d.get('status') in {'active', 'easing', 'wanted', 'in_progress', 'waiting'}]
                 active.sort(key=lambda d: (not overlap(d), -d.get('intensity', d.get('strength', 0)), d['id']))
                 for entry in active[:3 if kind == 'concerns' else 2]:
+                    if gated and entry['id'] not in active_matters and not overlap(entry):
+                        continue
                     if entry.get('expires_at') and timestamp(entry['expires_at']) <= timestamp(self.mind.clock()):
                         continue
                     if not self.ctx._references_available(conn, entry.get('evidence', [])):
                         warnings.append(entry['id']); continue
                     value = {k: entry[k] for k in FIELDS if k in entry}
-                    items.append({'id': entry['id'], 'revision': state['revision'], 'text': dumps(value),
+                    items.append({'id': entry['id'], 'revision': int(entry.get('revision') or 1), 'text': dumps(value),
                         'basis': entry.get('basis', 'inferred'), 'facts': {'kind': kind, 'status': entry['status']},
                         'dependencies': [{'id': r['record_id'], 'revision': r['revision']} for r in entry.get('evidence', [])],
                         'state_dependency': {'kind': kind, 'id': entry['id']}, 'priority': 0 if entry['id'] in active_matters else 1 if overlap(entry) else 3})

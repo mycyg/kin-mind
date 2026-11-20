@@ -170,6 +170,12 @@ function wordsOf(item: ContextItem): string {
   if (!item.text.startsWith('{')) return item.text
   try {
     const digest = JSON.parse(item.text) as Record<string, { text?: string }[] | undefined>
+    const kind = (item.facts as { kind?: string } | undefined)?.kind
+    if (kind === 'concerns' || kind === 'desires') {
+      const rec = digest as unknown as { topic?: string; content?: string }
+      const formatted = [rec.topic, rec.content].filter(Boolean).join('：')
+      if (formatted) return formatted
+    }
     const parts = DIGEST.flatMap(([part, mark]) => (Array.isArray(digest[part]) ? digest[part]! : []).flatMap((entry) => (entry.text ? [mark + entry.text] : [])))
     // Not a digest at all: its own words, rather than nothing. (A digest with nothing in it yet says nothing.)
     return DIGEST.some(([part]) => part in digest) ? parts.join('；') : wordsIn(digest)

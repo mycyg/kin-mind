@@ -194,3 +194,60 @@ def test_an_embed_job_whose_service_cannot_start_waits_with_the_reason_and_is_no
     assert embed["error"] == ("Local embedding service exited during startup (exit 1, "
                               "ModuleNotFoundError: No module named 'eventmem')")
     assert "embed" in worker.paused
+
+
+def test_query_instruction_and_rerank_endpoint(tmp_path):
+    import math
+    import numpy as np
+
+    class EmbedModel:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, texts, batch_size=1, **kwargs):
+            self.calls.append((list(texts), batch_size))
+            return np.ones((len(texts), 4))
+
+    class RerankModel:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, pairs, **kwargs):
+            self.calls.append((list(pairs), kwargs))
+            return np.array([2.0, -3.0][: len(pairs)])
+
+    embedder, reranker = EmbedModel(), RerankModel()
+    client = TestClient(local_embedding.create_app(tmp_path, loader=lambda: embedder, rerank_loader=lambda: reranker))
+    auth = {"Authorization": "Bearer " + (tmp_path / "embedding-token").read_text()}
+
+    res = client.post(
+        "/v1/embeddings",
+        json={"model": local_embedding.MODEL, "input": ["sea", "land"], "dimensions": 32, "input_types": ["query", "document"]},
+        headers=auth,
+    )
+    assert res.status_code == 200
+    assert embedder.calls[0][0] == [local_embedding.QUERY_INSTRUCTION + "sea", "land"]
+    assert embedder.calls[0][1] == 2
+
+    res_q = client.post(
+        "/v1/embeddings",
+        json={"model": local_embedding.MODEL, "input": "wave", "dimensions": 32, "input_type": "query"},
+        headers=auth,
+    )
+    assert res_q.status_code == 200
+    assert embedder.calls[1][0] == [local_embedding.QUERY_INSTRUCTION + "wave"]
+
+    assert client.post("/v1/rerank", json={"query": "q", "documents": ["a"]}).status_code == 401
+    assert client.post("/v1/rerank", json={"model": "other", "query": "q", "documents": ["a"]}, headers=auth).status_code == 400
+    rr = client.post(
+        "/v1/rerank",
+        json={"model": local_embedding.RERANKER_MODEL, "query": "harbour", "documents": ["doc1", "doc2"]},
+        headers=auth,
+    )
+    assert rr.status_code == 200
+    results = rr.json()["results"]
+    assert len(results) == 2
+    assert abs(results[0]["relevance_score"] - (1.0 / (1.0 + math.exp(-2.0)))) < 1e-4
+    assert abs(results[1]["relevance_score"] - (1.0 / (1.0 + math.exp(3.0)))) < 1e-4
+    health = client.get("/health", headers=auth).json()
+    assert health["loaded"] is True and health["reranker_loaded"] is True and health["reranker_model"] == local_embedding.RERANKER_MODEL

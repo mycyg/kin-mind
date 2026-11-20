@@ -222,7 +222,7 @@ def deep_inputs(engine, request, trace, scenario_policy):
 
     if request.vector is None or not request.index:
         try:
-            vector, index_id = Providers(engine).embed([request.query])
+            vector, index_id = Providers(engine).embed([request.query], input_type="query")
             found["vector"] = (vector[0], index_id)
         except NotConfigured:
             degrade(trace, "embedding_not_configured")

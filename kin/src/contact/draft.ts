@@ -67,7 +67,7 @@ export async function draft(host: Host, occasion: Occasion): Promise<{ decision:
   const kin = host.ctx.get('kin')!
   const topic = occasion.wishes.map((wish) => wish.topic ?? wish.content ?? '').join('\n') || occasion.group?.join('\n') || ''
   const { channel: _channel, ...scope } = occasion.scope
-  const memory = await host.mind.call('memory-context', { query: topic, purpose: 'proactive', mode: 'light', recent_dialogue: 'recipient', ...scope })
+  const memory = await host.mind.call('memory-context', { query: topic, purpose: 'proactive', mode: 'light', budget: 2200, recent_dialogue: 'recipient', ...scope })
   // Only this conversation's own talk: what she and someone else said stays with them.
   const recent = ((memory.recent_dialogue ?? []) as DialogueTurn[])
     .filter((turn) => (turn.recipient_person_id ?? OWNER) === occasion.scope.recipient_person_id && turn.text)

@@ -196,6 +196,7 @@ DEFAULTS = {"native_window_context": False, "records": False, "semantic": False,
             # the automatic context's envelope (context.CONTEXT_USAGE_HINT). Off, each is as before.
             "recall_admission": "off", "recall_admission_threshold": 0.55, "recall_admission_quota": 4,
             "recall_admission_timeout_ms": 3000, "recall_quiet_marks": False, "context_usage_hint": False,
+            "recall_reranker": False, "recall_rerank_threshold": 0.5,
             # Charged appraisal attempts before a job is quarantined for repair.
             "max_charged_attempts": 5,
             # The most one DeepSeek appraisal request may hold, in tokens. None: the appraisal's own
@@ -405,7 +406,7 @@ class MemoryContinuity:
                     "exploration_decision_archive", "sealed_entries",
                     "context_cache_sweep", "metrics_name_ring", "vector_optimize", "deferred_routes",
                     "checkpoint_texture", "window_notes", "timed_concerns", "anti_retreat", "dreams", "diary_replies", "anniversaries",
-                    "recall_quiet_marks", "context_usage_hint", "event_continuation",
+                    "recall_quiet_marks", "context_usage_hint", "recall_reranker", "event_continuation",
                     *memory_formation.SWITCHES):
             if key in values and type(values[key]) is not bool:
                 raise ValueError("Feature flags are boolean")

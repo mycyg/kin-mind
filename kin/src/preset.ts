@@ -57,6 +57,32 @@ const PRESENCE = '回话要快而跟手：平时一轮直接说完就结束，�
   + '遇到需要查资料、连看几个网页、仔细比对核实、算东西或多步整理的活：如果不需要主人文件夹，就在 bubbles 里先回对方一句的同时调用 kin_background 丢给后台便宜的做事线异步做完，结果稍后送回来你再补充告诉对方；如果是在主人指定文件夹里干正经活，就用 kin_delegate。'
   + '你做事的中途对方又说了话，会在你下一步之前送到你面前：照常回应，该改主意就改，不必等手头的事做完。'
 
+const PHATIC_RE = /^(?:哈哈+|嘿嘿+|嘻嘻+|呵呵+|嗯+[啊呀呢]?|哦+[啊呀]?|好[的呀啊啦嘛哒]|行[的呀吧]?|收到|明白|了解|知道了|谢谢[你啦]?|晚安+|早安+|早啊?|拜拜+|在吗[？?]?|ok|okay|yes|yeah|yep|thx|thanks|haha+)[！!。.~～…，,\s？?]*$/i
+const FOLLOWUP_RE = /(?:^|[，,\s])(?:那|这|它|他|她|那个|这个|刚才|之前|后来|为什么|怎么[了啦回]|然后呢|所以呢|接着呢|还有吗|是吗|真的吗)/
+
+function buildRecallQuery(agent: Agent, messages: readonly UserMessage[]): string {
+  const raw = messages.map(textOf).join('\n').trim()
+  if (!raw || (raw.length <= 8 && PHATIC_RE.test(raw))) return ''
+  if (!/^(?:mem|src|graph)_/.test(raw) && (raw.length < 22 || FOLLOWUP_RE.test(raw))) {
+    const snippets: string[] = []
+    let inCurrentTurn = true
+    for (let seq = Number(agent.session.seq) - 1; seq >= 0 && snippets.length < 2; seq--) {
+      const event = agent.session.eventAt(SessionSeq(seq))
+      if (!event) continue
+      if (inCurrentTurn) {
+        if (event.type === 'turn/start') inCurrentTurn = false
+        continue
+      }
+      const text = event.type === 'user/message' && spoken(event.data) ? textOf(event.data)
+        : event.type === 'assistant/message' ? textOf(event.data.message) : ''
+      if (text) snippets.unshift(text.slice(0, 80))
+    }
+    const prior = snippets.join('\n').slice(0, 160).trim()
+    if (prior) return `${raw}\n${prior}`
+  }
+  return raw
+}
+
 export function apply(ctx: Context) {
   const { kin } = ctx
   const warn = (what: string) => (error: Error) => ctx.logger('kin').warn('%s: %s', what, error.message)
@@ -160,7 +186,7 @@ export function apply(ctx: Context) {
       const noteContext = await noteRead()
       return noteContext ? { ...decision, messages: [...decision.messages, noteContext] } : decision
     }
-    const query = decision.messages.map(textOf).join('\n').trim()
+    const query = buildRecallQuery(agent, decision.messages)
     const session = agent.session.id
     if (said) kin.timeline.mark(session, 'step')
     await compacted.get(session)
@@ -172,7 +198,7 @@ export function apply(ctx: Context) {
     const seenElsewhere = shownElsewhere.get(session)
     const [noteContext, recalled] = await Promise.all([
       noteRead(),
-      kin.mind.call('memory-context', { query, purpose: 'chat', mode: 'light', session, ...scope,
+      kin.mind.call('memory-context', { query, purpose: 'chat', mode: 'light', budget: 1800, session, ...scope,
         ...(channel !== 'own' && said ? { recent_dialogue: 'other-conversations' } : {}) })
         .then(async (answer) => {
           elsewhere = (answer.recent_dialogue ?? []).slice(-8).filter((t: DialogueTurn) => !seenElsewhere?.has(t.source_id))

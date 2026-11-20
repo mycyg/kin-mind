@@ -184,6 +184,17 @@ def optimize_all(engine, *, keep=None):
                 ann = bool(table.list_indices())
             except Exception:  # noqa: BLE001 - the listing is informative only
                 ann = None
+            if after_rows >= 256 and ann is False:
+                index.build()
+                table = index.table()
+                table.optimize(cleanup_older_than=keep, delete_unverified=False)
+                after_versions, after_rows = len(table.list_versions()), table.count_rows()
+                if after_rows != rows:
+                    raise RuntimeError("Vector compaction changed the row count")
+                try:
+                    ann = bool(table.list_indices())
+                except Exception:  # noqa: BLE001 - the listing is informative only
+                    ann = None
             index.config.update(rows=after_rows, optimized_at=now(), ann_index=ann)
             with engine.db.connect(write=True) as conn:
                 conn.execute("UPDATE vector_indexes SET data=? WHERE id=?", (dumps(index.config), index_id))
