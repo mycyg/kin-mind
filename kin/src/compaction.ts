@@ -94,7 +94,7 @@ export default class KinCompactionEngine extends BasicCompactionEngine {
     for await (const chunk of this.ctx.llm.stream({ provider, model, maxTokens, messages,
       sessionId: agent.session.id, purpose: 'compaction', ...(signal ? { signal } : {}) })) assembler.push(chunk)
     const finish = assembler.finish
-    if (finish.kind === 'error' || finish.kind === 'aborted') throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+    if (finish.kind === 'error' || finish.kind === 'aborted') throw LlmError.fromFailure(finish.failure)
     if (finish.kind !== 'stop') throw new Error(`compaction did not finish a checkpoint: ${finish.kind}`)
     const rawOutput = assembler.blocks()
     validateCheckpoint(rawOutput)

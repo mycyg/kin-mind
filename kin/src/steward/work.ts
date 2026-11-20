@@ -22,9 +22,11 @@
  */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
-import type {} from '@deepseek-ai/dsh-experimental-agent-team'
+import type {} from '@deepseek-ai/dsh-agent-team'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-subagent'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, resolve, sep } from 'node:path'
@@ -115,7 +117,7 @@ const QUIET_MS = 5_000
 /** How often what an ending still owes is tried again, and for how long. */
 const OWED_RETRY_MS = 60_000
 const OWED_KEEP_MS = 24 * 3_600_000
-const LEAD = '（这件活由你带队：能拆开并行做的部分，用 spawn_teammate 叫队友分头做、用任务板分工；等队友都做完、你检查过，再收尾。）\n'
+const LEAD = '（这件活由你带队：能拆开并行做的部分，用 subagent 或 subagent_fork 叫队友分头做、用任务板分工；等队友都做完、你检查过，再收尾。）\n'
 const MEMBER: Record<Crew['members'][number]['status'], string> = { running: '在做', inactive: '歇着', provisioning: '刚叫来', failed: '没叫来' }
 
 export function work(host: Host, permit: Permit) {
@@ -136,23 +138,53 @@ export function work(host: Host, permit: Permit) {
   // DSH's team service as a worker has it: the owner's own Agent Teams when that is switched on, else her crew preset's.
   const teams = (agent: Agent) => ctx.get('agentTeams') ?? ctx.get('agentPresets')?.serviceFor(agent, 'agentTeams')
 
-  /** A team's members as DSH lists them, lead first; none for work one worker does, or a lead that is not loaded. */
-  const roster = (item: Work) => {
+  interface RosterMember {
+    id: string
+    role: 'lead' | 'teammate'
+    name: string
+    status: Crew['members'][number]['status']
+    description?: string
+  }
+
+  /** A team's members from its subagent catalog, lead first; none for single-worker work or an unloaded lead. */
+  const roster = (item: Work): RosterMember[] => {
     const lead = item.team ? live(item.id) : undefined
+    if (!lead) return []
     try {
-      return (lead && teams(lead)?.listMembers(lead)) || []
+      const catalog = ctx.get('sessionProjections')?.snapshot(lead.session, ['subagentCatalog']).values.subagentCatalog ?? []
+      const teammates: RosterMember[] = catalog
+        .filter((entry) => entry.mode === 'continuable' || entry.mode === 'one-shot' || entry.mode === 'external')
+        .map((entry) => ({
+          id: entry.id,
+          role: 'teammate',
+          name: ('name' in entry && entry.name) ? entry.name : entry.id.slice(0, 8),
+          status: live(entry.id)?.status === 'running' ? 'running' : 'inactive',
+          ...(entry.label ? { description: entry.label } : {}),
+        }))
+      return [
+        { id: lead.session.id, role: 'lead', name: 'lead', status: lead.status === 'running' ? 'running' : 'inactive' },
+        ...teammates,
+      ]
     } catch {
-      // DSH refuses team reads once a team's own records stopped replaying: the work goes on as one worker's.
       return []
     }
   }
   const crewOf = (item: Work): Crew | undefined => {
     const members = roster(item)
     const lead = live(item.id)
-    if (!members.length || !lead) return
+    const team = lead && teams(lead)
+    if (!members.length || !lead || !team) return
+    let tasks: Crew['tasks'] = []
+    try {
+      tasks = team.listTasks(lead).map(({ subject, status, ownerName, ownerId }) => ({
+        title: subject, status, ...((ownerName ?? ownerId) ? { owner: ownerName ?? ownerId } : {}),
+      }))
+    } catch {
+      tasks = []
+    }
     return {
       members: members.map(({ name, status, description }) => ({ name, status, ...(description ? { job: description } : {}) })),
-      tasks: teams(lead)!.listTasks(lead).map(({ subject, status, ownerName }) => ({ title: subject, status, ...(ownerName ? { owner: ownerName } : {}) })),
+      tasks,
     }
   }
 
@@ -232,7 +264,9 @@ export function work(host: Host, permit: Permit) {
   ctx.on('agent/status', ({ agent, status }) => {
     const item = ledger[agent.session.id]
     if (status === 'running' && item) agent.model.select({ provider: PROVIDER, model: 'task' })
-    const work = item ?? ledger[agent.session.header.parentSession ?? '']
+    let rootId = agent.session.header.parentSession ?? ''
+    try { rootId = ctx.get('subagents')?.rootOf(agent).session.id ?? rootId } catch {}
+    const work = item ?? ledger[rootId]
     if (work?.state !== 'running') return
     if (!work.team) {
       if (status === 'idle' && item) settle(item, agent.session)
@@ -242,8 +276,11 @@ export function work(host: Host, permit: Permit) {
     // Whatever sets a stopped team going again (a teammate's closing word reaching its lead) ends as it starts.
     if (status === 'running' && stopping.has(work.id)) return agent.cancel({ kind: 'user' })
     if (status !== 'idle') return
-    quiet.set(work.id, setTimeout(() => void agentOf(work.id).then((lead) => {
-      if (work.state === 'running' && !roster(work).some((member) => member.status === 'running' || member.status === 'provisioning')) settle(work, lead.session)
+    quiet.set(work.id, setTimeout(() => void agentOf(work.id).then(async (lead) => {
+      if (work.state !== 'running' || lead.status === 'running') return
+      const busy = await ctx.get('subagents')?.waitForTreeWork(lead).catch(() => false)
+      if (!busy && work.state === 'running'
+        && !roster(work).some((member) => member.status === 'running' || member.status === 'provisioning')) settle(work, lead.session)
     }, (error: Error) => host.log('team work not settled: ' + error.message)), host.ms(QUIET_MS)).unref())
   })
 
@@ -324,7 +361,9 @@ export function work(host: Host, permit: Permit) {
       await controller().rename({ sessionId, title: label })
       const agent = await agentOf(sessionId)
       permit(agent.session)
-      if (crew && teams(agent)) {
+      const teamService = crew ? teams(agent) : undefined
+      if (teamService) {
+        await teamService.setEnabled(agent, true)
         item.team = true
         save()
       }
@@ -364,6 +403,8 @@ export function work(host: Host, permit: Permit) {
       // A team stops whole: each teammate's turn ends too, and the quiet that follows settles the work.
       if (item.team) {
         stopping.add(id)
+        const lead = live(id)
+        if (lead) void ctx.get('subagents')?.drainDescendants([lead]).catch(() => {})
         for (const member of roster(item)) if (member.role === 'teammate') live(member.id)?.cancel({ kind: 'user' })
       }
       // It ends its turn; the idle that follows settles it and she is told.

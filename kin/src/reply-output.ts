@@ -23,7 +23,7 @@ export const REPLY_SCHEMA = {
 
 export interface ReplyTarget { id: string; sessionId: string; inputId?: string; sourceIds?: string[] }
 export interface ReplyEnvelope { private_note: string; action: 'send' | 'silent'; bubbles: { text: string }[] }
-const invalid = (reason: string): never => { throw new LlmError('公开回复封套无效：' + reason, 'INVALID_REPLY_ENVELOPE') }
+const invalid = (reason: string): never => { throw LlmError.fromFailure({ message: '公开回复封套无效：' + reason, code: 'INVALID_REPLY_ENVELOPE' }) }
 
 export function parseReply(text: string): ReplyEnvelope {
   let value: unknown
@@ -70,7 +70,7 @@ export async function* replyOutput(source: AsyncIterable<StreamChunk>, options: 
   const publicText = envelope?.bubbles.map(b => b.text).join('\n\n') ?? ''
   if (envelope?.private_note.trim()) {
     try { await options.save(envelope.private_note, publicText) }
-    catch { throw new LlmError('心情札记未确认保存，本步没有公开输出或执行工具', 'REPLY_NOTE_SAVE_FAILED') }
+    catch { throw LlmError.fromFailure({ message: '心情札记未确认保存，本步没有公开输出或执行工具', code: 'REPLY_NOTE_SAVE_FAILED' }) }
   }
   if (options.signal?.aborted) throw new LlmError('回复已取消，未公开输出', 'ABORTED')
   const projected: typeof blocks = []

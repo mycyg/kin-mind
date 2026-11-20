@@ -78,10 +78,8 @@ export function helpers(host: Host, permit: Permit): Helpers {
     permit(parent.session, 'workspace-write')
     const activation = await ctx.get('subagents')!.startActivation({
       provider: 'spawn', label, signal, delivery: 'caller',
-      request: {
-        prompt: [{ type: 'text', text: prompt }], parent, cwd, agentPreset: WORKER_PRESET,
-        agentOptions: { provider: PROVIDER, model: 'task' }, ...(outputSchema ? { outputSchema } : {}),
-      },
+      prompt: [{ type: 'text', text: prompt }], parent, cwd, agentPreset: WORKER_PRESET,
+      agentOptions: { provider: PROVIDER, model: 'task' }, ...(outputSchema ? { outputSchema } : {}),
     })
     const session = activation.childId as string
     onStarted?.(session)

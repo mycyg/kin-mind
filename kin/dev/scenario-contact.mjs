@@ -66,7 +66,7 @@ class Chat extends LlmAdapter {
     }
     // What was said last: the newest words of a person, not her recall block, her own told words or DSH's runtime notes.
     const answered = texts.at(-1)?.role === 'tool'
-    const said = texts.findLast((m) => m.role === 'user' && !/^(（|这条消息的来源编号|Current runtime context|Time sampled)/.test(m.text))?.text ?? ''
+    const said = texts.findLast((m) => m.role === 'user' && !/^(（|这条消息的来源编号|<system-reminder>|Current runtime context|Time sampled)/.test(m.text))?.text ?? ''
     if (!answered && said === 'synthetic attachment request') return yield* call('kin_send_file', { path: this.media })
     if (!answered && said === 'synthetic continue on Feishu') return yield* call('kin_conversations', { who: '小光' })
     if (answered && said === 'synthetic continue on Feishu') {

@@ -109,7 +109,7 @@ flowchart TB
     FS["飞书<br/>(长连接推送 + 15s 补拉)"]
   end
 
-  subgraph DSH["DeepSeek Harness 基座 (>= 0.2.2-rc.1)"]
+  subgraph DSH["DeepSeek Harness 基座 (>= 0.2.2-rc.5)"]
     subgraph Plugin["dsh-kin 插件包 (cordis.patch.yml)"]
       Preset["preset-kin 会话预设<br/>(人设注入 / 每轮回忆快照 / 对话入库)"]
       Host["dsh-kin 常驻宿主 (kin/src)<br/>(Heartbeat 分钟钟 / Contact 投递账本 / Health 看护)"]
@@ -160,7 +160,7 @@ flowchart TB
 
 ### 1. 准备环境
 
-- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.1 < 0.3.0`
+- **DeepSeek Harness (DSH)**：`>= 0.2.2-rc.5 < 0.3.0`
 - **Node.js**：`>= 24.9.0`
 - **Python**：`3.13`（用 `uv` 管理虚拟环境）
 
@@ -211,7 +211,7 @@ node scripts/migrate.mjs --from <OLD_KIN_HOME> --to <TARGET_DATA_DIR> --apply
 
 我在本机离线合成环境和真实桌面端上都做过全套体检（详细记录在 [docs/VERIFICATION.md](docs/VERIFICATION.md)）：
 
-- **验证基线**：DSH `0.2.2-rc.1`、Node.js `>= 24.9.0`、Python `3.13`。
+- **验证基线**：DSH `0.2.2-rc.5`、Node.js `>= 24.9.0`、Python `3.13`。
 - **8 套端到端集成测试（共 107 项检查全部通过）**：拉起真实的无头 DSH + `dsh-kin` + 真实的 Python Core，把人设、回忆、大总管派活、健康看护与冻结、微信/飞书传输、多人私聊加群记忆、模型回退与重启恢复全都跑了一遍：
   ```bash
   cd kin

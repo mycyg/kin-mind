@@ -159,6 +159,22 @@
               searchTimeoutMs: 60000
           - id: present
             name: '@deepseek-ai/dsh-tool-present'
+          - id: delegation
+            name: cordis:group
+            group: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
           - id: team
             name: cordis:group
             group: true
@@ -166,11 +182,8 @@
               agentTeams: true
             config:
               - id: agent-team
-                name: '@deepseek-ai/dsh-experimental-agent-team'
+                name: '@deepseek-ai/dsh-agent-team'
                 config:
-                  maxMembers: 8
+                  maxTasks: 256
               - id: tool-agent-team
-                name: '@deepseek-ai/dsh-experimental-tool-agent-team'
-                config:
-                  freshProvider: spawn
-                  forkProvider: fork
+                name: '@deepseek-ai/dsh-tool-agent-team'

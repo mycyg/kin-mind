@@ -1,3 +1,11 @@
+## 2026-11-20 — Adapt `dsh-kin` to DeepSeek Harness `0.2.2-rc.5`
+
+- Bump `@deepseek-ai/dsh*` peer/dev dependencies and baseline docs from `0.2.2-rc.1` to `0.2.2-rc.5`, and add `@deepseek-ai/dsh-agent-team`, `@deepseek-ai/dsh-session-projection`, and `@deepseek-ai/dsh-subagent` declarations.
+- Replace legacy `LlmError` three-argument calls with `LlmError.fromFailure` in `kin/src/compaction.ts`, `kin/src/models.ts`, and `kin/src/reply-output.ts`.
+- Update `kin/src/steward/helpers.ts` to pass flattened `SubagentActivationSpec` options to `ctx.subagents.startActivation`.
+- Migrate `kin/src/steward/work.ts` and `kin/cordis.patch.yml` from `@deepseek-ai/dsh-experimental-agent-team` / `-tool-agent-team` to graduated `@deepseek-ai/dsh-agent-team` / `@deepseek-ai/dsh-tool-agent-team`, enabling teams explicitly with `setEnabled(agent, true)` and reading team rosters from the Lead session's `subagentCatalog` projection.
+- Update the scripted E2E mock helpers in `kin/dev/scenario-contact.mjs` and `kin/dev/scenario-memory.mjs` to skip `<system-reminder>` runtime-context messages introduced in `0.2.2-rc.5`.
+
 ## 2026-11-19 — Soften self-auditing prompts, surface owner intimacy style and relax outreach cooldowns
 
 - Soften background appraisal, trait, private-note, diary, dream and creation review prompts in Core so empathetic associations and playful reflections are no longer self-interrogated as factual fabrications unless an explicit factual correction arrives; prevent defensive self-censorship lessons from being saved as recurring traits.

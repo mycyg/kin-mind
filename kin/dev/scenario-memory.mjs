@@ -20,7 +20,7 @@ class Memory extends Scripted {
     // Her own minute's draft: not now.
     if (options.system?.includes('最后只输出一个 JSON 对象')) return yield* reply('{"action":"wait","condition":"review","reason":"先不打扰"}')
     if (messages.at(-1)?.role === 'tool') return yield* reply(replyEnvelope('嗯，我想起来了。'))
-    const words = textOf(messages.findLast((m) => m.role === 'user' && !/^(（以下是你此刻|这条消息的来源编号)/.test(textOf(m))) ?? { content: [] })
+    const words = textOf(messages.findLast((m) => m.role === 'user' && !/^(（以下是你此刻|这条消息的来源编号|<system-reminder>|Current runtime context|Time sampled)/.test(textOf(m))) ?? { content: [] })
     if (words.includes('还记得')) return yield* call('kin_recall', { about: '出差 杭州 回中国 坐飞机' })
     return yield* reply(replyEnvelope('好呀～'))
   }

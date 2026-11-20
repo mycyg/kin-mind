@@ -163,7 +163,7 @@ export class KinModel extends LlmAdapter {
       }
     }
     const target = options.sessionId && !options.purpose && lane === 'chat' ? this.replyTargets.get(options.sessionId) : undefined
-    if (options.sessionId && !options.purpose && lane === 'chat' && !target) throw new LlmError('会话输出边界尚未就绪，未调用模型', 'REPLY_CONTEXT_MISSING')
+    if (options.sessionId && !options.purpose && lane === 'chat' && !target) throw LlmError.fromFailure({ message: '会话输出边界尚未就绪，未调用模型', code: 'REPLY_CONTEXT_MISSING' })
     const failed: LastCall['failed'] = []
     let failure: LlmFailure | undefined
     const key = (route: Route) => route.provider + '/' + route.model
@@ -252,7 +252,7 @@ export class KinModel extends LlmAdapter {
               const cause = chunk.reason.failure
               // Keep the original terminal failure; the compaction engine guards agent-level
               // recovery after partial output, including transports whose receipts are still pending.
-              throw new LlmError(cause.message, cause.code, cause)
+              throw LlmError.fromFailure(cause)
             }
           }
           if (!answering) {
@@ -276,7 +276,7 @@ export class KinModel extends LlmAdapter {
           }
           yield rememberRoute(chunk, route)
         }
-        if (answering && !finished) throw new LlmError('模型开始回复后连接中断，未收到结束确认', 'INCOMPLETE_RESPONSE')
+        if (answering && !finished) throw LlmError.fromFailure({ message: '模型开始回复后连接中断，未收到结束确认', code: 'INCOMPLETE_RESPONSE' })
         if (!answering && !acceptedEmpty && !failure) failure = { code: 'NO_RESPONSE', message: '模型没有返回内容' }
       } catch (error) {
         if ((error as { code?: string }).code === 'REPLY_NOTE_SAVE_FAILED') {
