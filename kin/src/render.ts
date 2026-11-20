@@ -191,15 +191,20 @@ const KNOWING: Record<string, string> = { imagined: '（梦里的，不是真发
  * `rests`: the memories and sources the block's words rest on, for taking it down when one of them is deleted.
  */
 export function renderContext(answer: Answer, dimensions: Record<string, Dimension>, name: Names,
-  { now = Date.now(), shown, ids }: { now?: number; shown?: string; ids?: boolean } = {}) {
+  { now = Date.now(), shown, shownStanding, ids }: { now?: number; shown?: string; shownStanding?: string; ids?: boolean } = {}) {
   const items = itemsOf(answer)
   const affect = items.find((item) => item.id === 'affect')
   const mood = affect?.text ? JSON.parse(affect.text) as Affect : undefined
-  const feeling = [
-    answer.moment?.replaceAll('用户甲', name('person:person_a')).replaceAll('小光', name('person:person_a')) || (mood ? renderAffect(mood, dimensions) : ''),
-    ...standing(items, mood),
-  ].filter(Boolean).join('\n')
-  const sections = feeling && feeling !== shown ? [feeling] : []
+  const moodLine = answer.moment?.replaceAll('用户甲', name('person:person_a')).replaceAll('小光', name('person:person_a'))
+    || (mood ? renderAffect(mood, dimensions) : '')
+  const standingText = standing(items, mood).filter(Boolean).join('\n')
+  const feeling = [moodLine, standingText].filter(Boolean).join('\n')
+  const sections: string[] = shownStanding === undefined
+    ? (feeling && feeling !== shown ? [feeling] : [])
+    : [
+        ...(moodLine && moodLine !== shown ? [moodLine] : []),
+        ...(standingText && standingText !== shownStanding ? [standingText] : []),
+      ]
   const memories = memoriesOf(answer, name)
   if (memories.length) {
     sections.push('想起来的事：\n' + memories.map((memory) => {
@@ -215,7 +220,7 @@ export function renderContext(answer: Answer, dimensions: Record<string, Dimensi
     item.id ?? '', ...(item.source_ids ?? []), ...(item.record_ids ?? []),
     ...[item.facts, ...(item.evidence ?? [])].flatMap((facts) => (facts?.sources ?? []).flatMap((source) => source.source_id ?? [])),
   ]).filter(Boolean))]
-  return { text, feeling, rests }
+  return { text, feeling, moodLine, standingText, rests }
 }
 
 /**

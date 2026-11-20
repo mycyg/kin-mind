@@ -53,7 +53,8 @@ export const name = 'kin-preset'
 export const inject = ['kin', 'agents', 'systemPrompt', 'tools']
 
 /** How she keeps someone company while she works: a word first, and what is said meanwhile reaches her mid-turn. */
-const PRESENCE = '回话要跟手：要花上一阵的事（上网查、叫帮手、交活），先回对方一句再去做，别让人干等。'
+const PRESENCE = '回话要快而跟手：平时一轮直接说完就结束，别在一个回合里连续多步调工具、反复查网页或把私密札记拆成单独的 kin_note 工具调用（心情随手写进回复 JSON 的 private_note 就好）。'
+  + '遇到需要查资料、连看几个网页、仔细比对核实、算东西或多步整理的活：如果不需要主人文件夹，就在 bubbles 里先回对方一句的同时调用 kin_background 丢给后台便宜的做事线异步做完，结果稍后送回来你再补充告诉对方；如果是在主人指定文件夹里干正经活，就用 kin_delegate。'
   + '你做事的中途对方又说了话，会在你下一步之前送到你面前：照常回应，该改主意就改，不必等手头的事做完。'
 
 export function apply(ctx: Context) {
@@ -84,11 +85,18 @@ export function apply(ctx: Context) {
 
   ctx.on('agent/request-error', async ({ failure }, next) => failure.code === 'REPLY_NOTE_SAVE_FAILED' ? undefined : next(), { prepend: true })
 
-  // The feeling line each conversation last showed her, so an unchanged mood is not repeated every turn. It
-  // counts as shown once the session has kept the block that carries it (`showing`: that block, until then):
-  // a turn stopped before that shows it again.
+  // Per-session deduplication for repeated mood/standing/channel/elsewhere context blocks across turns.
   const feelings = new Map<string, string>()
-  const showing = new Map<string, { message: string; feeling: string }>()
+  const standings = new Map<string, string>()
+  const shownHere = new Set<string>()
+  const shownElsewhere = new Map<string, Set<string>>()
+  const showing = new Map<string, { message: string; feeling?: string; standing?: string; here?: boolean; elsewhereIds?: string[] }>()
+  const resetSessionHints = (id: string) => {
+    feelings.delete(id)
+    standings.delete(id)
+    shownHere.delete(id)
+    shownElsewhere.delete(id)
+  }
 
   // A compaction DSH just finished is being told to Core, by session: her next recall waits for it, so it reads
   // the new window (what the summary replaced may be offered again) and not the old one's.
@@ -145,34 +153,41 @@ export function apply(ctx: Context) {
     if (step === 1) await forget(agent.session).catch(warn('deleted memories not checked'))
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
-    const { channel: _noteChannel, ...noteScope } = kin.scopeOf(agent.session.id)
-    const noteContext = await replyNoteContext(agent.session, id => kin.mind.call('private-notes', { identifier: id, limit: 1, semantic: false, ...noteScope }))
-    const withNotes = (messages: UserMessage[]) => noteContext ? [...messages, noteContext] : messages
+    const { channel, ...scope } = kin.scopeOf(agent.session.id)
     const said = decision.messages.some(spoken)
-    if (step !== 1 && !said) return { ...decision, messages: withNotes(decision.messages) }
+    const noteRead = () => replyNoteContext(agent.session, id => kin.mind.call('private-notes', { identifier: id, limit: 1, semantic: false, ...scope }))
+    if (step !== 1 && !said) {
+      const noteContext = await noteRead()
+      return noteContext ? { ...decision, messages: [...decision.messages, noteContext] } : decision
+    }
     const query = decision.messages.map(textOf).join('\n').trim()
     const session = agent.session.id
     if (said) kin.timeline.mark(session, 'step')
-    // Recall in this conversation's own view: what is the owner's alone (her intimacy) is shown to the owner only.
-    const { channel, ...scope } = kin.scopeOf(session)
     await compacted.get(session)
     let receipt: { id: string; epoch: string; marker: string } | undefined
     let rests: string[] = []
     let feeling: string | undefined
+    let standingText: string | undefined
     let elsewhere: DialogueTurn[] = []
-    const [recalled] = await Promise.all([
+    const seenElsewhere = shownElsewhere.get(session)
+    const [noteContext, recalled] = await Promise.all([
+      noteRead(),
       kin.mind.call('memory-context', { query, purpose: 'chat', mode: 'light', session, ...scope,
         ...(channel !== 'own' && said ? { recent_dialogue: 'other-conversations' } : {}) })
         .then(async (answer) => {
-          elsewhere = (answer.recent_dialogue ?? []).slice(-8)
+          elsewhere = (answer.recent_dialogue ?? []).slice(-8).filter((t: DialogueTurn) => !seenElsewhere?.has(t.source_id))
           if (answer.injection?.state === 'prepared') {
             const { id, epoch, marker } = answer.injection
             const begun = await kin.mind.call('context-delivery-begin', { session, epoch, id })
             if (!begun.acquired) return ''
             receipt = { id, epoch, marker }
           }
-          const rendered = renderContext(answer, kin.dimensions(), kin.nameOf, { shown: feelings.get(session) })
-          feeling = rendered.feeling
+          const rendered = renderContext(answer, kin.dimensions(), kin.nameOf, {
+            shown: feelings.get(session),
+            shownStanding: standings.get(session) ?? '',
+          })
+          feeling = rendered.moodLine
+          standingText = rendered.standingText
           rests = rendered.rests
           return rendered.text
         })
@@ -180,13 +195,15 @@ export function apply(ctx: Context) {
       // A later step that brings new words asks again; the first step asked above.
       step !== 1 && forget(agent.session).catch(warn('deleted memories not checked')),
     ])
+    const withNotes = (messages: UserMessage[]) => noteContext ? [...messages, noteContext] : messages
     // What was just said joins her memory now: after her recall, so it is not recalled back to her, and
     // before she answers, so what she does with it this turn (a plan made of it, a reply held back) can name it.
     const source = await hear(session, decision.messages).catch((error) => (warn('not recorded yet')(error), ''))
     if (said) kin.timeline.mark(session, 'recalled')
+    const needHere = step === 1 && !shownHere.has(session)
     // Her own conversation (her outings, her making, the routines she set herself) reaches no one.
-    const here = channel === 'own' ? '（当前对话：你自己的对话，这里说的话不会发给任何人）'
-      : `（当前对话：${kin.nameOf(scope.recipient_person_id)}（${channel === 'app' ? '桌面' : PLATFORMS[channel] ?? channel}，${scope.recipient_person_id.startsWith('group:') ? '群聊' : '私聊'}））`
+    const here = needHere && (channel === 'own' ? '（当前对话：你自己的对话，这里说的话不会发给任何人）'
+      : `（当前对话：${kin.nameOf(scope.recipient_person_id)}（${channel === 'app' ? '桌面' : PLATFORMS[channel] ?? channel}，${scope.recipient_person_id.startsWith('group:') ? '群聊' : '私聊'}））`)
     // A turn nobody here started (a reminder come due, word of handed-out work) may find the person elsewhere:
     // when and where they last spoke is hers to weigh (kin_tell reaches them there).
     const last = step === 1 && !said && channel !== 'own' ? ctx.get('kinContact')?.heardFrom(scope.recipient_person_id) : undefined
@@ -203,7 +220,7 @@ export function apply(ctx: Context) {
     const continuity = elsewhere.length ? '和这个人在其他对话里最近的记录（按原时间）：\n'
       + elsewhere.map(turn => dialogueLine({ ...turn, text: turn.text.slice(0, 500) }, kin.nameOf(scope.recipient_person_id))).join('\n')
       + '\n接着办之前的事时，kin_conversations 可查原对话和文件路径。' : ''
-    const text = [step === 1 && here, days, away, asked, recalled, continuity, work, source && `这条消息的来源编号：${source}`].filter(Boolean).join('\n')
+    const text = [here, days, away, asked, recalled, continuity, work, source && `这条消息的来源编号：${source}`].filter(Boolean).join('\n')
     if (!text) return { ...decision, messages: withNotes(decision.messages) }
     const block = createUserMessage({
       content: [{ type: 'text', text }],
@@ -212,7 +229,13 @@ export function apply(ctx: Context) {
         ...(recalled && receipt ? { receipt } : {}), ...((rests.length || elsewhere.length) ? { rests: [...rests, ...elsewhere.map(turn => turn.source_id)] } : {}),
       },
     })
-    if (recalled && feeling) showing.set(session, { message: block.id, feeling })
+    showing.set(session, {
+      message: block.id,
+      ...(recalled && feeling ? { feeling } : {}),
+      ...(recalled && standingText !== undefined ? { standing: standingText } : {}),
+      ...(needHere ? { here: true } : {}),
+      ...(elsewhere.length ? { elsewhereIds: elsewhere.map(t => t.source_id) } : {}),
+    })
     return { ...decision, messages: withNotes([...decision.messages, block]) }
   }, { prepend: true })
 
@@ -221,7 +244,7 @@ export function apply(ctx: Context) {
   // the turn, which is what makes it sure). And a compaction that just finished is told to Core at once.
   ctx.on('session/event', (session, event) => {
     if (event.type === 'compaction/end' && !event.data.error) {
-      feelings.delete(session.id)
+      resetSessionHints(session.id)
       compacted.set(session.id, kin.mind.call('memory-compact-ack', {
         session: session.id, actual_session: session.id, epoch: event.data.compactionId, completed: true,
       }).catch(warn('compaction not told to her mind yet')))
@@ -233,7 +256,14 @@ export function apply(ctx: Context) {
     if (event.type !== 'user/message' || event.data.source.kind !== 'kin-context') return
     const shown = showing.get(session.id)
     if (shown && shown.message === event.data.id) {
-      feelings.set(session.id, shown.feeling)
+      if (shown.feeling) feelings.set(session.id, shown.feeling)
+      if (shown.standing !== undefined) standings.set(session.id, shown.standing)
+      if (shown.here) shownHere.add(session.id)
+      if (shown.elsewhereIds?.length) {
+        let seen = shownElsewhere.get(session.id)
+        if (!seen) shownElsewhere.set(session.id, seen = new Set())
+        for (const id of shown.elsewhereIds) seen.add(id)
+      }
       showing.delete(session.id)
     }
     if (event.data.source.receipt) acknowledge(session, event, event.data.source.receipt).catch(warn('recall receipt not kept yet'))
@@ -311,7 +341,7 @@ export function apply(ctx: Context) {
         await kin.mind.call('memory-compact-ack', {
           session: session.id, actual_session: session.id, epoch: event.data.compactionId, completed: true,
         })
-        feelings.delete(session.id)
+        resetSessionHints(session.id)
       }
       kin.markRecorded(session.id, seq + 1)
     }

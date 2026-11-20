@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -113,7 +114,24 @@ def structure_digest(conn) -> str:
     return digest([list(row) for row in rows])[:16]
 
 
+@lru_cache(maxsize=2048)
+def _tokenize_cached(text: str) -> str:
+    words = re.findall(r"[a-zA-Z0-9_]+", text)
+    code_words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", " ".join(words))
+    chinese = re.findall(r"[\u3400-\u9fff]+", text)
+    if chinese:
+        import jieba
+
+        with _jieba_lock:
+            jieba.setLogLevel(40)
+            for segment in chinese:
+                words.extend(jieba.cut_for_search(segment))
+    return " ".join(w.lower() for w in words + code_words)
+
+
 def tokenize(text: str) -> str:
+    if len(text) <= 2048:
+        return _tokenize_cached(text)
     words = re.findall(r"[a-zA-Z0-9_]+", text)
     code_words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", " ".join(words))
     chinese = re.findall(r"[\u3400-\u9fff]+", text)

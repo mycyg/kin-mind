@@ -8,7 +8,7 @@
  * after the others for a few minutes, so a route that is down does not cost every reply its wait.
  * An empty lane speaks with DSH's default model. Credentials stay in DSH.
  */
-import { OUTPUT_BUDGET, estimateRequestTokens, requestThreshold } from './model-budget.js'
+import { CONTEXT_WINDOW, OUTPUT_BUDGET, estimateRequestTokens, requestThreshold } from './model-budget.js'
 import { answerText, modelOutput } from './model-output.js'
 import { replyWithCorrection, type ReplyTarget } from './reply-output.js'
 import type {} from './index.js'

@@ -1,9 +1,9 @@
 /** KIN's small line icons: one stroke weight, round ends, drawn on a 24 grid. */
 import type { ReactNode } from 'react'
 
-function Icon({ size = 16, children, filled }: { size?: number; children: ReactNode; filled?: boolean }) {
+function Icon({ size = 16, className, children, filled }: { size?: number; className?: string; children: ReactNode; filled?: boolean }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="kin-icon"
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className={className ? `kin-icon ${className}` : 'kin-icon'}
       fill={filled ? 'currentColor' : 'none'} stroke={filled ? 'none' : 'currentColor'}
       strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
       {children}
@@ -11,7 +11,7 @@ function Icon({ size = 16, children, filled }: { size?: number; children: ReactN
   )
 }
 
-type P = { size?: number }
+type P = { size?: number; className?: string }
 export const Sparkle = (p: P) => <Icon {...p} filled><path d="M12 2.8l1.9 5.9 5.9 1.9-5.9 1.9L12 18.4l-1.9-5.9-5.9-1.9 5.9-1.9z" /></Icon>
 export const Heart = (p: P) => <Icon {...p} filled><path d="M12 20.3s-7.6-4.6-7.6-10.3A4.3 4.3 0 0 1 12 7.3a4.3 4.3 0 0 1 7.6 2.7c0 5.7-7.6 10.3-7.6 10.3z" /></Icon>
 export const Stop = (p: P) => <Icon {...p} filled><rect x="7" y="7" width="10" height="10" rx="2.5" /></Icon>
@@ -28,6 +28,13 @@ export const Bento = (p: P) => (
   <Icon {...p}><rect x="4" y="4" width="7" height="9.5" rx="2.2" /><rect x="13" y="4" width="7" height="5.5" rx="2.2" /><rect x="13" y="11.5" width="7" height="8.5" rx="2.2" /><rect x="4" y="15.5" width="7" height="4.5" rx="2.2" /></Icon>
 )
 export const Waves = (p: P) => <Icon {...p}><path d="M4 8.5c2.7-2 5.3 2 8 0s5.3 2 8 0M4 12.5c2.7-2 5.3 2 8 0s5.3 2 8 0M4 16.5c2.7-2 5.3 2 8 0s5.3 2 8 0" /></Icon>
+export const Play = (p: P) => <Icon {...p} filled><path d="M8.5 6.4v11.2a1 1 0 0 0 1.5.85l8.8-5.6a1 1 0 0 0 0-1.7L10 5.55a1 1 0 0 0-1.5.85z" /></Icon>
+export const Pause = (p: P) => <Icon {...p} filled><rect x="7.5" y="6" width="3.2" height="12" rx="1.2" /><rect x="13.3" y="6" width="3.2" height="12" rx="1.2" /></Icon>
+export const Headphones = (p: P) => <Icon {...p}><path d="M4.5 14.5v-2a7.5 7.5 0 0 1 15 0v2" /><rect x="3.5" y="13.5" width="3.5" height="6" rx="1.6" /><rect x="17" y="13.5" width="3.5" height="6" rx="1.6" /></Icon>
+export const ChevronDown = (p: P) => <Icon {...p}><path d="M6.5 9.5L12 15l5.5-5.5" /></Icon>
+export const ArrowDown = (p: P) => <Icon {...p}><path d="M12 5.5v13M6.5 13.5L12 19l5.5-5.5" /></Icon>
+export const Bell = (p: P) => <Icon {...p}><path d="M6.5 15.5V11a5.5 5.5 0 0 1 11 0v4.5l1.5 2H5l1.5-2zM10 19.5a2 2 0 0 0 4 0" /></Icon>
+export const Craft = (p: P) => <Icon {...p}><path d="M12 3.5l2.2 5 5.3.6-4 3.6 1.1 5.3-4.6-2.8-4.6 2.8 1.1-5.3-4-3.6 5.3-.6z" /></Icon>
 export const Grip = (p: P) => (
   <Icon {...p} filled>
     {[8, 12, 16].flatMap((y) => [9, 15].map((x) => <circle key={`${x}-${y}`} cx={x} cy={y} r="1.3" />))}

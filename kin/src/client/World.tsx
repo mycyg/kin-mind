@@ -6,10 +6,10 @@
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import {
   activeWish, api, useApi, useDiary,
-  type Diary, type DiaryEntry, type Dreams, type Explore, type Home, type Letters, type Memory, type Wish,
+  type CreationArtifact, type CreationItem, type Diary, type DiaryEntry, type Dreams, type Explore, type Home, type Letters, type Memory, type Wish,
 } from './api.js'
 import { CalendarView, dayKey, useWeek } from './Calendar.js'
-import { Back, Mail, Moon, Search } from './icons.js'
+import { Back, Bubble, Craft, Mail, Moon, Search, Sparkle } from './icons.js'
 import { Outing } from './steward/Outing.js'
 import { stamp } from '../render.js'
 import { ago, calendarDay, clock, day, isoDay, night } from './time.js'
@@ -56,7 +56,7 @@ export function World({ home, place, go, openSettings, talk }: {
       {place === 'dreams' ? <DreamsView openSettings={openSettings} /> : null}
       {place === 'letters' ? <LettersView openSettings={openSettings} /> : null}
       {place === 'diary' ? <DiaryView openSettings={openSettings} /> : null}
-      {place === 'wishes' ? <WishesView home={home} toDay={(at) => { setDay(dayKey(new Date(at))); go('calendar') }} /> : null}
+      {place === 'wishes' ? <WishesView home={home} toDay={(at) => { setDay(dayKey(new Date(at))); go('calendar') }} talk={talk} /> : null}
       {place === 'wander' ? <Wander /> : null}
       {place === 'memories' ? <Recall /> : null}
       {place === 'calendar' ? <CalendarView go={go} day={day} talk={talk} /> : null}
@@ -67,21 +67,27 @@ export function World({ home, place, go, openSettings, talk }: {
 /** A tile's title and its place's title share a name, so one glides into the other. */
 const named = (place: Place) => ({ viewTransitionName: 'kin-' + place }) as CSSProperties
 
+const isFresh = (iso?: string | null) => Boolean(iso && Date.now() - Date.parse(iso) < 86_400_000)
+
 function Collection({ home, open }: { home: Home | undefined; open: (place: Place) => void }) {
   const dreams = useApi<Dreams>('api/kin/dreams', 30_000)
   const letters = useApi<Letters>('api/kin/letters', 30_000)
   const diary = useApi<Diary>('api/kin/diary', 30_000)
   const explore = useApi<Explore>('api/kin/explore', 30_000)
+  const creations = useApi<{ creations: CreationItem[] }>('api/kin/creations', 60_000)
   const wishes = home?.state.desires.filter(activeWish) ?? []
   const sealed = letters.data?.items.filter((item) => item.state === 'sealed').length ?? 0
   const dream = dreams.data?.dreams[0]
   const pages = diary.data?.total ?? diary.data?.entries.length ?? 0
   const wandered = explore.data?.explorations[0]
   const week = useWeek()
+  const crafted = creations.data?.creations ?? []
+  const letterFresh = Boolean(letters.data?.items.some((item) => item.state === 'opened' && isFresh(item.opened_at)))
 
-  const tile = (place: Place, note: ReactNode, art?: ReactNode) => (
+  const tile = (place: Place, note: ReactNode, art?: ReactNode, fresh?: boolean) => (
     <button type="button" className="kin-tile" data-tile={place} onClick={() => open(place)} aria-label={PLACES[place].sub}>
       {art}
+      {fresh ? <span className="kin-tile-fresh" title="最近 24 小时有新动静"><Sparkle size={11} />新</span> : null}
       <span className="kin-script kin-tile-title" style={named(place)}>{PLACES[place].title}</span>
       <span className="kin-tile-note">{note}</span>
     </button>
@@ -96,11 +102,11 @@ function Collection({ home, open }: { home: Home | undefined; open: (place: Plac
       <div className="kin-bento">
         {tile('dreams',
           dream ? `${night(dream.at)}：${clip(dream.text, 34)}` : dreams.data?.generation_enabled === false ? '她还不会做梦' : '还没有梦',
-          <><i className="kin-art-moon" /><i className="kin-art-stars" /></>)}
-        {tile('letters', sealed ? `${sealed} 封还封着` : '写一封以后才能拆的信', <><i className="kin-art-flap" /><i className="kin-art-seal" /></>)}
-        {tile('diary', diary.error ? '日记暂时没读出来，点开重试' : !diary.data ? '正在翻日记…' : pages ? `${pages} 页` : '还没写', <i className="kin-art-frame" />)}
-        {tile('wishes', '心愿', <strong className="kin-numeral kin-tile-count">{wishes.length}</strong>)}
-        {tile('wander', wandered ? clip(wandered.title ?? wandered.text ?? '', 30) : '还没出门探索过', <i className="kin-art-horizon" />)}
+          <><i className="kin-art-moon" /><i className="kin-art-stars" /></>, isFresh(dream?.at))}
+        {tile('letters', sealed ? `${sealed} 封还封着` : '写一封以后才能拆的信', <><i className="kin-art-flap" /><i className="kin-art-seal" /></>, letterFresh)}
+        {tile('diary', diary.error ? '日记暂时没读出来，点开重试' : !diary.data ? '正在翻日记…' : pages ? `${pages} 页` : '还没写', <i className="kin-art-frame" />, isFresh(diary.data?.entries[0]?.at))}
+        {tile('wishes', crafted.length ? `心愿 · ${crafted.length} 件手作` : '心愿', <strong className="kin-numeral kin-tile-count">{wishes.length}</strong>, isFresh(crafted[0]?.finished_at))}
+        {tile('wander', wandered ? clip(wandered.title ?? wandered.text ?? '', 30) : '还没出门探索过', <i className="kin-art-horizon" />, isFresh(wandered?.at))}
         {tile('memories', '她记得你们聊过的事', <Constellation />)}
         {tile('calendar', week.note, week.art)}
       </div>
@@ -129,29 +135,37 @@ function Failed({ error, retry }: { error: string; retry: () => void }) {
   return <p className="kin-quiet">没读出来：{error} <button type="button" className="kin-link" onClick={retry}>再试一次</button></p>
 }
 
-export function Wishes({ wishes }: { wishes: Wish[] }) {
+export function Wishes({ wishes, talk }: { wishes: Wish[]; talk?: (text: string) => void }) {
   return (
     <ul className="kin-list kin-list-scroll" tabIndex={0}>
       {wishes.map((wish) => (
-        <li key={wish.id}>
-          {wish.kind ? <span className="kin-tag">{WISH_KINDS[wish.kind]}</span> : null}
-          {wish.content ?? wish.topic}
-          <span className="kin-dim"> · {WISH_STATES[wish.status] ?? wish.status}</span>
+        <li key={wish.id} className="kin-list-item">
+          <span className="kin-list-body">
+            {wish.kind ? <span className="kin-tag">{WISH_KINDS[wish.kind]}</span> : null}
+            {wish.content ?? wish.topic}
+            <span className="kin-dim"> · {WISH_STATES[wish.status] ?? wish.status}</span>
+          </span>
+          {talk ? (
+            <button type="button" className="kin-say-btn" onClick={() => talk(`看到你的心愿「${wish.content ?? wish.topic}」，想和你聊聊这个`)}>
+              <Bubble size={13} /> 和她说说
+            </button>
+          ) : null}
         </li>
       ))}
     </ul>
   )
 }
 
-function WishesView({ home, toDay }: { home: Home | undefined; toDay: (at: string) => void }) {
+function WishesView({ home, toDay, talk }: { home: Home | undefined; toDay: (at: string) => void; talk?: (text: string) => void }) {
   const wishes = home?.state.desires.filter(activeWish) ?? []
   const plans = home?.plans.filter((plan) => plan.status === 'active') ?? []
   return (
     <>
       <Outing kind="creation" />
       <section className="kin-card">
-        {wishes.length ? <Wishes wishes={wishes} /> : <Quiet>还没有特别想做的事。想做什么，是她自己在心里慢慢长出来的。</Quiet>}
+        {wishes.length ? <Wishes wishes={wishes} talk={talk} /> : <Quiet>还没有特别想做的事。想做什么，是她自己在心里慢慢长出来的。</Quiet>}
       </section>
+      <Creations talk={talk} />
       {plans.length ? (
         <section className="kin-card">
           <h3 className="kin-card-title">在做的计划</h3>
@@ -172,6 +186,95 @@ function WishesView({ home, toDay }: { home: Home | undefined; toDay: (at: strin
         </section>
       ) : null}
     </>
+  )
+}
+
+function artifactKind(name: string): 'image' | 'frame' | 'text' | 'link' {
+  const dot = name.lastIndexOf('.')
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : ''
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image'
+  if (['.html', '.htm', '.svg'].includes(ext)) return 'frame'
+  if (['.md', '.txt', '.json', '.csv', '.py', '.js'].includes(ext)) return 'text'
+  return 'link'
+}
+
+const formatBytes = (bytes: number) => (bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`)
+
+function Creations({ talk }: { talk?: (text: string) => void }) {
+  const { data, error, reload } = useApi<{ creations: CreationItem[] }>('api/kin/creations', 60_000)
+  const [preview, setPreview] = useState<{ itemId: string; artifact: CreationArtifact }>()
+  const [texts, setTexts] = useState<Record<string, { text?: string; error?: string; loading?: boolean }>>({})
+
+  if (error) return <Failed error={error} retry={reload} />
+  if (!data || !data.creations.length) return null
+
+  const openArtifact = (itemId: string, artifact: CreationArtifact) => {
+    if (preview?.itemId === itemId && preview.artifact.path === artifact.path) return setPreview(undefined)
+    setPreview({ itemId, artifact })
+    if (artifactKind(artifact.name) === 'text' && !texts[artifact.path]) {
+      setTexts((now) => ({ ...now, [artifact.path]: { loading: true } }))
+      void fetch('api/kin/creations/file?path=' + encodeURIComponent(artifact.path))
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`${res.status}`)
+          return res.text()
+        })
+        .then((text) => setTexts((now) => ({ ...now, [artifact.path]: { text } })))
+        .catch(() => setTexts((now) => ({ ...now, [artifact.path]: { error: '没能打开这件文件' } })))
+    }
+  }
+
+  return (
+    <section className="kin-card">
+      <h3 className="kin-card-title"><Craft size={15} /> 她的手作匣</h3>
+      <div className="kin-creations">
+        {data.creations.map((item) => (
+          <article key={item.id} className="kin-creation">
+            <div className="kin-creation-head">
+              <strong>{item.title}</strong>
+              {item.finished_at ? <span className="kin-dim">{ago(item.finished_at)}</span> : null}
+            </div>
+            {item.summary ? <p className="kin-creation-summary">{item.summary}</p> : null}
+            {item.artifacts.length ? (
+              <div className="kin-creation-files">
+                {item.artifacts.map((art) => {
+                  const active = preview?.itemId === item.id && preview.artifact.path === art.path
+                  return (
+                    <button key={art.path} type="button" className="kin-chip" data-active={active ? '' : undefined} onClick={() => openArtifact(item.id, art)}>
+                      {art.name}{art.bytes ? ` · ${formatBytes(art.bytes)}` : ''}
+                    </button>
+                  )
+                })}
+              </div>
+            ) : null}
+            {preview?.itemId === item.id ? (() => {
+              const art = preview.artifact
+              const src = 'api/kin/creations/file?path=' + encodeURIComponent(art.path)
+              const kind = artifactKind(art.name)
+              if (kind === 'image') return <div className="kin-creation-preview"><img src={src} alt={art.name} /></div>
+              if (kind === 'frame') return <div className="kin-creation-preview"><iframe className="kin-creation-frame" sandbox="allow-scripts" src={src} title={art.name} /></div>
+              if (kind === 'text') {
+                const entry = texts[art.path]
+                return (
+                  <div className="kin-paper kin-creation-preview">
+                    {entry?.loading ? <span className="kin-dim">正在翻开…</span>
+                      : entry?.error ? <span className="kin-error">{entry.error}</span>
+                      : <pre className="kin-creation-text">{entry?.text ?? ''}</pre>}
+                  </div>
+                )
+              }
+              return <div className="kin-creation-preview"><a className="kin-link" href={src} target="_blank" rel="noopener noreferrer">在新窗口打开 {art.name}</a></div>
+            })() : null}
+            {talk ? (
+              <div className="kin-creation-foot">
+                <button type="button" className="kin-say-btn" onClick={() => talk(`刚看了你做的「${item.title}」，好喜欢！和我讲讲你是怎么做的吧`)}>
+                  <Bubble size={13} /> 和她聊聊这件作品
+                </button>
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -285,8 +388,20 @@ function LettersView({ openSettings }: { openSettings: () => void }) {
   const [unlock, setUnlock] = useState(isoDay(30))
   const [problem, setProblem] = useState<string>()
   const [sealing, setSealing] = useState(false)
+  const [bodies, setBodies] = useState<Record<string, { loading?: boolean; text?: string; error?: string }>>({})
+  const [openIds, setOpenIds] = useState<Record<string, boolean>>({})
   if (error) return <Failed error={error} retry={reload} />
   if (!data) return <Quiet>正在看信箱…</Quiet>
+  const toggleLetter = (id: string) => {
+    const next = !openIds[id]
+    setOpenIds((now) => ({ ...now, [id]: next }))
+    if (next && !bodies[id]?.text && !bodies[id]?.loading) {
+      setBodies((now) => ({ ...now, [id]: { loading: true } }))
+      void api<{ text: string }>('api/kin/letters/read', { id })
+        .then((res) => setBodies((now) => ({ ...now, [id]: { text: res.text } })))
+        .catch((err: Error) => setBodies((now) => ({ ...now, [id]: { error: err.message } })))
+    }
+  }
   const seal = () => {
     if (sealing) return
     if (!text.trim()) return setProblem('先写点什么吧')
@@ -314,17 +429,38 @@ function LettersView({ openSettings }: { openSettings: () => void }) {
       ) : (
         <Quiet>时光信还没打开。<button type="button" className="kin-link" onClick={openSettings}>在设置里打开「时光信与暗房」</button></Quiet>
       )}
-      {data.items.map((item) => (
-        <div key={item.id} className="kin-envelope" data-state={item.state}>
-          <Mail size={18} />
-          <div>
-            <p>{item.kind === 'letter'
-              ? (item.state === 'sealed' ? `一封 ${calendarDay(item.unlock_at)} 才能拆的信` : `${day(item.created_at)}写的信，已经拆开了`)
-              : (item.state === 'sealed' ? `她锁起来的一篇日记，${calendarDay(item.unlock_at)} 才打开` : '她锁起来的日记打开了，在日记里')}</p>
-            <span className="kin-dim">{item.kind === 'letter' ? '你' : '她'}写于 {day(item.created_at)}</span>
+      {data.items.map((item) => {
+        const opened = item.state === 'opened'
+        const expanded = Boolean(openIds[item.id])
+        const body = bodies[item.id]
+        return (
+          <div key={item.id} className="kin-envelope" data-state={item.state}>
+            <Mail size={18} />
+            <div className="kin-envelope-body">
+              <div className="kin-envelope-head">
+                <div>
+                  <p>{item.kind === 'letter'
+                    ? (item.state === 'sealed' ? `一封 ${calendarDay(item.unlock_at)} 才能拆的信` : `${day(item.created_at)}写的信，已经拆开了`)
+                    : (item.state === 'sealed' ? `她锁起来的一篇日记，${calendarDay(item.unlock_at)} 才打开` : '她锁起来的日记打开了')}</p>
+                  <span className="kin-dim">{item.kind === 'letter' ? '你' : '她'}写于 {day(item.created_at)}</span>
+                </div>
+                {opened ? (
+                  <button type="button" className="kin-btn" onClick={() => toggleLetter(item.id)}>
+                    {expanded ? '收起' : '拆开重读'}
+                  </button>
+                ) : null}
+              </div>
+              {opened && expanded ? (
+                <div className="kin-paper kin-letter-body">
+                  {body?.loading ? <p className="kin-dim">正在拆开这页信纸…</p>
+                    : body?.error ? <p className="kin-error">{body.error}</p>
+                    : <p className="kin-voice">{body?.text ?? ''}</p>}
+                </div>
+              ) : null}
+            </div>
           </div>
-        </div>
-      ))}
+        )
+      })}
     </>
   )
 }

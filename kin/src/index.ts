@@ -5,9 +5,9 @@ import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-workspace'
 import z from '@deepseek-ai/schemastery'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startBridge, writeModelFile, type Bridge } from './bridge.js'
 import { calendar } from './calendar.js'
@@ -18,7 +18,7 @@ import { callOf, EMPTY, OWNER, rosterOf, type People } from './contact/people.js
 import { health } from './health/index.js'
 import { Heartbeat } from './heartbeat.js'
 import { Mind } from './mind.js'
-import { CONTEXT_WINDOW, PRESSURE_RATIO, HEADROOM_TOKENS, OUTPUT_BUDGET } from './model-budget.js'
+import { CONTEXT_WINDOW, IDLE_COMPACT_TOKENS, PRESSURE_RATIO, HEADROOM_TOKENS, OUTPUT_BUDGET } from './model-budget.js'
 import { KinModel, LANES, PROVIDER, type Lane, type Route } from './models.js'
 import { KIN, memoriesOf, RECALL, type Dimension } from './render.js'
 import type { ReplyTarget } from './reply-output.js'
@@ -243,11 +243,38 @@ export function apply(ctx: Context, config: Config) {
     return opening.get(key)!
   }
 
+  const CATALOG_TTL_MS = 5 * 60_000
+  let catalogCache: { value: Awaited<ReturnType<NonNullable<ReturnType<typeof ctx.get<'sessionController'>>>['modelCatalog']>> | null; at: number } | undefined
+  let catalogPending: Promise<NonNullable<typeof catalogCache>['value']> | undefined
+  const getCatalog = async (refresh = false) => {
+    const fresh = !refresh && catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS
+    if (fresh) return catalogCache!.value
+    const controller = ctx.get('sessionController')
+    if (!controller) return null
+    const fetchNow = () => {
+      if (catalogPending) return catalogPending
+      catalogPending = controller.modelCatalog()
+        .then((value) => { catalogCache = { value, at: Date.now() }; return value })
+        .catch(() => catalogCache?.value ?? null)
+        .finally(() => { catalogPending = undefined })
+      return catalogPending
+    }
+    // Serve stale catalog immediately and refresh in the background so Settings never stalls on upstream model probes.
+    if (!refresh && catalogCache?.value) {
+      void fetchNow()
+      return catalogCache.value
+    }
+    return fetchNow()
+  }
+
   let dimensions: Record<string, Dimension> = {}
-  const ready = (async () => {
+  const initMind = mind.gateInit(async () => {
     writeModelFile(mind.modelFile, await bridge.url, bridge.key)
     // A fresh mind's first memory is its own awakening, so it is true when recalled.
     await mind.call('ensure-initialized', { text: '我在这台电脑上醒来了。从今天起，我住在这里。' })
+  })
+  const ready = (async () => {
+    await initMind
     await syncPersona()
     // DSH compacts KIN's conversations itself and the preset tells Core when it does, so Core need
     // not ration recall over a conversation's whole life (its 12K-token cap would end recall for good).
@@ -257,10 +284,16 @@ export function apply(ctx: Context, config: Config) {
       if (!sessions[key]) await conversation(key, entry)
     }
     // What a previous run left half done is settled before her state is read and her minute starts.
-    await heartbeat.start().catch((error: Error) => ctx.logger('kin').warn('heartbeat did not start: %s', error.message))
-    const { state } = await mind.call('read')
-    dimensions = Object.fromEntries(Object.entries(state.dimensions as Record<string, Dimension>)
-      .map(([key, value]) => [key, { label: value.label, baseline: value.baseline }]))
+    const loadDimensions = async () => {
+      const { state } = await mind.call('read', { projection: 'page' })
+      dimensions = Object.fromEntries(Object.entries(state.dimensions as Record<string, Dimension>)
+        .map(([key, value]) => [key, { label: value.label, baseline: value.baseline }]))
+    }
+    let loadedDimensions = false
+    await heartbeat.start(async () => { await loadDimensions(); loadedDimensions = true })
+      .catch((error: Error) => ctx.logger('kin').warn('heartbeat did not start: %s', error.message))
+    if (!loadedDimensions) await loadDimensions()
+    void getCatalog().catch(() => {})
   })()
   ready.catch((error) => ctx.logger('kin').warn('mind is not ready: %s', error.message))
 
@@ -320,7 +353,7 @@ export function apply(ctx: Context, config: Config) {
       // Her page asks only while it is open and in front (client/api.ts), so asking is the owner being there.
       seen = Date.now()
       const [overview, read, liveness, plans] = await Promise.all([
-        mind.call('state-overview', { query: '' }), mind.call('read'), mind.call('liveness-facts'), mind.call('autonomous-plans', { status: 'active' }),
+        mind.call('state-overview', { query: '' }), mind.call('read', { projection: 'page' }), mind.call('liveness-facts'), mind.call('autonomous-plans', { status: 'active' }),
       ])
       return {
         overview, state: read.state, drives: read.drives, liveness, plans: plans.plans,
@@ -330,8 +363,11 @@ export function apply(ctx: Context, config: Config) {
     },
   })
 
-  // The desktop conversation with KIN, talked to in KIN's own chat box.
-  route('/api/kin/chat', { POST: () => conversation('app', { channel: 'app', title: '和 KIN 的聊天' }) })
+  // The desktop conversation with KIN, talked to in KIN's own chat box (decoupled from slow home state reads).
+  route('/api/kin/chat', {
+    GET: () => (sessions['app'] ? Promise.resolve(sessions['app']) : conversation('app', { channel: 'app', title: '和 KIN 的聊天' })),
+    POST: () => conversation('app', { channel: 'app', title: '和 KIN 的聊天' }),
+  })
 
   // Her inner world. Diary replies and sealed letters are the owner's own words, kept as such.
   route('/api/kin/diary', { GET: async (request) => {
@@ -356,15 +392,79 @@ export function apply(ctx: Context, config: Config) {
       return mind.call('seal-letter', { text, unlock_at, command_id: randomUUID() })
     },
   })
+  route('/api/kin/letters/read', {
+    POST: async (request) => {
+      const { id } = await body<{ id: string }>(request)
+      if (!id) throw new Error('没说要拆哪一封')
+      return mind.call('letter-read', { id })
+    },
+  })
   route('/api/kin/explore', {
     GET: async () => {
       const [read, plans, explorations] = await Promise.all([
-        mind.call('read'), mind.call('autonomous-plans', { status: 'active' }), mind.call('explorations', { limit: 20 }),
+        mind.call('read', { projection: 'page', include_cadence: true, include_findings: true }), mind.call('autonomous-plans', { status: 'active' }), mind.call('explorations', { limit: 20 }),
       ])
       return {
         wishes: (read.state.desires as { kind?: string }[]).filter((wish) => wish.kind === 'explore'),
         explorations: explorations.activities, findings: read.findings, cadence: read.exploration_cadence, plans: plans.plans,
       }
+    },
+  })
+  route('/api/kin/traits', { GET: () => mind.call('traits', { limit: 30 }) })
+  route('/api/kin/traits/revoke', {
+    POST: async (request) => {
+      const { id, revision, text, reason } = await body<{ id: string; revision?: number; text?: string; reason?: string }>(request)
+      if (!id) throw new Error('没说要改哪一条')
+      const note = reason?.trim() || '我觉得这条不太像现在的我'
+      const scope = { channel: 'app', recipient_person_id: OWNER, conversation_key: 'app' }
+      const { source_id } = await mind.call('ingest', {
+        id: 'trait-revoke:' + randomUUID(), text: `关于你记的自己「${(text ?? '').slice(0, 80)}」：${note}`, at: new Date().toISOString(),
+        session: sessions['app']?.sessionId, speaker_person_id: OWNER, ...scope,
+      })
+      const answer = await mind.call('trait-revoke', {
+        trait_id: id, ...(typeof revision === 'number' ? { expected_revision: revision } : {}), source_id, reason: note,
+      })
+      heartbeat.nudge()
+      return answer
+    },
+  })
+  route('/api/kin/creations', { GET: () => mind.call('creations', { limit: 24 }) })
+  const CREATION_TYPES: Record<string, string> = {
+    '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8', '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+    '.svg': 'image/svg+xml; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.pdf': 'application/pdf', '.py': 'text/plain; charset=utf-8', '.js': 'text/plain; charset=utf-8',
+  }
+  route('/api/kin/creations/file', {
+    GET: async (request) => {
+      const rel = new URL(request.url).searchParams.get('path') ?? ''
+      const creationRoot = load<{ creation_directory?: string }>('mind-config.json', {}).creation_directory || join(config.dataDir, 'KIN', 'creations')
+      const base = realpathSync(creationRoot)
+      const target = realpathSync(resolve(base, rel))
+      if (!target.startsWith(base + sep)) throw new Error('not a creation file')
+      const stat = statSync(target)
+      if (!stat.isFile() || stat.size > 16 * 1024 * 1024) throw new Error('file unavailable')
+      const ext = extname(target).toLowerCase()
+      const headers: Record<string, string> = {
+        'content-type': CREATION_TYPES[ext] ?? 'application/octet-stream',
+        'x-content-type-options': 'nosniff',
+      }
+      if (ext === '.html' || ext === '.htm' || ext === '.svg') {
+        headers['content-security-policy'] = "sandbox allow-scripts; default-src 'self' 'unsafe-inline' data: blob:"
+      }
+      return new Response(readFileSync(target), { headers })
+    },
+  })
+  route('/api/kin/elsewhere', {
+    GET: async () => {
+      const memory = await mind.call('memory-context', {
+        query: '', mode: 'light', purpose: 'chat', recipient_person_id: OWNER, conversation_key: 'app', recent_dialogue: 'other-conversations',
+      })
+      const turns = ((memory.recent_dialogue ?? []) as { role: string; text: string; occurred_at: string; channel?: string; kind?: string; state?: string; source_id: string }[])
+        .filter((t) => t.text?.trim() && t.channel && t.channel !== 'app')
+        .slice(-10)
+        .map((t) => ({ id: t.source_id, role: t.role, text: t.text, at: t.occurred_at, channel: t.channel!, kind: t.kind, state: t.state }))
+      return { turns }
     },
   })
   // Her memories as the owner reads them on her page: "你" is the owner, "她" is KIN.
@@ -396,17 +496,22 @@ export function apply(ctx: Context, config: Config) {
 
   // Settings live on KIN's own page: who she is, which models she speaks with, which inner-life parts are on.
   route('/api/kin/settings', {
-    GET: async () => {
+    GET: async (request) => {
+      const refresh = new URL(request.url).searchParams.get('refresh') === '1'
       const [read, catalog] = await Promise.all([
-        mind.call('read'),
-        ctx.get('sessionController')?.modelCatalog().catch(() => null) ?? null,
+        mind.call('read', { projection: 'settings' }),
+        getCatalog(refresh),
       ])
-      const settings = read.memory.settings as Record<string, boolean>
+      const settings = (read.memory?.settings ?? {}) as Record<string, boolean>
       return {
         persona: personaText(persona),
         features: Object.fromEntries(FEATURES.map((key) => [key, settings[key] === true])),
         models: {
-          budget: { inputWindow: CONTEXT_WINDOW, compactAt: Math.floor(CONTEXT_WINDOW * PRESSURE_RATIO), outputBudget: OUTPUT_BUDGET, headroom: HEADROOM_TOKENS },
+          budget: {
+            inputWindow: CONTEXT_WINDOW, compactAt: Math.floor(CONTEXT_WINDOW * PRESSURE_RATIO),
+            idleCompactAt: IDLE_COMPACT_TOKENS,
+            outputBudget: OUTPUT_BUDGET, headroom: HEADROOM_TOKENS,
+          },
           lanes: Object.fromEntries(LANES.map((lane) => [lane, {
             routes: routes[lane] ?? [], last: model.last[lane] ?? null, fallback: catalog?.default ?? null,
           }])),

@@ -234,6 +234,9 @@ export function calendar(host: Host) {
   // Her finished plans, read whole from Core each time: kept a few minutes, so an open calendar does not
   // keep her mind's one resident process busy with it.
   let finished: { at: number; items: Item[] } | undefined
+  // Short-lived gather dedupe so concurrent widgets (<Today /> + <UseWeek />) share one Core read.
+  const gatheredCache = new Map<string, { at: number; value: Promise<{ items: Item[]; partial: boolean }> }>()
+  const invalidateCalendar = () => gatheredCache.clear()
   // The marks, and the ids of the schedules kin_routine made.
   const book = host.load<{ marks: Mark[]; routines: string[] }>('calendar.json', { marks: [], routines: [] })
   const keep = () => host.save('calendar.json', book)
@@ -360,7 +363,7 @@ export function calendar(host: Host) {
         { id: `anniversary:${entry.date}:${entry.title}`, kind: 'anniversary', at: entry.date, title: entry.title, note: entry.years ? `${entry.years} 周年` : undefined, done: entry.date < today || undefined }))),
       // When she means to think again, what she wants, and what the two of them agreed on.
       read('her state', async () => {
-        const { state, memory } = await mind.call('read')
+        const { state, memory } = await mind.call('read', { projection: 'page' })
         return [
           ...(memory?.review ? [{ id: 'review', kind: 'review' as const, at: memory.review as string, title: '静下来再想一想' }] : []),
           ...(state.desires as { id: string; status: string; content?: string; topic?: string; expired?: boolean }[])
@@ -447,11 +450,20 @@ export function calendar(host: Host) {
   host.route('/api/kin/calendar', {
     GET: async (request) => {
       const query = new URL(request.url).searchParams
-      return gather(Date.parse(query.get('from')!), Date.parse(query.get('to')!), query.has('ahead'))
+      const from = Date.parse(query.get('from')!)
+      const to = Date.parse(query.get('to')!)
+      const ahead = query.has('ahead')
+      const key = `${from}:${to}:${ahead}`
+      const hit = gatheredCache.get(key)
+      if (hit && Date.now() - hit.at < 5_000) return hit.value
+      const pending = gather(from, to, ahead).catch((err) => { gatheredCache.delete(key); throw err })
+      gatheredCache.set(key, { at: Date.now(), value: pending })
+      return pending
     },
     // The owner leaves her a reminder for a time (`at`, `text`), or takes back one left here (`remove`); marks a
     // stretch of days (`from`, `to`, `text`), or takes one off (`unmark`).
     POST: async (request) => {
+      invalidateCalendar()
       const { at, text, remove, from, to, unmark: off } = await host.body<{ at: string; text: string; remove: string; from: string; to: string; unmark: string }>(request)
       if (off) return { removed: unmark(off) }
       if (from) {

@@ -1,11 +1,18 @@
 /** KIN checkpoint generation; DSH owns selection, locking, durable replacement and retention. */
 import type { Context } from '@deepseek-ai/cordis'
-import { SessionSeq } from '@deepseek-ai/dsh-session'
+import { SessionSeq, type Session } from '@deepseek-ai/dsh-session'
 import { BasicCompactionEngine, type BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import { assistantStreamHasVisibleText, assistantStreamChunks, BlockAssembler, createSystemMessage, createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-token-meter'
+import { IDLE_COMPACT_MS, IDLE_COMPACT_TOKENS } from './model-budget.js'
+
+export interface KinCompactionConfig extends BasicCompactionConfig {
+  idleCompactTokens?: number
+  idleCompactMs?: number
+}
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap { 'kin-compaction': { readonly kind: 'kin-compaction' } }
@@ -38,9 +45,20 @@ function validateCheckpoint(blocks: ReturnType<BlockAssembler['blocks']>): void 
   if (bodies.every(body => /^[-*] \(none\)$/.test(body))) throw new Error('compaction returned an empty checkpoint')
 }
 
+function lastActivityMs(session: Session): number {
+  for (let seq = Number(session.seq) - 1; seq >= 0; seq--) {
+    const time = session.eventAt(SessionSeq(seq))?.time
+    if (time === undefined) continue
+    const ms = typeof time === 'number' ? time : Date.parse(String(time))
+    if (Number.isFinite(ms)) return ms
+  }
+  return Date.now()
+}
+
 export default class KinCompactionEngine extends BasicCompactionEngine {
-  constructor(ctx: Context, config: BasicCompactionConfig = {}) {
-    super(ctx, config)
+  constructor(ctx: Context, config: KinCompactionConfig = {}) {
+    const { idleCompactTokens = IDLE_COMPACT_TOKENS, idleCompactMs = IDLE_COMPACT_MS, ...basicConfig } = config
+    super(ctx, basicConfig)
     // LlmRuntime converts adapter exceptions back into terminal chunks. Stop recovery at the
     // agent boundary too: text handed to a channel may still be in flight when this error arrives.
     ctx.on('agent/request-error', async ({ agent, turn, step }, next) => {
@@ -55,6 +73,55 @@ export default class KinCompactionEngine extends BasicCompactionEngine {
       }
       return next()
     }, { prepend: true })
+
+    if (basicConfig.auto !== false && idleCompactTokens > 0 && idleCompactMs > 0) {
+      const timers = new Map<string, NodeJS.Timeout>()
+      const lifecycle = new AbortController()
+      const clear = (id: string) => {
+        const timer = timers.get(id)
+        if (!timer) return
+        clearTimeout(timer)
+        timers.delete(id)
+      }
+      const scheduleIdleCheck = (agent: Agent) => {
+        const id = agent.session.id
+        clear(id)
+        if (lifecycle.signal.aborted || agent.status !== 'idle') return
+        const total = this.ctx.tokenMeter?.measure(agent.session, agent.session.requestHeader()).totalTokens ?? 0
+        if (total <= idleCompactTokens) return
+        const elapsed = Math.max(0, Date.now() - lastActivityMs(agent.session))
+        const waitMs = Math.max(20, idleCompactMs - elapsed)
+        const timer = setTimeout(() => {
+          timers.delete(id)
+          if (lifecycle.signal.aborted || agent.status !== 'idle') return
+          if (Date.now() - lastActivityMs(agent.session) < idleCompactMs - 200) return scheduleIdleCheck(agent)
+          void (async () => {
+            try {
+              const pruner = (this.ctx as { get?: (k: string) => { pruneSession?(s: Session): void } | undefined }).get?.('toolResultPruner')
+              pruner?.pruneSession?.(agent.session)
+              const current = this.ctx.tokenMeter?.measure(agent.session, agent.session.requestHeader()).totalTokens ?? 0
+              if (current <= idleCompactTokens) return
+              await this.compactNow(agent, lifecycle.signal)
+            } catch {
+              // User resumed, agent busy, or transient summarization failure: active pressure guard still protects turns.
+            }
+          })()
+        }, waitMs)
+        timer.unref()
+        timers.set(id, timer)
+      }
+      ctx.on('agent/created', ({ agent }) => { if (agent.status === 'idle') scheduleIdleCheck(agent); return undefined })
+      ctx.on('agent/status', ({ agent, status }) => {
+        if (status === 'running') clear(agent.session.id)
+        else scheduleIdleCheck(agent)
+      })
+      ctx.on('agent/disposed', ({ agent }) => clear(agent.session.id))
+      ctx.effect(() => () => {
+        lifecycle.abort()
+        for (const timer of timers.values()) clearTimeout(timer)
+        timers.clear()
+      }, 'kin idle compaction timers')
+    }
   }
 
   override async compactIfNeeded(agent: Agent, trigger: CompactionTrigger, signal: AbortSignal) {

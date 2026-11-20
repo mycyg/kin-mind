@@ -86,7 +86,7 @@ export class Heartbeat {
    * After start-up recovery: what a previous run left half done is settled before anything new runs. A recovery
    * that fails is tried again, a minute later and then up to ten apart: her minute must not stay stopped for it.
    */
-  async start() {
+  async start(beforeMinute?: () => Promise<void>) {
     if (this.closed) return
     try {
       await this.mind.run('recover')
@@ -97,6 +97,8 @@ export class Heartbeat {
       if (!this.closed) (this.retry = setTimeout(() => void this.start().catch((again: Error) => this.log(`heartbeat did not start: ${again.message}`)), wait)).unref()
       throw error
     }
+    if (this.closed) return
+    await beforeMinute?.()
     if (this.closed) return
     if (!this.paused) this.mind.keepWorker()
     this.timer = setInterval(() => this.minute(), MINUTE * this.pace)

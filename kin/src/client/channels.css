@@ -36,3 +36,7 @@
   .kin-channel-form .kin-inline-form input { flex: none; }
   .kin-channel-form .kin-inline-form > span { width: auto; padding-left: 14px; }
 }
+
+.kin-channel-compact { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; font-size: 12.5px; }
+.kin-voice-voices { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.kin-voice-preview { margin-left: auto; }

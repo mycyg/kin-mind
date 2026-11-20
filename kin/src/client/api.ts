@@ -11,19 +11,37 @@ export async function api<T>(route: string, body?: unknown): Promise<T> {
   return value as T
 }
 
-/** One route's latest answer, reloaded on demand and, when asked, every `everyMs`. */
-export function useApi<T>(route: string, everyMs?: number) {
-  const [data, setData] = useState<T>()
+// In-memory SWR cache across tab switches so returning to a section renders immediately with zero flash.
+const cache = new Map<string, unknown>()
+export function invalidateApi(prefix?: string) {
+  if (!prefix) return cache.clear()
+  for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key)
+}
+
+/** One route's latest answer, cached across unmounts, reloaded on demand and, when asked, every `everyMs`. */
+export function useApi<T>(route: string | undefined, everyMs?: number) {
+  const [data, setData] = useState<T | undefined>(() => (route ? (cache.get(route) as T | undefined) : undefined))
   const [error, setError] = useState<string>()
   // Only the latest request lands: a slower earlier one (last month's page, an older poll) is dropped.
   const latest = useRef(0)
-  const reload = useCallback(() => {
+  useEffect(() => {
+    setData(route ? (cache.get(route) as T | undefined) : undefined)
+    setError(undefined)
+  }, [route])
+  const reload = useCallback((overrideRoute?: unknown) => {
+    const target = typeof overrideRoute === 'string' ? overrideRoute : route
+    if (!target) return Promise.resolve()
     const asked = ++latest.current
-    return api<T>(route)
-      .then((value) => { if (asked === latest.current) { setData(value); setError(undefined) } })
+    return api<T>(target)
+      .then((value) => {
+        cache.set(target, value)
+        if (route && target !== route) cache.set(route, value)
+        if (asked === latest.current) { setData(value); setError(undefined) }
+      })
       .catch((reason: Error) => { if (asked === latest.current) setError(reason.message) })
   }, [route])
   useEffect(() => {
+    if (!route) return
     void reload()
     if (!everyMs) return
     const refresh = () => { if (!document.hidden && document.hasFocus()) void reload() }
@@ -35,7 +53,7 @@ export function useApi<T>(route: string, everyMs?: number) {
       window.removeEventListener('focus', refresh)
       document.removeEventListener('visibilitychange', refresh)
     }
-  }, [reload, everyMs])
+  }, [route, reload, everyMs])
   return { data, error, reload }
 }
 
@@ -55,6 +73,7 @@ export interface Home {
     dimension_groups: Group[]
     desires: Wish[]
     concerns: Concern[]
+    easing_omitted?: number
     rhythm?: { status?: string; phase?: string }
     affect_layers?: { feeling?: { text?: string }; undertone?: { text?: string }; vitals?: { heart_rate_bpm?: number; status?: string } }
     /** Her latest review: what she made of things, in her words, and when. */
@@ -70,6 +89,35 @@ export interface Home {
   /** When she means to think things over again, as she set it herself. */
   nextReview: string | null
   chat: { sessionId: string } | null
+}
+
+export interface CreationArtifact { path: string; name: string; bytes: number }
+export interface CreationItem {
+  id: string
+  plan_id: string
+  title: string
+  step_goal?: string
+  summary?: string
+  finished_at: string
+  artifacts: CreationArtifact[]
+}
+export interface TraitItem {
+  id: string
+  category: string
+  text: string
+  revision: number
+  status: 'candidate' | 'established' | 'revoked' | 'needs_review' | string
+  reason?: string
+  updated_at?: string
+}
+export interface ElsewhereTurn {
+  id: string
+  role: string
+  text: string
+  at: string
+  channel: string
+  kind?: string
+  state?: string
 }
 
 export interface Beat {
@@ -161,7 +209,7 @@ export interface Settings {
   persona: string
   features: Record<Feature, boolean>
   models: {
-    budget?: { inputWindow: number; compactAt: number; outputBudget: number; headroom: number }
+    budget?: { inputWindow: number; compactAt: number; idleCompactAt?: number; outputBudget: number; headroom: number }
     lanes: { chat: LaneState; task: LaneState }
     catalog: { id: string; name: string; models: { id: string; name: string; reasoning?: { efforts: { id: string; name: string }[] } }[] }[]
   }

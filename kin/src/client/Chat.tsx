@@ -12,9 +12,10 @@ import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/
 import type { FileAttachmentRef, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { answerText } from '../model-output.js'
-import { useApi } from './api.js'
-import { Close, Heart, Helper, Stop } from './icons.js'
+import { useApi, type ElsewhereTurn } from './api.js'
+import { ArrowDown, ChevronDown, Close, Headphones, Heart, Helper, Pause, Play, Stop } from './icons.js'
 import { Orb } from './Orb.js'
+import { RichText } from './RichText.js'
 import { clock, day } from './time.js'
 
 declare module '@deepseek-ai/dsh-api-session-controller/client' {
@@ -35,6 +36,41 @@ type Item =
   | { kind: 'me'; key: string; text: string; at: number; pictures: Shot[]; files: { name: string; bytes: number }[]; pending?: boolean; via?: string }
   | { kind: 'kin'; key: string; text: string; at: number; live?: boolean; media?: { kind: 'image' | 'voice'; file: string } }
   | { kind: 'act'; key: string; text: string; at: number }
+
+type DisplayRow =
+  | { kind: 'day'; key: string; label: string }
+  | { kind: 'act'; key: string; text: string; at: number }
+  | { kind: 'act-group'; key: string; acts: { key: string; text: string; at: number }[] }
+  | { kind: 'me'; key: string; text: string; at: number; pictures: Shot[]; files: { name: string; bytes: number }[]; pending?: boolean; via?: string; first: boolean }
+  | { kind: 'kin'; key: string; text: string; at: number; live?: boolean; media?: { kind: 'image' | 'voice'; file: string }; first: boolean }
+
+function groupRows(items: Item[]): DisplayRow[] {
+  const rows: DisplayRow[] = []
+  let i = 0
+  while (i < items.length) {
+    const item = items[i]!
+    if (item.kind === 'day') {
+      rows.push(item)
+      i++
+      continue
+    }
+    if (item.kind === 'act') {
+      const acts: { key: string; text: string; at: number }[] = []
+      while (i < items.length && items[i]!.kind === 'act') {
+        const cur = items[i] as Extract<Item, { kind: 'act' }>
+        acts.push({ key: cur.key, text: cur.text, at: cur.at })
+        i++
+      }
+      if (acts.length >= 2) rows.push({ kind: 'act-group', key: 'ag:' + acts[0]!.key, acts })
+      else rows.push({ kind: 'act', ...acts[0]! })
+      continue
+    }
+    const prev = items[i - 1]
+    rows.push({ ...item, first: prev?.kind !== item.kind })
+    i++
+  }
+  return rows
+}
 
 /** A file DSH has staged for her session: the receipt a prompt cites, and what it keeps. */
 interface Staged { receiptId: Extract<PromptContentPart, { type: 'file' }>['receiptId']; file: FileAttachmentRef }
@@ -100,11 +136,14 @@ export function createChat(ctx: Context) {
     return binding
   }
 
-  return function Chat({ sessionId, warmth, seed }: { sessionId: string | undefined; warmth: number; seed?: Seed }) {
+  return function Chat({ sessionId, warmth, seed, onSpeakingChange }: {
+    sessionId: string | undefined; warmth: number; seed?: Seed; onSpeakingChange?: (speaking: boolean) => void
+  }) {
     const binding = useBinding(sessionId)
     const events = useObservable(binding?.eventSource as Observable<EventWindow> | undefined)
     const session = useObservable(binding?.session as Observable<SessionView> | undefined)
     const items = useMemo(() => assemble(events?.entries ?? [], session?.pendingSubmissions ?? []), [events, session?.pendingSubmissions])
+    const rows = useMemo(() => groupRows(items), [items])
     const running = session?.running ?? false
     const typing = running && items.at(-1)?.kind !== 'kin'
 
@@ -112,8 +151,13 @@ export function createChat(ctx: Context) {
     const [notice, setNotice] = useState<string>()
     const [dropping, setDropping] = useState(false)
     const [viewing, setViewing] = useState<Viewing>()
+    const [atBottom, setAtBottom] = useState(true)
+    const [expandedActs, setExpandedActs] = useState<Record<string, boolean>>({})
+    const [elsewhereOpen, setElsewhereOpen] = useState(false)
     // The microphone shows only where her host can write out what is said (channels/index.ts).
     const hearing = useApi<{ hearing: boolean }>('api/kin/hear').data?.hearing ?? false
+    const elsewhere = useApi<{ turns: ElsewhereTurn[] }>('api/kin/elsewhere', 30_000)
+    const elsewhereTurns = elsewhere.data?.turns ?? []
     // A file still on its way to the host holds the message back.
     const waiting = drafts.some((draft) => draft.kind === 'file' && !draft.staged)
     // Read without `inject`, so the chat still opens where the service is not mounted: pictures only then.
@@ -235,12 +279,73 @@ export function createChat(ctx: Context) {
 
     const ready = binding && session?.openState === 'open'
     const refusal = session?.promptError?.error
+
+    // Unfocused desktop notification when a new non-streaming message from KIN arrives.
+    const seenKinRef = useRef<string | null>(null)
+    const readySessionRef = useRef<string | undefined>(undefined)
+    useEffect(() => { readySessionRef.current = undefined; seenKinRef.current = null }, [sessionId])
+    const latestCommittedKin = useMemo(
+      () => [...items].reverse().find((it): it is Extract<Item, { kind: 'kin' }> => it.kind === 'kin' && !it.live && Boolean(it.text.trim())),
+      [items],
+    )
+    useEffect(() => {
+      if (!ready || !sessionId) return
+      if (readySessionRef.current !== sessionId) {
+        readySessionRef.current = sessionId
+        seenKinRef.current = latestCommittedKin?.key ?? '__empty__'
+        return
+      }
+      if (!latestCommittedKin || latestCommittedKin.key === seenKinRef.current) return
+      seenKinRef.current = latestCommittedKin.key
+      if ((document.hidden || !document.hasFocus()) && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        const note = new Notification('KIN', { body: latestCommittedKin.text.slice(0, 140), tag: 'kin-chat' })
+        note.onclick = () => { window.focus(); note.close() }
+      }
+    }, [ready, sessionId, latestCommittedKin?.key])
+
+    const latestKinKey = latestCommittedKin?.key
+    const latestKinText = latestCommittedKin?.text
+    const elsewhereChannels = useMemo(
+      () => [...new Set(elsewhereTurns.map((t) => CHANNELS[t.channel.split(':')[0]!] ?? t.channel))].join(' / '),
+      [elsewhereTurns],
+    )
+
     return (
       <div className="kin-chat" onDragEnter={(event) => { if (binding && event.dataTransfer.types.includes('Files')) setDropping(true) }}>
+        {elsewhereTurns.length || hearing ? (
+          <div className="kin-chat-bar">
+            {elsewhereTurns.length ? (
+              <div className="kin-elsewhere">
+                <button type="button" className="kin-elsewhere-toggle" aria-expanded={elsewhereOpen} onClick={() => setElsewhereOpen((v) => !v)}>
+                  <span>最近在{elsewhereChannels}聊过 · {elsewhereTurns.length} 条</span>
+                  <ChevronDown size={13} className={elsewhereOpen ? 'kin-rot' : undefined} />
+                </button>
+              </div>
+            ) : <span />}
+            {hearing ? (
+              <VoiceCompanion ready={Boolean(ready)} running={running} latestKinKey={latestKinKey} latestKinText={latestKinText}
+                onSend={(text) => send(text)} onSpeakingChange={onSpeakingChange} onNotice={setNotice} />
+            ) : null}
+          </div>
+        ) : null}
+        {elsewhereOpen && elsewhereTurns.length ? (
+          <div className="kin-elsewhere-list" aria-label="其他渠道最近对话">
+            {elsewhereTurns.map((t) => (
+              <div key={t.id} className="kin-elsewhere-item">
+                <span className="kin-tag">{CHANNELS[t.channel.split(':')[0]!] ?? t.channel}</span>
+                <span className="kin-elsewhere-who">{t.role === 'assistant' ? '她' : '你'}</span>
+                <span className="kin-elsewhere-text">{t.text.length > 84 ? t.text.slice(0, 84) + '…' : t.text}</span>
+                {t.at ? <time className="kin-dim">{clock(new Date(t.at).getTime())}</time> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
         <div className="kin-chat-list" ref={list}
           onScroll={(event) => {
             const element = event.currentTarget
-            pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
+            const dist = element.scrollHeight - element.scrollTop - element.clientHeight
+            pinned.current = dist < 80
+            setAtBottom(dist < 120)
           }}>
           {events?.hasMore ? (
             <button type="button" className="kin-older" onClick={loadOlder} disabled={session?.loadingOlder}>
@@ -248,24 +353,51 @@ export function createChat(ctx: Context) {
             </button>
           ) : null}
           {ready && items.length === 0 ? <Hello warmth={warmth} onPick={send} /> : null}
-          {!ready ? <div className="kin-chat-wait">{session?.openState === 'error' ? '聊天记录没打开，稍后再试试' : '正在打开和她的聊天…'}</div> : null}
-          {items.map((item, index) => {
-            if (item.kind === 'day') return <div key={item.key} className="kin-day"><span>{item.label}</span></div>
-            if (item.kind === 'act') {
-              return <div key={item.key} className="kin-act"><Helper size={14} /><span>{item.text}</span></div>
+          {!ready ? (session?.openState === 'error'
+            ? <div className="kin-chat-wait">聊天记录没打开，稍后再试试</div>
+            : (
+              <div className="kin-chat-skeletons" aria-label="正在打开和她的聊天">
+                <span className="kin-skel-bubble" data-from="kin" style={{ width: '58%' }} />
+                <span className="kin-skel-bubble" data-from="me" style={{ width: '42%' }} />
+                <span className="kin-skel-bubble" data-from="kin" style={{ width: '68%' }} />
+                <span className="kin-skel-bubble" data-from="me" style={{ width: '36%' }} />
+              </div>
+            )) : null}
+          {rows.map((row) => {
+            if (row.kind === 'day') return <div key={row.key} className="kin-day"><span>{row.label}</span></div>
+            if (row.kind === 'act') {
+              return <div key={row.key} className="kin-act"><Helper size={14} /><span>{row.text}</span></div>
             }
-            const previous = items[index - 1]
-            const first = previous?.kind !== item.kind
-            const attached = item.kind === 'me' && item.pictures.length + item.files.length > 0
-            return (
-              <div key={item.key} className="kin-msg" data-from={item.kind} data-first={first ? '' : undefined}
-                data-pending={item.kind === 'me' && item.pending ? '' : undefined}>
-                {item.kind === 'kin' ? (first ? <Orb size={28} warmth={warmth} /> : <span className="kin-msg-gap" />) : null}
-                <div className="kin-bubble" title={clock(item.at)} data-attached={attached ? '' : undefined}>
-                  {item.kind === 'me' && item.via ? <span className="kin-via">{item.via}</span> : null}
-                  {item.kind === 'me' && attached ? <Attached pictures={item.pictures} files={item.files} text={item.text} session={binding?.session} onView={setViewing} />
-                    : item.kind === 'kin' && item.media ? <Media {...item.media} words={item.text} /> : item.text}
+            if (row.kind === 'act-group') {
+              const open = Boolean(expandedActs[row.key])
+              const latest = row.acts.at(-1)!
+              return (
+                <div key={row.key} className="kin-act-group">
+                  <button type="button" className="kin-act-toggle" aria-expanded={open}
+                    onClick={() => setExpandedActs((now) => ({ ...now, [row.key]: !now[row.key] }))}>
+                    <Helper size={14} />
+                    <span>做了 {row.acts.length} 件事 · {latest.text}</span>
+                    <ChevronDown size={12} className={open ? 'kin-rot' : undefined} />
+                  </button>
+                  {open ? (
+                    <div className="kin-act-sublist">
+                      {row.acts.map((act) => <div key={act.key} className="kin-act"><span>{act.text}</span></div>)}
+                    </div>
+                  ) : null}
                 </div>
+              )
+            }
+            const attached = row.kind === 'me' && row.pictures.length + row.files.length > 0
+            return (
+              <div key={row.key} className="kin-msg" data-from={row.kind} data-first={row.first ? '' : undefined}
+                data-pending={row.kind === 'me' && row.pending ? '' : undefined}>
+                {row.kind === 'kin' ? (row.first ? <Orb size={28} warmth={warmth} /> : <span className="kin-msg-gap" />) : null}
+                <div className="kin-bubble" title={clock(row.at)} data-attached={attached ? '' : undefined}>
+                  {row.kind === 'me' && row.via ? <span className="kin-via">{row.via}</span> : null}
+                  {row.kind === 'me' && attached ? <Attached pictures={row.pictures} files={row.files} text={row.text} session={binding?.session} onView={setViewing} />
+                    : row.kind === 'kin' && row.media ? <Media {...row.media} words={row.text} /> : <RichText text={row.text} />}
+                </div>
+                <time className="kin-msg-time">{clock(row.at)}</time>
               </div>
             )
           })}
@@ -277,6 +409,15 @@ export function createChat(ctx: Context) {
           ) : null}
           {!running && session?.lastAgentError ? <div className="kin-chat-error">她刚才没能说出来：{session.lastAgentError}</div> : null}
         </div>
+        {!atBottom && items.length > 0 ? (
+          <button type="button" className="kin-to-bottom kin-glass" onClick={() => {
+            pinned.current = true
+            setAtBottom(true)
+            list.current?.scrollTo({ top: list.current.scrollHeight, behavior: 'smooth' })
+          }}>
+            <ArrowDown size={14} /> 回到底部
+          </button>
+        ) : null}
         <Composer running={running} drafts={drafts} waiting={waiting} picturesOnly={!upload} hearing={hearing} seed={seed}
           onAttach={attach} onDiscard={discard} onSend={send} onStop={() => void binding?.session.cancel()} onNotice={setNotice}
           error={notice ?? (refusal ? `没发出去：${REFUSED[refusal.details?.reason ?? ''] ?? refusal.message}` : undefined)} />
@@ -508,7 +649,7 @@ function Attached({ pictures, files, text, session, onView }: {
         </div>
       ) : null}
       {files.map((file, index) => <FileChip key={index} name={file.name} note={sizeOf(file.bytes)} />)}
-      {text ? <span className="kin-caption">{text}</span> : null}
+      {text ? <div className="kin-caption"><RichText text={text} /></div> : null}
     </>
   )
 }
@@ -656,7 +797,231 @@ function assemble(entries: readonly SessionEventLikeEntry[], pending: readonly P
 function Media({ kind, file, words }: { kind: 'image' | 'voice'; file: string; words: string }) {
   const src = 'api/kin/media?file=' + encodeURIComponent(file)
   if (kind === 'image') return <img className="kin-sticker" src={src} alt={words} />
-  return <><audio className="kin-audio" controls preload="none" src={src} />{words}</>
+  return <VoiceBubble src={src} words={words} />
+}
+
+const WAVE_BARS = [42, 68, 52, 85, 96, 64, 48, 76, 92, 58, 44, 72, 88, 60, 50, 82, 66, 40]
+const formatSec = (s: number) => (!Number.isFinite(s) || s <= 0 ? '0:00' : `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`)
+
+function VoiceBubble({ src, words }: { src: string; words: string }) {
+  const audioRef = useRef<HTMLAudioElement>(null)
+  const [playing, setPlaying] = useState(false)
+  const [duration, setDuration] = useState(0)
+  const [current, setCurrent] = useState(0)
+  const toggle = () => {
+    const el = audioRef.current
+    if (!el) return
+    if (el.paused) void el.play().catch(() => setPlaying(false))
+    else el.pause()
+  }
+  const ratio = duration > 0 ? Math.min(1, current / duration) : 0
+  return (
+    <div className="kin-voice-msg">
+      <div className="kin-voice-pill">
+        <audio ref={audioRef} preload="metadata" src={src}
+          onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+          onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+          onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+          onEnded={() => { setPlaying(false); setCurrent(0) }} />
+        <button type="button" className="kin-voice-play" onClick={toggle} aria-label={playing ? '暂停语音' : '播放语音'}>
+          {playing ? <Pause size={12} /> : <Play size={12} />}
+        </button>
+        <div className="kin-voice-bars" onClick={(e) => {
+          const el = audioRef.current
+          if (!el || !duration) return
+          const rect = e.currentTarget.getBoundingClientRect()
+          el.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * duration
+        }}>
+          {WAVE_BARS.map((h, i) => (
+            <i key={i} className="kin-voice-bar" style={{ height: `${h}%` }} data-played={i / WAVE_BARS.length <= ratio ? '' : undefined} />
+          ))}
+        </div>
+        <span className="kin-voice-dur">{formatSec(playing || current > 0 ? current : duration)}</span>
+      </div>
+      {words ? <div className="kin-voice-words"><RichText text={words} /></div> : null}
+    </div>
+  )
+}
+
+type CallPhase = 'off' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+const CALL_LABELS: Record<CallPhase, string> = {
+  off: '语音陪伴',
+  listening: '在听你说话…（点此结束）',
+  transcribing: '正在听清…（点此结束）',
+  thinking: 'KIN 在想…（点此结束）',
+  speaking: 'KIN 在说话…（点此结束）',
+}
+
+function VoiceCompanion({ ready, running, latestKinKey, latestKinText, onSend, onSpeakingChange, onNotice }: {
+  ready: boolean; running: boolean; latestKinKey?: string; latestKinText?: string
+  onSend: (text: string) => boolean; onSpeakingChange?: (speaking: boolean) => void; onNotice: (msg?: string) => void
+}) {
+  const [phase, setPhase] = useState<CallPhase>('off')
+  const phaseRef = useRef<CallPhase>('off')
+  const setCallPhase = (next: CallPhase) => { phaseRef.current = next; setPhase(next) }
+  const sendRef = useRef(onSend)
+  sendRef.current = onSend
+  const latestKeyRef = useRef(latestKinKey)
+  latestKeyRef.current = latestKinKey
+  const speakRef = useRef(onSpeakingChange)
+  speakRef.current = onSpeakingChange
+
+  const streamRef = useRef<MediaStream>()
+  const audioCtxRef = useRef<AudioContext>()
+  const timerRef = useRef<number>()
+  const recRef = useRef<MediaRecorder>()
+  const playerRef = useRef<HTMLAudioElement>()
+  const playUrlRef = useRef<string>()
+  const pendingSinceRef = useRef<string>()
+
+  const stopAll = useCallback(() => {
+    setCallPhase('off')
+    if (timerRef.current) { window.clearInterval(timerRef.current); timerRef.current = undefined }
+    if (recRef.current) {
+      recRef.current.onstop = null
+      if (recRef.current.state === 'recording') recRef.current.stop()
+      recRef.current = undefined
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = undefined
+    void audioCtxRef.current?.close().catch(() => {})
+    audioCtxRef.current = undefined
+    playerRef.current?.pause()
+    playerRef.current = undefined
+    if (playUrlRef.current) { URL.revokeObjectURL(playUrlRef.current); playUrlRef.current = undefined }
+    speakRef.current?.(false)
+  }, [])
+
+  useEffect(() => () => stopAll(), [stopAll])
+
+  const startAll = async () => {
+    if (!ready) return onNotice('聊天还没准备好，稍等一下再开启语音陪伴')
+    onNotice(undefined)
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+    } catch {
+      return onNotice('打开麦克风失败：请在系统或浏览器里允许麦克风权限')
+    }
+    streamRef.current = stream
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    const ctxAudio = new AudioCtx()
+    audioCtxRef.current = ctxAudio
+    const source = ctxAudio.createMediaStreamSource(stream)
+    const analyser = ctxAudio.createAnalyser()
+    analyser.fftSize = 1024
+    source.connect(analyser)
+    const buf = new Uint8Array(analyser.fftSize)
+    setCallPhase('listening')
+
+    let lastSpeechAt = 0
+    let recordStartedAt = 0
+    let cooldownUntil = 0
+
+    const transcribeAndSend = async (audio: Blob) => {
+      const isOff = () => phaseRef.current === 'off'
+      if (isOff()) return
+      setCallPhase('transcribing')
+      try {
+        const res = await fetch('api/kin/hear', { method: 'POST', body: audio })
+        const body = await res.json().catch(() => ({})) as { text?: string; error?: string }
+        if (isOff()) return
+        if (!res.ok) throw new Error(body.error ?? `${res.status}`)
+        const spoken = body.text?.trim() ?? ''
+        if (!spoken) return setCallPhase('listening')
+        pendingSinceRef.current = latestKeyRef.current ?? '__none__'
+        setCallPhase('thinking')
+        if (!sendRef.current(spoken)) setCallPhase('listening')
+      } catch (err) {
+        onNotice('语音陪伴没听清：' + (err as Error).message)
+        if (!isOff()) setCallPhase('listening')
+      }
+    }
+
+    timerRef.current = window.setInterval(() => {
+      if (phaseRef.current !== 'listening') return
+      const now = Date.now()
+      if (now < cooldownUntil) return
+      analyser.getByteTimeDomainData(buf)
+      let sum = 0
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i]! - 128) / 128
+        sum += v * v
+      }
+      const rms = Math.sqrt(sum / buf.length)
+      if (rms > 0.028) {
+        lastSpeechAt = now
+        if (!recRef.current) {
+          const chunks: Blob[] = []
+          const take = new MediaRecorder(stream)
+          recordStartedAt = now
+          take.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data) }
+          take.onstop = () => {
+            recRef.current = undefined
+            if (phaseRef.current === 'off') return
+            const elapsed = Date.now() - recordStartedAt
+            const blob = new Blob(chunks, { type: take.mimeType })
+            if (elapsed < 450 || blob.size < 400) {
+              if (phaseRef.current === 'listening') setCallPhase('listening')
+              return
+            }
+            void transcribeAndSend(blob)
+          }
+          take.start()
+          recRef.current = take
+        }
+      } else if (recRef.current && (now - lastSpeechAt >= 950 || now - recordStartedAt >= 30_000)) {
+        recRef.current.stop()
+      }
+      cooldownUntil = 0
+    }, 60)
+  }
+
+  // When a new reply finishes while waiting in `'thinking'`, synthesize WAV and speak it back.
+  useEffect(() => {
+    if (phase !== 'thinking' || running || !latestKinKey || !latestKinText || latestKinKey === pendingSinceRef.current) return
+    pendingSinceRef.current = latestKinKey
+    setCallPhase('speaking')
+    speakRef.current?.(true)
+    const textToSpeak = latestKinText.trim().slice(0, 1200)
+    void fetch('api/kin/speak', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: textToSpeak }),
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`${res.status}`)
+        return res.blob()
+      })
+      .then(async (blob) => {
+        if (phaseRef.current !== 'speaking') return
+        if (playUrlRef.current) URL.revokeObjectURL(playUrlRef.current)
+        const url = URL.createObjectURL(blob)
+        playUrlRef.current = url
+        const audio = new Audio(url)
+        playerRef.current = audio
+        const finish = () => {
+          speakRef.current?.(false)
+          if (playUrlRef.current === url) { URL.revokeObjectURL(url); playUrlRef.current = undefined }
+          if (phaseRef.current !== 'off') setTimeout(() => { if (phaseRef.current !== 'off') setCallPhase('listening') }, 250)
+        }
+        audio.onended = finish
+        audio.onerror = finish
+        await audio.play()
+      })
+      .catch(() => {
+        speakRef.current?.(false)
+        if (phaseRef.current !== 'off') setCallPhase('listening')
+      })
+  }, [phase, running, latestKinKey, latestKinText])
+
+  return (
+    <button type="button" className="kin-call-btn" data-phase={phase === 'off' ? undefined : phase}
+      onClick={() => { if (phase === 'off') void startAll(); else stopAll() }}>
+      <Headphones size={14} />
+      <span>{CALL_LABELS[phase]}</span>
+    </button>
+  )
 }
 
 function textOf(content: readonly { type: string; text?: string }[]): string {

@@ -46,6 +46,9 @@
                   thresholdRatio: 0.9
                   headroomTokens: 32768
                   maxTokens: 16384
+                  summarizationProvider: kin
+                  summarizationModel: task
+                  retainTokens: 20000
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -140,6 +143,9 @@
                   thresholdRatio: 0.9
                   headroomTokens: 32768
                   maxTokens: 16384
+                  summarizationProvider: kin
+                  summarizationModel: task
+                  retainTokens: 20000
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner

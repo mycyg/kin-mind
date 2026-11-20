@@ -278,9 +278,75 @@ def _dispatch(config, action, request):
         # A letter whose day has come opens when it is looked for, not only at the review minute.
         sealed.open_due(mind)
         return sealed.entries(mind)
+    if action == "letter-read":
+        from . import sealed
+        from eventmem.core.db import Conflict, Missing
+        identifier = request.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("Letter id is required")
+        with engine.db.connect() as conn:
+            if not sealed._table(conn):
+                raise Missing(identifier)
+            row = conn.execute(f"SELECT * FROM {sealed.TABLE} WHERE id=? AND scope=?", (identifier, mind.scope.key())).fetchone()
+            if not row:
+                raise Missing(identifier)
+            if row["state"] != "opened":
+                raise Conflict("Sealed entry is not open yet", code="sealed-entry-locked")
+            record = engine._get(conn, sealed.root_id(row["source_id"]))
+            return {"id": row["id"], "kind": row["kind"], "unlock_at": row["unlock_at"],
+                    "created_at": row["created_at"], "opened_at": row["opened_at"], "text": record["content"]}
     if action == "seal-letter":
         from . import sealed
         return sealed.seal_letter(mind, request.get("text"), request.get("unlock_at"), request.get("command_id"))
+    if action == "creations":
+        from . import recipient
+        limit = max(1, min(40, int(request.get("limit", 24))))
+        root_dir = Path(config["creation_directory"]).resolve() if config.get("creation_directory") else None
+        items = []
+        with engine.db.connect() as conn:
+            has_runs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_plan_runs'").fetchone()
+            has_plans = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mind_plans'").fetchone()
+            if not has_runs or not has_plans:
+                return {"creations": []}
+            plan_rows = conn.execute("SELECT id,data FROM mind_plans WHERE scope=? AND " + recipient.predicate(), (mind.scope.key(),)).fetchall()
+            plans_by_id = {r["id"]: json.loads(r["data"]) for r in plan_rows}
+            run_rows = conn.execute("SELECT id,plan_id,step_id,data FROM mind_plan_runs WHERE scope=? AND actor='create' AND state='completed' ORDER BY rowid DESC LIMIT ?", (mind.scope.key(), limit * 2)).fetchall()
+            for r in run_rows:
+                plan = plans_by_id.get(r["plan_id"])
+                if not plan:
+                    continue
+                data = json.loads(r["data"])
+                res = data.get("result") or {}
+                raw_artifacts = res.get("artifacts") or []
+                artifacts = []
+                for art in raw_artifacts:
+                    rel = art.get("relative")
+                    abs_path = art.get("path")
+                    if not rel and root_dir and abs_path:
+                        try:
+                            rel = str(Path(abs_path).resolve().relative_to(root_dir))
+                        except Exception:
+                            rel = None
+                    if not rel and abs_path:
+                        rel = Path(abs_path).name
+                    if not rel:
+                        continue
+                    artifacts.append({"path": rel, "name": Path(rel).name, "bytes": art.get("bytes") or 0})
+                if not artifacts and not res.get("summary"):
+                    continue
+                step = next((s for s in plan.get("steps") or [] if s.get("id") == r["step_id"]), {})
+                items.append({
+                    "id": r["id"],
+                    "plan_id": r["plan_id"],
+                    "title": plan.get("title") or plan.get("goal") or step.get("goal") or "手作",
+                    "step_goal": step.get("goal") or "",
+                    "summary": res.get("summary") or "",
+                    "finished_at": data.get("finished_at") or plan.get("updated_at") or "",
+                    "artifacts": artifacts,
+                })
+                if len(items) >= limit:
+                    break
+        return {"creations": items}
     if action == "anniversaries":
         # The calendar page's: the anniversaries of shared moments between two days (initiative.py).
         from .initiative import anniversaries_between
@@ -582,6 +648,44 @@ def _dispatch(config, action, request):
         }
     if action == "read":
         projection = request.get("projection")
+        if projection == "settings":
+            if request.get("history"):
+                raise ValueError("Unknown state projection")
+            settings = memory.settings()
+            return {"projection": "settings", "memory": {"settings": settings} if settings.get("records") else {"state": "disabled"}}
+        if projection == "page":
+            if request.get("history"):
+                raise ValueError("Unknown state projection")
+            from . import recipient
+            from .drives import owner_private, view as drives_view
+            at = mind.clock()
+            with mind.engine.db.connect() as conn:
+                drives = drives_view(conn, mind.scope.key(), at, private=owner_private())
+                try:
+                    cursor_row = recipient.cursor(conn, mind.scope.key(), "mind_semantic_cursor")
+                except Exception:
+                    cursor_row = None
+                next_review = cursor_row["next_review"] if cursor_row else at
+            settings = memory.settings()
+            state = dict(mind.read(history=0, query=request.get("query", "")))
+            for heavy_key in ("exploration_decisions", "activity_decisions", "trait_ledger", "traits", "open_predictions", "confirmed_checks"):
+                state.pop(heavy_key, None)
+            state["desires"] = [d for d in (state.get("desires") or []) if d.get("status") in ("wanted", "waiting", "in_progress") and not d.get("expired")]
+            all_concerns = state.get("concerns") or []
+            active_c = [c for c in all_concerns if c.get("status") not in ("resolved", "archived", "easing")]
+            easing_c = [c for c in all_concerns if c.get("status") == "easing"]
+            kept_easing = easing_c[-24:]
+            state["concerns"] = [*active_c, *kept_easing]
+            state["easing_omitted"] = max(0, len(easing_c) - len(kept_easing))
+            return {
+                "projection": "page",
+                "state": state,
+                "drives": drives,
+                "exploration_capabilities": jobs.exploration_capabilities,
+                "findings": explorer.recent() if request.get("include_findings") else [],
+                **({"exploration_cadence": cadence.status()} if request.get("include_cadence") else {}),
+                "memory": {"settings": settings, "review": next_review} if settings.get("records") else {"state": "disabled"},
+            }
         if projection is not None:
             # A bounded part of the state for a reader that uses only that (interaction_projection):
             # a contact draft. Without it the answer is the whole view, as it always was.
@@ -894,7 +998,8 @@ RESIDENT_ACTIONS = frozenset({
     # The DSH plugin's per-turn context and its home page reads. The plugin asks for `mode: light`
     # context, which never calls a model, so these stay short like the rest of this set.
     "ensure-initialized", "memory-context", "state-overview", "autonomous-plans", "graph", "event-thread",
-    "persona-save", "work-history", "share-history", "diary", "diary-reply", "dreams", "explorations", "letters", "seal-letter", "anniversaries", "configure-memory",
+    "persona-save", "work-history", "share-history", "creations", "diary", "diary-reply", "dreams", "explorations", "letters", "letter-read", "seal-letter", "anniversaries", "configure-memory",
+    "traits", "trait-revoke",
     # Her chat tools (chat_tools: plans, store reads and writes, no model) and the owner's choices on her page.
     "chat-tools", "chat-tool", "owner-habit",
 })

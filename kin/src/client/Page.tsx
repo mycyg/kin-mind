@@ -36,8 +36,19 @@ export function createPage(ctx: Context) {
     const [chatId, setChatId] = useState<string>()
     // A line for her composer to start with (the calendar's 和她说说); a new id each time, so the same line can come again.
     const [seed, setSeed] = useState<{ text: string; id: number }>()
+    const [speaking, setSpeaking] = useState(false)
     useSheen(root)
     const active = useWindowActive()
+
+    // Decouple desktop chat startup from slow home state reads.
+    useEffect(() => {
+      if (chatId) return
+      let cancelled = false
+      void api<{ sessionId: string }>('api/kin/chat')
+        .then((chat) => { if (!cancelled && chat?.sessionId) setChatId((prev) => prev ?? chat.sessionId) })
+        .catch(() => {})
+      return () => { cancelled = true }
+    }, [])
 
     // Her desktop conversation exists from the first visit on.
     useEffect(() => {
@@ -67,18 +78,18 @@ export function createPage(ctx: Context) {
         <div className="kin-stage">
           <section className="kin-chat-col kin-glass" aria-label="和 KIN 聊天">
             <header className="kin-chat-head">
-              <Orb size={38} warmth={warmth} />
+              <Orb size={38} warmth={warmth} speaking={speaking} />
               <div className="kin-who">
                 <strong>KIN</strong>
                 <span>{status}</span>
               </div>
             </header>
-            <Chat sessionId={chatId} warmth={warmth} seed={seed} />
+            <Chat sessionId={chatId} warmth={warmth} seed={seed} onSpeakingChange={setSpeaking} />
           </section>
           <main className="kin-right">
             {shown === 'settings' ? <Settings />
               : shown === 'world' ? <World home={home.data} place={place} go={(next) => glide(() => setPlace(next))} openSettings={() => open('settings')} talk={talk} />
-              : <Now home={home.data} error={home.error} go={visit} />}
+              : <Now home={home.data} error={home.error} go={visit} talk={talk} />}
             {narrow ? null : dock}
           </main>
         </div>

@@ -116,4 +116,29 @@ await check('source identities and attached media survive task isolation without
     toolOutput = false
   } finally { await ctx.fiber.dispose() }
 })
+if (!process.env.KIN_COMPACTION_BASELINE) {
+  await check('idle session over threshold auto-compacts after quiet window while smaller sessions stay untouched', async () => {
+    const runIdle = async (threshold) => {
+      const ctx = new Context()
+      new LlmRuntime(ctx); new SessionStore(ctx); new TokenMeter(ctx)
+      ctx.sessions.flush = async () => false
+      ctx.llm.registerAdapter(['synthetic'], new Synthetic())
+      const engine = new Engine(ctx, { auto: true, headroomTokens: 1024, maxTokens: 2048, retainTokens: 4000, idleCompactTokens: threshold, idleCompactMs: 60 })
+      const session = seed()
+      const agent = { session, status: 'idle', options: { provider: 'synthetic', model: 'synthetic' }, runMaintenance: fn => fn(new AbortController().signal) }
+      try {
+        response = valid; requests = []
+        ctx.emit('agent/status', { agent, status: 'idle' })
+        await new Promise(r => setTimeout(r, 220))
+        return { compacted: session.snapshotEvents().some(e => e.type === 'compaction/summary'), requests: requests.length }
+      } finally { await ctx.fiber.dispose() }
+    }
+    const over = await runIdle(500)
+    assert.equal(over.compacted, true)
+    assert.equal(over.requests, 1)
+    const under = await runIdle(500_000)
+    assert.equal(under.compacted, false)
+    assert.equal(under.requests, 0)
+  })
+}
 process.exitCode = failures ? 1 : 0

@@ -2,10 +2,10 @@
 import type { CSSProperties } from 'react'
 import { Sparkle } from './icons.js'
 
-export function Orb({ size, warmth }: { size: number; warmth: number }) {
+export function Orb({ size, warmth, speaking }: { size: number; warmth: number; speaking?: boolean }) {
   const style = { '--kin-orb': size + 'px', '--kin-warmth': Math.round(warmth * 100) + '%' } as CSSProperties
   return (
-    <span className="kin-orb" style={style} aria-hidden="true">
+    <span className="kin-orb" style={style} data-speaking={speaking ? '' : undefined} aria-hidden="true">
       <Sparkle size={Math.max(8, Math.round(size * 0.32))} />
     </span>
   )

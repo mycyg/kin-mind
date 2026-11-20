@@ -7,6 +7,9 @@ import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment'
 let tokenizer: Tiktoken | undefined
 
 export const CONTEXT_WINDOW = 648_000
+/** Auto-compact an idle session when no activity occurs for 1 hour and history exceeds 256k tokens. */
+export const IDLE_COMPACT_TOKENS = 256_000
+export const IDLE_COMPACT_MS = 60 * 60_000
 /** Default generation budget; physical adapter output ceilings remain independently configured. */
 export const OUTPUT_BUDGET = 128_000
 export const PRESSURE_RATIO = 0.9

@@ -1,6 +1,6 @@
 /** Where she can find you: WeChat (scan to log in), Feishu (the app's credentials) and her voice, on her settings page. */
-import { useEffect, useMemo, useState } from 'react'
-import { api, useApi } from './api.js'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { api, invalidateApi, useApi } from './api.js'
 import { qr } from './qr.js'
 
 type State = 'connected' | 'connecting' | 'login-required' | 'stopped' | 'failed'
@@ -8,7 +8,8 @@ interface Status { state: State; reason?: string; qr?: string }
 interface Data {
   wechat: { baseUrl: string; cdnBaseUrl: string; userId: string | null; status: Status } | null
   feishu: { appId: string; domain: string; status: Status } | null
-  voice: { python: string; model: string; ffmpeg: string; voice?: string } | null
+  voice: { provider?: 'deepseek' | 'local'; voiceId?: string; python?: string; model?: string; ffmpeg?: string; voice?: string } | null
+  hasDeepSeekKey?: boolean
 }
 
 const STATES: Record<State, string> = {
@@ -30,7 +31,7 @@ export function Channels() {
         <>
           <WeChat data={data.wechat} onChange={reload} />
           <Feishu data={data.feishu} onChange={reload} />
-          <Voice data={data.voice} onChange={reload} />
+          <Voice data={data.voice} hasKey={data.hasDeepSeekKey} onChange={() => { invalidateApi('api/kin/hear'); void reload() }} />
         </>
       )}
     </section>
@@ -72,44 +73,147 @@ function WeChat({ data, onChange }: { data: Data['wechat']; onChange: () => void
 }
 
 function Feishu({ data, onChange }: { data: Data['feishu']; onChange: () => void }) {
+  const [editing, setEditing] = useState(false)
   return (
     <div className="kin-channel">
       <Head title="飞书" status={data?.status}
         remove={data ? () => api('api/kin/channels/remove', { id: 'feishu' }).then(onChange) : undefined} />
       {data?.status.reason ? <p className="kin-channel-reason" data-state={data.status.state}>{data.status.reason}</p> : null}
-      <Fields
-        fields={[
-          { key: 'appId', label: 'App ID', placeholder: '飞书自建应用的 App ID' },
-          { key: 'appSecret', label: 'App Secret', placeholder: data ? '已存好；不换就留空' : '应用的 App Secret', secret: true },
-          { key: 'domain', label: '地址', placeholder: '飞书开放平台地址，https:// 开头' },
-        ]}
-        initial={{ appId: data?.appId ?? '', appSecret: '', domain: data?.domain ?? '' }}
-        action={data ? '保存并重连' : '连上飞书'}
-        submit={(values) => api('api/kin/channels/feishu', values).then(onChange)}
-      />
+      {data && !editing ? (
+        <div className="kin-channel-compact">
+          <span className="kin-dim">App ID · {data.appId}</span>
+          <button type="button" className="kin-link" onClick={() => setEditing(true)}>修改配置</button>
+        </div>
+      ) : (
+        <>
+          <Fields
+            fields={[
+              { key: 'appId', label: 'App ID', placeholder: '飞书自建应用的 App ID' },
+              { key: 'appSecret', label: 'App Secret', placeholder: data ? '已存好；不换就留空' : '应用的 App Secret', secret: true },
+              { key: 'domain', label: '地址', placeholder: '飞书开放平台地址，https:// 开头' },
+            ]}
+            initial={{ appId: data?.appId ?? '', appSecret: '', domain: data?.domain ?? '' }}
+            action={data ? '保存并重连' : '连上飞书'}
+            submit={(values) => api('api/kin/channels/feishu', values).then(() => { setEditing(false); onChange() })}
+          />
+          {data ? <button type="button" className="kin-link" onClick={() => setEditing(false)}>收起</button> : null}
+        </>
+      )}
     </div>
   )
 }
 
-function Voice({ data, onChange }: { data: Data['voice']; onChange: () => void }) {
+const VOICES: { id: 'stella' | 'tide'; label: string }[] = [
+  { id: 'stella', label: '海星 · 女声' },
+  { id: 'tide', label: '暗潮 · 男声' },
+]
+
+function Voice({ data, hasKey, onChange }: { data: Data['voice']; hasKey?: boolean; onChange: () => void }) {
+  const [localOpen, setLocalOpen] = useState(data?.provider === 'local')
+  const [busy, setBusy] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
+  const [note, setNote] = useState<string>()
+  const audioRef = useRef<HTMLAudioElement>()
+  const urlRef = useRef<string>()
+  useEffect(() => () => {
+    audioRef.current?.pause()
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+  }, [])
+
+  const isLocal = data?.provider === 'local'
+  const currentVoice = data?.voiceId || 'stella'
+
+  const selectDeepSeek = (voiceId: string) => {
+    setBusy(true)
+    setNote(undefined)
+    void api('api/kin/channels/voice', { provider: 'deepseek', voiceId })
+      .then(() => onChange(), (err: Error) => setNote(err.message))
+      .finally(() => setBusy(false))
+  }
+
+  const preview = async () => {
+    if (previewing) return
+    setPreviewing(true)
+    setNote(undefined)
+    try {
+      const response = await fetch('api/kin/speak', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: '喂，在听吗？我在这里呀。', voiceId: currentVoice }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(body.error ?? `${response.status}`)
+      }
+      const blob = await response.blob()
+      audioRef.current?.pause()
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+      const url = URL.createObjectURL(blob)
+      urlRef.current = url
+      const player = new Audio(url)
+      audioRef.current = player
+      player.onended = () => {
+        if (urlRef.current === url) { URL.revokeObjectURL(url); urlRef.current = undefined }
+      }
+      await player.play()
+    } catch (err) {
+      setNote((err as Error).message)
+    } finally {
+      setPreviewing(false)
+    }
+  }
+
   return (
     <div className="kin-channel">
       <div className="kin-channel-head">
-        <span className="kin-lane-title">她的声音</span>
-        <span className="kin-dim">{data ? '设好了：她可以发语音' : '还没设：她先只发文字'}</span>
+        <span className="kin-lane-title">她的声音与听写</span>
+        <span className="kin-pill" data-state={isLocal || hasKey ? 'connected' : 'stopped'}>
+          {isLocal ? '本机语音' : hasKey ? 'DeepSeek 云端' : '未就绪'}
+        </span>
       </div>
-      <p className="kin-hint">本机的语音模型（和以前一样，不连外网）。发出去的语音留 14 天，之后挪进废纸篓。</p>
-      <Fields
-        fields={[
-          { key: 'python', label: 'Python', placeholder: '装了 mlx-audio 的 Python 路径' },
-          { key: 'model', label: '模型', placeholder: '语音模型所在的文件夹' },
-          { key: 'ffmpeg', label: 'ffmpeg', placeholder: 'ffmpeg 的路径' },
-          { key: 'voice', label: '音色', placeholder: '不填就是 serena' },
-        ]}
-        initial={{ python: data?.python ?? '', model: data?.model ?? '', ffmpeg: data?.ffmpeg ?? '', voice: data?.voice ?? '' }}
-        action="保存"
-        submit={(values) => api('api/kin/channels/voice', values).then(onChange)}
-      />
+      <p className="kin-hint">
+        {isLocal ? '正在使用本机语音模型；也可以随时切回更快的 DeepSeek 云端合成与识别。'
+          : hasKey ? '使用 DeepSeek 语音合成与识别，发语音和实时语音陪伴都会快很多。'
+          : '需要在 DSH 凭据里配置 DEEPSEEK_API_KEY，才能启用快速云端语音与听写。'}
+      </p>
+      <div className="kin-voice-voices">
+        {VOICES.map((voice) => (
+          <button key={voice.id} type="button" className="kin-chip" disabled={busy}
+            data-active={!isLocal && currentVoice === voice.id ? '' : undefined}
+            onClick={() => selectDeepSeek(voice.id)}>
+            {voice.label}
+          </button>
+        ))}
+        {hasKey ? (
+          <button type="button" className="kin-btn kin-voice-preview" disabled={previewing} onClick={() => void preview()}>
+            {previewing ? '合成中…' : '试听一下'}
+          </button>
+        ) : null}
+        {isLocal && hasKey ? (
+          <button type="button" className="kin-link" disabled={busy} onClick={() => selectDeepSeek(currentVoice)}>
+            切回 DeepSeek 云端
+          </button>
+        ) : null}
+      </div>
+      {note ? <p className="kin-error">{note}</p> : null}
+      <div className="kin-channel-compact">
+        <button type="button" className="kin-link" onClick={() => setLocalOpen((v) => !v)}>
+          {localOpen ? '收起本机语音配置' : '高级：配置本机 MLX 语音模型'}
+        </button>
+      </div>
+      {localOpen ? (
+        <Fields
+          fields={[
+            { key: 'python', label: 'Python', placeholder: '装了 mlx-audio 的 Python 路径' },
+            { key: 'model', label: '模型', placeholder: '语音模型所在的文件夹' },
+            { key: 'ffmpeg', label: 'ffmpeg', placeholder: 'ffmpeg 的路径' },
+            { key: 'voice', label: '音色', placeholder: '不填就是 serena' },
+          ]}
+          initial={{ python: data?.python ?? '', model: data?.model ?? '', ffmpeg: data?.ffmpeg ?? '', voice: data?.voice ?? '' }}
+          action="改用本机语音"
+          submit={(values) => api('api/kin/channels/voice', { ...values, provider: 'local' }).then(onChange)}
+        />
+      ) : null}
     </div>
   )
 }

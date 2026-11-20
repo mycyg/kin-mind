@@ -45,39 +45,27 @@ export function timeoutOf(action: string): number {
   return 180_000
 }
 
-export class Mind {
+class ResidentPipe {
   private child?: ChildProcess
   private seq = 0
   private readonly pending = new Map<number, Pending>()
-  private readonly workers = new Set<ChildProcess>()
-  private readonly configFile: string
-  private closed = false
-  private worker?: ChildProcess
-  private resting = false
-  /** The memory worker, for her health check: its process while it runs, and how it ended lately. */
-  readonly memoryWorker: { pid?: number; since?: string; ends: { at: string; how: string }[] } = { ends: [] }
-  /** Core's store directory and the scope it keeps KIN's mind under. */
-  readonly root: string
-  readonly scope: object
 
-  constructor(private readonly options: MindOptions) {
-    this.configFile = join(options.dataDir, 'mind-config.json')
-    ;({ root: this.root, scope: this.scope } = writeMindConfig(this.configFile, options.dataDir, options.pace))
-  }
+  constructor(private readonly startChild: () => ChildProcess, private readonly log: (message: string) => void) {}
 
-  /** The file that routes Core's own model calls to KIN's lanes (bridge.ts writes it), where Core looks for it (host.py, load_config). */
-  get modelFile(): string {
-    return join(this.options.dataDir, 'state', 'model-config.json')
-  }
-
-  /** A short action in the resident process. */
-  call<T = any>(action: string, args: object = {}, timeoutMs = 20_000): Promise<T> {
-    const child = this.child ?? this.start()
+  call<T = any>(action: string, args: object = {}, timeoutMs = 45_000): Promise<T> {
+    const child = this.child ?? this.spawn()
     const id = ++this.seq
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { action, resolve, reject, timeoutMs, frame: JSON.stringify({ id, action, args }) + '\n', child })
       this.sendNext(child)
     })
+  }
+
+  stop(): void {
+    const child = this.child
+    this.child = undefined
+    child?.stdin?.end()
+    child?.kill()
   }
 
   /** Core serves frames serially. Only its executing request owns a deadline: time spent
@@ -94,6 +82,100 @@ export class Mind {
       if (this.child === child) this.stop()
     }, request.timeoutMs)
     child.stdin!.write(request.frame)
+  }
+
+  private spawn(): ChildProcess {
+    const child = this.startChild()
+    createInterface({ input: child.stdout! }).on('line', (line) => {
+      let frame: { id: number; ok: boolean; result?: unknown; error?: MindError['detail'] }
+      try {
+        frame = JSON.parse(line)
+      } catch {
+        return this.log('mind: unexpected output: ' + line.slice(0, 200))
+      }
+      const request = this.pending.get(frame.id)
+      if (!request) return
+      this.pending.delete(frame.id)
+      clearTimeout(request.timer)
+      if (frame.ok) request.resolve(frame.result)
+      else request.reject(new MindError(request.action, frame.error ?? {}))
+      this.sendNext(child)
+    })
+    // A process that died takes its pipe with it; the exit below answers every waiting request.
+    child.stdin!.on('error', () => {})
+    child.on('exit', (code, signal) => {
+      if (this.child === child) this.child = undefined
+      // Only what was asked of this process: one started since has requests of its own waiting.
+      for (const [id, request] of this.pending) {
+        if (request.child !== child) continue
+        clearTimeout(request.timer)
+        request.reject(new MindError(request.action, { code: `exited (${signal ?? code})` }))
+        this.pending.delete(id)
+      }
+    })
+    child.on('error', (error) => {
+      this.log('mind: cannot start python: ' + error.message)
+      if (this.child === child) this.child = undefined
+      // A failed spawn emits no exit event; queued calls have no execution timers yet.
+      for (const [id, request] of this.pending) {
+        if (request.child !== child) continue
+        clearTimeout(request.timer)
+        request.reject(new MindError(request.action, { code: 'cannot start: ' + error.message }))
+        this.pending.delete(id)
+      }
+    })
+    this.child = child
+    return child
+  }
+}
+
+const FAST_ACTIONS = new Set([
+  'ensure-initialized', 'memory-context', 'context-delivery-begin', 'deleted-sources', 'ingest', 'private-notes', 'private-note-save',
+  'state-overview', 'liveness-facts', 'creations', 'traits', 'letters', 'letter-read', 'autonomous-plans',
+])
+
+export class Mind {
+  private readonly mainPipe: ResidentPipe
+  private readonly fastPipe: ResidentPipe
+  private readonly workers = new Set<ChildProcess>()
+  private readonly configFile: string
+  private closed = false
+  private worker?: ChildProcess
+  private resting = false
+  private initGate?: Promise<void>
+  /** The memory worker, for her health check: its process while it runs, and how it ended lately. */
+  readonly memoryWorker: { pid?: number; since?: string; ends: { at: string; how: string }[] } = { ends: [] }
+  /** Core's store directory and the scope it keeps KIN's mind under. */
+  readonly root: string
+  readonly scope: object
+
+  constructor(private readonly options: MindOptions) {
+    this.configFile = join(options.dataDir, 'mind-config.json')
+    ;({ root: this.root, scope: this.scope } = writeMindConfig(this.configFile, options.dataDir, options.pace))
+    this.mainPipe = new ResidentPipe(() => this.spawnServe('serve'), options.log)
+    this.fastPipe = new ResidentPipe(() => this.spawnServe('serve-fast'), options.log)
+  }
+
+  /** Hold other calls until model-config and `ensure-initialized` settle; unit tests that skip `gateInit` are unaffected. */
+  gateInit<T>(init: () => Promise<T>): Promise<T> {
+    const p = init()
+    const gate = p.then(() => {}, () => {}).finally(() => { if (this.initGate === gate) this.initGate = undefined })
+    this.initGate = gate
+    return p
+  }
+
+  /** The file that routes Core's own model calls to KIN's lanes (bridge.ts writes it), where Core looks for it (host.py, load_config). */
+  get modelFile(): string {
+    return join(this.options.dataDir, 'state', 'model-config.json')
+  }
+
+  /** Dispatch lightweight foreground-critical and projected page reads/writes to the isolated fast pipe; heavy/background work stays on mainPipe. */
+  async call<T = any>(action: string, args: object = {}, timeoutMs = 45_000): Promise<T> {
+    if (this.initGate && action !== 'ensure-initialized') await this.initGate
+    const projection = (args as { projection?: string }).projection
+    const fast = (FAST_ACTIONS.has(action) && (action !== 'memory-context' || (args as { mode?: string }).mode !== 'deep'))
+      || (action === 'read' && (projection === 'settings' || projection === 'page'))
+    return (fast ? this.fastPipe : this.mainPipe).call(action, args, timeoutMs)
   }
 
   /** An action that may call a model, in a process of its own; it ends when the action does or its time is up. */
@@ -195,59 +277,17 @@ export class Mind {
     })
   }
 
-  private start(): ChildProcess {
-    const { python, log } = this.options
-    const child = spawn(python, ['-m', 'kin_mind.host', '--config', this.configFile, 'serve'], {
+  private spawnServe(label: string): ChildProcess {
+    const child = spawn(this.options.python, ['-m', 'kin_mind.host', '--config', this.configFile, 'serve'], {
       env: this.env(), stdio: ['pipe', 'pipe', 'pipe'],
     })
-    createInterface({ input: child.stdout! }).on('line', (line) => {
-      let frame: { id: number; ok: boolean; result?: unknown; error?: MindError['detail'] }
-      try {
-        frame = JSON.parse(line)
-      } catch {
-        return log('mind: unexpected output: ' + line.slice(0, 200))
-      }
-      const request = this.pending.get(frame.id)
-      if (!request) return
-      this.pending.delete(frame.id)
-      clearTimeout(request.timer)
-      if (frame.ok) request.resolve(frame.result)
-      else request.reject(new MindError(request.action, frame.error ?? {}))
-      this.sendNext(child)
-    })
-    this.relay(child, 'serve')
-    // A process that died takes its pipe with it; the exit below answers every waiting request.
-    child.stdin!.on('error', () => {})
-    child.on('exit', (code, signal) => {
-      if (this.child === child) this.child = undefined
-      // Only what was asked of this process: one started since has requests of its own waiting.
-      for (const [id, request] of this.pending) {
-        if (request.child !== child) continue
-        clearTimeout(request.timer)
-        request.reject(new MindError(request.action, { code: `exited (${signal ?? code})` }))
-        this.pending.delete(id)
-      }
-    })
-    child.on('error', (error) => {
-      log('mind: cannot start ' + python + ': ' + error.message)
-      if (this.child === child) this.child = undefined
-      // A failed spawn emits no exit event; queued calls have no execution timers yet.
-      for (const [id, request] of this.pending) {
-        if (request.child !== child) continue
-        clearTimeout(request.timer)
-        request.reject(new MindError(request.action, { code: 'cannot start: ' + error.message }))
-        this.pending.delete(id)
-      }
-    })
-    this.child = child
+    this.relay(child, label)
     return child
   }
 
   private stop(): void {
-    const child = this.child
-    this.child = undefined
-    child?.stdin?.end()
-    child?.kill()
+    this.mainPipe.stop()
+    this.fastPipe.stop()
   }
 }
 

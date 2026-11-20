@@ -145,3 +145,77 @@ i.kin-picture { display: grid; place-items: center; font-style: normal; font-siz
 }
 .kin-viewer-close:hover { transform: scale(1.08); }
 .kin-viewer-close:active { transform: scale(.9); }
+
+/* Chat skeletons, hover timestamps, collapsed act groups, custom voice pill, scroll-to-bottom, cross-channel & voice companion */
+.kin-chat-skeletons { display: flex; flex-direction: column; gap: 14px; padding: 24px 8px; }
+.kin-skel-bubble {
+  display: block; height: 38px; border-radius: 20px; background: var(--kin-fill-2);
+  background-image: linear-gradient(100deg, transparent 25%, var(--kin-shine) 50%, transparent 75%);
+  background-size: 240% 100%; animation: kin-sweep 1.6s linear infinite;
+}
+.kin-skel-bubble[data-from="kin"] { align-self: flex-start; border-bottom-left-radius: 8px; }
+.kin-skel-bubble[data-from="me"] { align-self: flex-end; border-bottom-right-radius: 8px; }
+
+.kin-msg-time {
+  align-self: flex-end; flex: none; font-size: 10.5px; color: var(--kin-ink-3); opacity: 0;
+  transition: opacity .2s; pointer-events: none; margin-bottom: 3px; font-variant-numeric: tabular-nums;
+}
+.kin-msg[data-from="me"] .kin-msg-time { order: -1; }
+.kin-msg:hover .kin-msg-time, .kin-msg:focus-within .kin-msg-time { opacity: 1; }
+
+.kin-act-group { align-self: flex-start; margin: 6px 0 2px 36px; display: flex; flex-direction: column; gap: 4px; }
+.kin-act-toggle {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border: 0; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 12px; color: var(--kin-ink-2); background: var(--kin-fill-2); box-shadow: inset 0 1px 0 var(--kin-rim-2);
+}
+.kin-act-toggle:hover { background: var(--kin-fill-3); }
+.kin-act-sublist { display: flex; flex-direction: column; gap: 2px; padding-left: 6px; }
+.kin-act-sublist .kin-act { margin-left: 8px; }
+
+.kin-voice-msg { display: flex; flex-direction: column; gap: 6px; min-width: 196px; }
+.kin-voice-pill {
+  display: flex; align-items: center; gap: 9px; padding: 6px 10px 6px 6px; border-radius: 999px;
+  background: rgb(226 119 159 / .12); box-shadow: inset 0 1px 0 rgb(255 255 255 / .4);
+}
+.kin-voice-play {
+  flex: none; width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 50%; cursor: pointer;
+  background: var(--kin-me); color: #fff; box-shadow: 0 4px 10px -4px rgb(226 119 159 / .9);
+}
+.kin-voice-bars { flex: 1; height: 22px; display: flex; align-items: center; gap: 2.5px; cursor: pointer; }
+.kin-voice-bar { flex: 1; min-width: 2px; border-radius: 2px; background: color-mix(in srgb, var(--kin-rose) 28%, transparent); transition: background .15s; }
+.kin-voice-bar[data-played] { background: var(--kin-rose); }
+.kin-voice-dur { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--kin-ink-2); }
+.kin-voice-words { font-size: 13px; color: var(--kin-ink); }
+
+.kin-to-bottom {
+  position: absolute; left: 50%; bottom: 78px; z-index: 3; transform: translateX(-50%);
+  display: inline-flex; align-items: center; gap: 5px; padding: 6px 14px; border: 0; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 12px; color: var(--kin-ink); animation: kin-rise .35s var(--kin-spring) both;
+}
+
+.kin-chat-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 2px 18px 8px; border-bottom: 1px solid var(--kin-hairline);
+}
+.kin-elsewhere { min-width: 0; }
+.kin-elsewhere-toggle {
+  display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border: 0; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 11.5px; color: var(--kin-ink-2); background: var(--kin-fill-2);
+}
+.kin-elsewhere-toggle:hover { background: var(--kin-fill-3); }
+.kin-elsewhere-list {
+  display: flex; flex-direction: column; gap: 5px; max-height: 150px; overflow-y: auto;
+  padding: 8px 18px; background: var(--kin-fill); border-bottom: 1px solid var(--kin-hairline); font-size: 12px;
+}
+.kin-elsewhere-item { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.kin-elsewhere-who { font-weight: 600; color: var(--kin-ink-2); flex: none; }
+.kin-elsewhere-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--kin-ink); }
+
+.kin-call-btn {
+  display: inline-flex; align-items: center; gap: 6px; flex: none; padding: 4px 12px; border: 0; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 12px; color: var(--kin-ink-2); background: var(--kin-fill-2); box-shadow: inset 0 1px 0 var(--kin-rim-2);
+  transition: background .25s, color .25s, box-shadow .25s;
+}
+.kin-call-btn:hover { background: var(--kin-fill-3); color: var(--kin-rose); }
+.kin-call-btn[data-phase] { color: #fff; background: var(--kin-me); box-shadow: 0 6px 16px -6px rgb(226 119 159 / .9); }
+.kin-call-btn[data-phase="listening"] { animation: kin-listen 2s ease-in-out infinite; }

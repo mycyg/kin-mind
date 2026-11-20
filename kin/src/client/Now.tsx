@@ -8,15 +8,37 @@ import { activeWish, openConcern, type Beat, type Dimension, type Home } from '.
 import { Today } from './Calendar.js'
 import { Contact } from './Contact.js'
 import { HealthNote } from './Health.js'
-import { Waves } from './icons.js'
+import { Bubble, ChevronDown, Waves } from './icons.js'
 import { ago, soon } from './time.js'
 import { CONCERN_KINDS, Wishes, type Place } from './World.js'
 import { Work } from './steward/Work.js'
 
-export function Now({ home, error, go }: { home: Home | undefined; error?: string; go: (place: Place) => void }) {
+export function Now({ home, error, go, talk }: { home: Home | undefined; error?: string; go: (place: Place) => void; talk?: (text: string) => void }) {
   const [all, setAll] = useState(false)
+  const [showEasing, setShowEasing] = useState(false)
+  if (error) {
+    return <div className="kin-scroll"><p className="kin-quiet kin-center">{`她的心智还没醒来：${error}`}</p></div>
+  }
   if (!home) {
-    return <div className="kin-scroll"><p className="kin-quiet kin-center">{error ? `她的心智还没醒来：${error}` : '正在看她此刻的样子…'}</p></div>
+    return (
+      <div className="kin-scroll kin-skeletons" aria-label="正在看她此刻的样子">
+        <div className="kin-hero kin-skeleton-hero">
+          <span className="kin-skeleton-pill" style={{ width: 64 }} />
+          <span className="kin-skeleton-num" />
+          <span className="kin-skeleton-line" style={{ width: '48%' }} />
+        </div>
+        <div className="kin-card kin-skeleton-card">
+          <div className="kin-skeleton-grid">
+            {Array.from({ length: 8 }, (_, idx) => <span key={idx} className="kin-skeleton-gauge" />)}
+          </div>
+        </div>
+        <div className="kin-card kin-skeleton-card">
+          <span className="kin-skeleton-line" style={{ width: '32%' }} />
+          <span className="kin-skeleton-line" style={{ width: '88%' }} />
+          <span className="kin-skeleton-line" style={{ width: '74%' }} />
+        </div>
+      </div>
+    )
   }
   const { state, liveness } = home
   const feeling = home.overview.affect_layers?.feeling ?? state.affect_layers?.feeling?.text ?? '平静'
@@ -29,8 +51,13 @@ export function Now({ home, error, go }: { home: Home | undefined; error?: strin
   const pulse = state.affect_layers?.vitals?.status === 'rhythm-disabled' ? undefined : state.affect_layers?.vitals?.heart_rate_bpm
   const thought = state.appraisal_summary
   const concerns = (state.concerns ?? []).filter(openConcern)
+  const activeConcerns = concerns.filter((c) => c.status !== 'easing')
+  const easingConcerns = concerns.filter((c) => c.status === 'easing')
+  const easingOmitted = state.easing_omitted ?? 0
+  const easingTotal = easingConcerns.length + easingOmitted
   const wishes = state.desires.filter(activeWish)
   const decisions = Object.values(liveness.contact_funnel?.idle_decisions_24h ?? {}).reduce((sum, n) => sum + n, 0)
+  const statusLine = [`此刻${feeling}${undertone && undertone !== feeling ? `，心底${undertone}` : ''}`, rhythm].filter(Boolean).join(' · ')
 
   return (
     <div className="kin-scroll">
@@ -39,21 +66,19 @@ export function Now({ home, error, go }: { home: Home | undefined; error?: strin
         {hero ? <strong className="kin-numeral">{Math.round(hero.value)}</strong> : null}
         <span className="kin-hero-label">{hero?.label ?? feeling}</span>
         <span className="kin-hero-sub">
-          {[`此刻${feeling}${undertone && undertone !== feeling ? `，心底${undertone}` : ''}`, rhythm, pulse ? `心跳 ${pulse}` : '']
-            .filter(Boolean).join(' · ')}
+          {statusLine}
+          {pulse ? <>{statusLine ? ' · ' : ''}<span className="kin-pulse-wrap"><i className="kin-pulse-dot" aria-hidden="true" />心跳 {pulse}</span></> : null}
         </span>
       </header>
 
-      <section className="kin-card kin-gauges" aria-label="她心里的各种感觉">
-        {standout.slice(0, 8).map(({ key, ...dimension }) => <Gauge key={key} {...dimension} />)}
+      <section className="kin-card" aria-label="她心里的各种感觉">
+        <GaugeBoard items={standout.slice(0, 8)} bare />
       </section>
       <button type="button" className="kin-link kin-more" onClick={() => setAll(!all)}>{all ? '收起' : '看看每一样'}</button>
       {all ? state.dimension_groups.map((group) => (
         <section key={group.id} className="kin-card">
           <h3 className="kin-card-title">{group.label}</h3>
-          <div className="kin-gauges" data-bare="">
-            {group.members.map((key) => state.dimensions[key]).filter(Boolean).map((dimension) => <Gauge key={dimension!.label} {...dimension!} />)}
-          </div>
+          <GaugeBoard items={group.members.map((key) => state.dimensions[key]).filter(Boolean) as Dimension[]} bare />
         </section>
       )) : null}
 
@@ -64,6 +89,11 @@ export function Now({ home, error, go }: { home: Home | undefined; error?: strin
           <footer>
             <span>{thought.at ? `${ago(thought.at)}静下来想过` : ''}</span>
             {home.nextReview ? <span>她说 {soon(home.nextReview)}再想</span> : null}
+            {talk ? (
+              <button type="button" className="kin-say-btn" onClick={() => talk(`看到你刚想到的事：「${thought.reason}」，想和你聊聊这个`)}>
+                <Bubble size={13} /> 和她说说
+              </button>
+            ) : null}
           </footer>
         </article>
       ) : null}
@@ -71,20 +101,55 @@ export function Now({ home, error, go }: { home: Home | undefined; error?: strin
       <Today open={() => go('calendar')} />
       <section className="kin-card">
         <h3 className="kin-card-title">心事</h3>
-        {concerns.length ? (
+        {activeConcerns.length ? (
           <ul className="kin-list kin-list-scroll" tabIndex={0} aria-label="心事列表">
-            {concerns.map((concern) => (
-              <li key={concern.id}>
-                {concern.kind ? <span className="kin-tag">{CONCERN_KINDS[concern.kind] ?? concern.kind}</span> : null}
-                {concern.content ?? concern.topic}
+            {activeConcerns.map((concern) => (
+              <li key={concern.id} className="kin-list-item">
+                <span className="kin-list-body">
+                  {concern.kind ? <span className="kin-tag">{CONCERN_KINDS[concern.kind] ?? concern.kind}</span> : null}
+                  {concern.content ?? concern.topic}
+                </span>
+                {talk ? (
+                  <button type="button" className="kin-say-btn" onClick={() => talk(`看到你在挂念「${concern.content ?? concern.topic}」，想和你聊聊`)}>
+                    <Bubble size={13} /> 和她说说
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>
-        ) : <p className="kin-quiet">心里暂时没有挂着的事</p>}
+        ) : <p className="kin-quiet">{easingTotal ? '此刻没有新挂着的心事' : '心里暂时没有挂着的事'}</p>}
+        {easingTotal > 0 ? (
+          <>
+            <button type="button" className="kin-link kin-easing-toggle" onClick={() => setShowEasing((v) => !v)}>
+              <ChevronDown size={13} className={showEasing ? 'kin-rot' : undefined} />
+              {showEasing ? '收起正在慢慢放下的心事' : `还有 ${easingTotal} 件正在慢慢放下的心事`}
+            </button>
+            {showEasing ? (
+              <>
+                <ul className="kin-list kin-list-scroll kin-list-easing" tabIndex={0} aria-label="慢慢放下的心事">
+                  {easingConcerns.map((concern) => (
+                    <li key={concern.id} className="kin-list-item">
+                      <span className="kin-list-body">
+                        {concern.kind ? <span className="kin-tag">{CONCERN_KINDS[concern.kind] ?? concern.kind}</span> : null}
+                        {concern.content ?? concern.topic}
+                      </span>
+                      {talk ? (
+                        <button type="button" className="kin-say-btn" onClick={() => talk(`想起你之前挂心的「${concern.content ?? concern.topic}」，现在好些了吗？`)}>
+                          <Bubble size={13} /> 和她说说
+                        </button>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+                {easingOmitted > 0 ? <p className="kin-dim kin-easing-more">其余 {easingOmitted} 件早先的挂念已悄悄沉淀下来</p> : null}
+              </>
+            ) : null}
+          </>
+        ) : null}
       </section>
       <section className="kin-card">
         <h3 className="kin-card-title">心愿</h3>
-        {wishes.length ? <Wishes wishes={wishes} /> : <p className="kin-quiet">还没有特别想做的事</p>}
+        {wishes.length ? <Wishes wishes={wishes} talk={talk} /> : <p className="kin-quiet">还没有特别想做的事</p>}
       </section>
       <Contact />
       <Work />
@@ -99,14 +164,36 @@ export function Now({ home, error, go }: { home: Home | undefined; error?: strin
   )
 }
 
-/** One feeling: its number, a thin bar with where it usually sits, its name. */
-function Gauge({ label, value, baseline, reason }: Pick<Dimension, 'label' | 'value' | 'baseline' | 'reason'>) {
+function GaugeBoard({ items, bare }: { items: Dimension[]; bare?: boolean }) {
+  const [picked, setPicked] = useState<string>()
+  const active = items.find((item) => item.label === picked && item.reason)
   return (
-    <div className="kin-gauge" title={reason}>
-      <span className="kin-gauge-num">{Math.round(value)}</span>
+    <>
+      <div className="kin-gauges" data-bare={bare ? '' : undefined}>
+        {items.map((dimension) => (
+          <Gauge key={dimension.label} {...dimension} selected={active?.label === dimension.label}
+            onSelect={dimension.reason ? () => setPicked((now) => (now === dimension.label ? undefined : dimension.label)) : undefined} />
+        ))}
+      </div>
+      {active?.reason ? <p className="kin-gauge-why"><strong>{active.label}：</strong>{active.reason}</p> : null}
+    </>
+  )
+}
+
+/** One feeling: its number, baseline delta, a thin bar with where it usually sits, its name. */
+function Gauge({ label, value, baseline, reason, selected, onSelect }: Pick<Dimension, 'label' | 'value' | 'baseline' | 'reason'> & { selected?: boolean; onSelect?: () => void }) {
+  const delta = Math.round(value - baseline)
+  const deltaText = Math.abs(delta) >= 1 ? (delta > 0 ? `+${delta}` : `${delta}`) : null
+  return (
+    <button type="button" className="kin-gauge" title={reason} data-selected={selected ? '' : undefined}
+      data-clickable={reason ? '' : undefined} disabled={!reason} onClick={onSelect}>
+      <span className="kin-gauge-top">
+        <span className="kin-gauge-num">{Math.round(value)}</span>
+        {deltaText ? <span className="kin-gauge-delta" data-sign={delta > 0 ? 'up' : 'down'}>{deltaText}</span> : null}
+      </span>
       <span className="kin-bar"><i style={{ width: `${value}%` }} /><b style={{ left: `${baseline}%` }} /></span>
       <span className="kin-gauge-name">{label}</span>
-    </div>
+    </button>
   )
 }
 

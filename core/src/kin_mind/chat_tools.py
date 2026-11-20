@@ -55,9 +55,10 @@ def _unscoped(schema):
 
 
 def tools(engine):
-    """The chat tools as MCP declares them: name, description and input schema."""
-    return [{"name": tool.name, "description": tool.description, "inputSchema": _unscoped(tool.parameters)}
-            for tool in _server(engine)._tool_manager.list_tools() if tool.name in CHAT_TOOLS]
+    """The chat tools as MCP declares them: name, description and input schema, in fixed canonical order for prompt-cache stability."""
+    by_name = {tool.name: tool for tool in _server(engine)._tool_manager.list_tools()}
+    return [{"name": name, "description": by_name[name].description, "inputSchema": _unscoped(by_name[name].parameters)}
+            for name in CHAT_TOOLS if name in by_name]
 
 
 def call(engine, scope, name, arguments):

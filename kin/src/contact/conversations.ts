@@ -40,8 +40,8 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-/** The owner's quiet between bubbles that makes them one message; an @ in a group goes at once. */
-const BURST_MS = 20_000
+/** The quiet between bubbles that makes them one message; an @ in a group goes at once. */
+const BURST_MS = 3_000
 const MENTION_MS = 1_000
 /** An arrival her mind could not take in is tried again this often, for this long. */
 const RETAKE_MS = 60_000

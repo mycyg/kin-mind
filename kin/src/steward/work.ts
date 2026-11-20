@@ -28,8 +28,10 @@ import { SessionSeq, type Session, type SessionId } from '@deepseek-ai/dsh-sessi
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
-import { existsSync, realpathSync, statSync } from 'node:fs'
-import { isAbsolute, resolve, sep } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Host } from '../index.js'
 import { PROVIDER } from '../models.js'
 import { WORKER_PRESET, textOf } from './helpers.js'
@@ -58,6 +60,8 @@ export interface Work {
   state: 'running' | 'done' | 'stopped' | 'failed' | 'interrupted'
   started: string
   ended?: string
+  /** Isolated temporary scratch workspace (background research/writing without an owner project folder). */
+  scratch?: boolean
   /** The worker leads a DSH Agent Team: teammates of its own in the same folder. */
   team?: boolean
   /** The worker's approvals she has been told are waiting, by DSH's id for each. */
@@ -85,6 +89,11 @@ export interface Steward {
    * (the returned work says whether this DSH could give it one). Throws what she should hear.
    */
   delegate(request: { session: string; label: string; task: string; folder: string; team?: boolean }): Promise<Work>
+  /**
+   * Run general non-folder work (research, fact-checking, web fetching, synthesis) asynchronously on the
+   * background `kin/task` lane in an isolated scratch workspace; delivers the result back when done.
+   */
+  background(request: { session: string; label: string; task: string; team?: boolean }): Promise<Work>
   /** Open work first, then what ended lately, newest first. */
   list(): Work[]
   /** A word to a worker: steers it while it works, sets it going again once it has stopped. */
@@ -208,8 +217,9 @@ export function work(host: Host, permit: Permit) {
   /** She hears of it in the conversation that asked (how it ended, unless said otherwise), and says it in her own words. */
   const tellHer = async (item: Work, what: string, summary = SAID[item.state]) => {
     const agent = await agentOf(item.session)
+    const where = item.scratch ? `（后台帮手 ${item.id}）` : `（在 ${item.folder}，帮手 ${item.id}）`
     agent.followup(createUserMessage({
-      content: [{ type: 'text', text: `宿主事实：你交给帮手的「${item.label}」（在 ${item.folder}，帮手 ${item.id}）${what}` }],
+      content: [{ type: 'text', text: `宿主事实：你交给帮手的「${item.label}」${where}${what}` }],
       source: { kind: 'kin-steward', form: 'notice', summary: `交给帮手的「${item.label}」${summary}` },
     }))
   }
@@ -255,6 +265,9 @@ export function work(host: Host, permit: Permit) {
       state: stopping.delete(item.id) ? 'stopped' : teamFailed ? 'failed' : ENDINGS[ending?.reason.kind ?? ''] ?? 'failed', ended: new Date().toISOString(),
       result: ending?.said.slice(0, 2000) || undefined, owed: { memory: teamFailed ? 'failed' : ending?.reason.kind ?? 'unknown', word: true },
     })
+    if (item.scratch && item.folder.startsWith(join(tmpdir(), 'kin-bg'))) {
+      try { rmSync(item.folder, { recursive: true, force: true }) } catch {}
+    }
     save()
     void conclude(item)
   }
@@ -339,6 +352,34 @@ export function work(host: Host, permit: Permit) {
     }
   }
 
+  const launch = async ({ session, label, folder, task, team, scratch }: {
+    session: string; label: string; folder: string; task: string; team?: boolean; scratch?: boolean
+  }): Promise<Work> => {
+    // A lead needs DSH's team tools. With the owner's own Agent Teams on, every session has them; otherwise her
+    // crew preset carries them, when this DSH could load it.
+    const crew = !team ? undefined : ctx.get('agentTeams') ? WORKER_PRESET
+      : await ctx.get('agentPresets')?.resolve(TEAM_PRESET).then((preset) => (preset.id === TEAM_PRESET && !preset.broken ? TEAM_PRESET : undefined), () => undefined)
+    const { sessionId } = await controller().create({ cwd: folder, agentPreset: crew ?? WORKER_PRESET })
+    const item: Work = { id: sessionId, session, label, folder, ...(scratch ? { scratch: true } : {}), state: 'running', started: new Date().toISOString() }
+    // In the ledger before its first request, so that request goes to her task lane.
+    ledger[sessionId] = item
+    save()
+    await controller().rename({ sessionId, title: label })
+    const agent = await agentOf(sessionId)
+    permit(agent.session)
+    const teamService = crew ? teams(agent) : undefined
+    if (teamService) {
+      await teamService.setEnabled(agent, true)
+      item.team = true
+      save()
+    }
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text: task + '\n\n' + (item.team ? LEAD : '') + '（做完时用几句话说清楚做了什么、结果放在哪。）' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: session as SessionId },
+    }))
+    return item
+  }
+
   ctx.provide('kinSteward', {
     async delegate({ session, label, task, folder, team }) {
       if (!isAbsolute(folder) || !existsSync(folder) || !statSync(folder).isDirectory()) {
@@ -349,29 +390,12 @@ export function work(host: Host, permit: Permit) {
       if (realFolder === realData || realFolder.startsWith(realData + sep) || realData.startsWith(realFolder + sep)) {
         throw new Error('这是你自己的数据目录（或包含了它），不是干活的地方。问清楚小光要在哪个文件夹做。')
       }
-      // A lead needs DSH's team tools. With the owner's own Agent Teams on, every session has them; otherwise her
-      // crew preset carries them, when this DSH could load it.
-      const crew = !team ? undefined : ctx.get('agentTeams') ? WORKER_PRESET
-        : await ctx.get('agentPresets')?.resolve(TEAM_PRESET).then((preset) => (preset.id === TEAM_PRESET && !preset.broken ? TEAM_PRESET : undefined), () => undefined)
-      const { sessionId } = await controller().create({ cwd: folder, agentPreset: crew ?? WORKER_PRESET })
-      const item: Work = { id: sessionId, session, label, folder, state: 'running', started: new Date().toISOString() }
-      // In the ledger before its first request, so that request goes to her task lane.
-      ledger[sessionId] = item
-      save()
-      await controller().rename({ sessionId, title: label })
-      const agent = await agentOf(sessionId)
-      permit(agent.session)
-      const teamService = crew ? teams(agent) : undefined
-      if (teamService) {
-        await teamService.setEnabled(agent, true)
-        item.team = true
-        save()
-      }
-      agent.followup(createUserMessage({
-        content: [{ type: 'text', text: task + '\n\n' + (item.team ? LEAD : '') + '（做完时用几句话说清楚做了什么、结果放在哪。）' }],
-        source: { kind: 'agent-message', form: 'relay', senderSessionId: session as SessionId },
-      }))
-      return item
+      return launch({ session, label, folder, task, team })
+    },
+    async background({ session, label, task, team }) {
+      const folder = join(tmpdir(), 'kin-bg', randomUUID())
+      mkdirSync(folder, { recursive: true, mode: 0o700 })
+      return launch({ session, label, folder, task, team, scratch: true })
     },
     list: () => Object.values(ledger)
       .sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running') || b.started.localeCompare(a.started))
@@ -447,7 +471,7 @@ export function work(host: Host, permit: Permit) {
       }
       await conclude(item)
     }
-  })
+  }).catch((error: Error) => host.log(`steward: catching up after a restart: ${error.message}`))
 
   // Her page: the work she has going, in which folder, and a way to stop it.
   host.route('/api/kin/work', { GET: async () => ({ work: ctx.kinSteward.list().slice(0, 12) }) })

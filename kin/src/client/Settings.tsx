@@ -1,9 +1,9 @@
 /** KIN's settings, on her own page: who she is, which models she speaks and works with, which inner-life parts are on. */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { api, useApi, type Feature, type Route, type Settings as Data } from './api.js'
+import { api, invalidateApi, useApi, type Feature, type Route, type Settings as Data, type TraitItem } from './api.js'
 import { Channels } from './Channels.js'
 import { Health } from './Health.js'
-import { Close, Grip } from './icons.js'
+import { Bell, Close, Grip } from './icons.js'
 import { ContactRules, People } from './People.js'
 import { Permission } from './steward/Permission.js'
 import { TalkSettings } from './Talk.js'
@@ -11,6 +11,14 @@ import { ago } from './time.js'
 
 type Lane = keyof Data['models']['lanes']
 type Catalog = Data['models']['catalog']
+type SettingsTab = 'her' | 'models' | 'connect' | 'health'
+
+const TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'her', label: '她自己' },
+  { id: 'models', label: '模型与权限' },
+  { id: 'connect', label: '消息与人' },
+  { id: 'health', label: '健康检查' },
+]
 
 const LANES: { lane: Lane; title: string; hint: string; answered: string }[] = [
   { lane: 'chat', title: '聊天的她', hint: '回你消息时用，挑有感情、会说话的', answered: '刚刚是它在和你说话' },
@@ -30,6 +38,12 @@ const FEATURES: { key: Feature; title: string; hint: string }[] = [
 
 export function Settings() {
   const { data, error, reload } = useApi<Data>('api/kin/settings')
+  const [tab, setTab] = useState<SettingsTab>('her')
+  const [refreshing, setRefreshing] = useState(false)
+  const refreshCatalog = () => {
+    setRefreshing(true)
+    void reload('api/kin/settings?refresh=1').finally(() => setRefreshing(false))
+  }
   const head = (
     <header className="kin-collection-head">
       <h2 className="kin-script">Settings</h2>
@@ -37,28 +51,152 @@ export function Settings() {
     </header>
   )
   if (error) return <div className="kin-scroll kin-settings">{head}<p className="kin-quiet">设置没读出来：{error}</p></div>
-  if (!data) return <div className="kin-scroll kin-settings">{head}<p className="kin-quiet">正在打开设置…</p></div>
+  if (!data) {
+    return (
+      <div className="kin-scroll kin-settings kin-skeletons">
+        {head}
+        <div className="kin-card kin-skeleton-card">
+          <span className="kin-skeleton-line" style={{ width: '26%' }} />
+          <span className="kin-skeleton-line" style={{ width: '92%' }} />
+          <span className="kin-skeleton-line" style={{ width: '80%' }} />
+        </div>
+        <div className="kin-card kin-skeleton-card">
+          <span className="kin-skeleton-line" style={{ width: '34%' }} />
+          <span className="kin-skeleton-line" style={{ width: '72%' }} />
+        </div>
+      </div>
+    )
+  }
   return (
     <div className="kin-scroll kin-settings">
       {head}
-      <Persona text={data.persona} />
-      <TalkSettings />
-      <section className="kin-card">
-        <h3 className="kin-card-title">她用的模型</h3>
-        <p className="kin-hint">每条线按顺序试：开始回复前超时或报错，就换下一个。拖动排序；模型的密钥和地址在 DSH 的设置里配。</p>
-        {data.models.budget && <p className="kin-hint">上下文预算 {data.models.budget.inputWindow.toLocaleString()} tokens，约 {data.models.budget.compactAt.toLocaleString()} 时压缩（90%）。回复空间另行预留；模型实际容量较小时会提前压缩。</p>}
-        {LANES.map((lane) => (
-          <RouteLane key={lane.lane} {...lane} data={data.models.lanes[lane.lane]} catalog={data.models.catalog} onSaved={reload} />
+      <div className="kin-tabs" role="tablist" aria-label="设置分类">
+        {TABS.map((item) => (
+          <button key={item.id} type="button" role="tab" className="kin-tab" aria-selected={tab === item.id} onClick={() => setTab(item.id)}>
+            {item.label}
+          </button>
         ))}
-      </section>
-      <Permission />
-      <Features features={data.features} onSaved={reload} />
-      <Channels />
-      <People />
-      <ContactRules />
-      <Health />
-      <p className="kin-footnote">她的心智住在 {data.dataDir}</p>
+      </div>
+      {tab === 'her' ? (
+        <>
+          <Persona text={data.persona} />
+          <SelfPortrait />
+          <Features features={data.features} onSaved={reload} />
+          <TalkSettings />
+        </>
+      ) : null}
+      {tab === 'models' ? (
+        <>
+          <section className="kin-card">
+            <div className="kin-card-bar">
+              <h3 className="kin-card-title">她用的模型</h3>
+              <button type="button" className="kin-btn" disabled={refreshing} onClick={refreshCatalog}>
+                {refreshing ? '刷新中…' : '刷新模型目录'}
+              </button>
+            </div>
+            <p className="kin-hint">每条线按顺序试：开始回复前超时或报错，就换下一个。拖动排序；模型的密钥和地址在 DSH 的设置里配。</p>
+            {data.models.budget && (
+              <p className="kin-hint">
+                上下文预算 {data.models.budget.inputWindow.toLocaleString()} tokens，活跃对话约 {data.models.budget.compactAt.toLocaleString()} 时压缩（90%，保护热缓存）；会话静置满 1 小时且超过 {(data.models.budget.idleCompactAt ?? 256_000).toLocaleString()} tokens 时，由后台做事线自动静默压缩。回复空间另行预留；模型实际容量较小时会提前压缩。
+              </p>
+            )}
+            {LANES.map((lane) => (
+              <RouteLane key={lane.lane} {...lane} data={data.models.lanes[lane.lane]} catalog={data.models.catalog} onSaved={reload} />
+            ))}
+          </section>
+          <Permission />
+        </>
+      ) : null}
+      {tab === 'connect' ? (
+        <>
+          <DesktopNotifyCard />
+          <Channels />
+          <People />
+          <ContactRules />
+        </>
+      ) : null}
+      {tab === 'health' ? (
+        <>
+          <Health />
+          <p className="kin-footnote">她的心智住在 {data.dataDir}</p>
+        </>
+      ) : null}
     </div>
+  )
+}
+
+const TRAIT_CATEGORIES: Record<string, string> = {
+  temperament: '性格', habit: '习惯', preference: '偏好', style: '说话方式', value: '在意的事', boundary: '分寸',
+}
+
+function SelfPortrait() {
+  const { data, error, reload } = useApi<{ traits: TraitItem[] }>('api/kin/traits', 60_000)
+  const [busyId, setBusyId] = useState<string>()
+  const [note, setNote] = useState<string>()
+  const traits = (data?.traits ?? []).filter((t) => t.status !== 'revoked')
+
+  const revoke = (item: TraitItem) => {
+    setBusyId(item.id)
+    setNote(undefined)
+    void api('api/kin/traits/revoke', { id: item.id, revision: item.revision, text: item.text })
+      .then(() => { invalidateApi('api/kin/traits'); void reload() }, (err: Error) => setNote(err.message))
+      .finally(() => setBusyId(undefined))
+  }
+
+  return (
+    <section className="kin-card">
+      <h3 className="kin-card-title">她眼中的自己</h3>
+      <p className="kin-hint">她平时慢慢攒下来的自我认识。要是哪条走偏了，你可以轻轻帮她撤掉。</p>
+      {error ? <p className="kin-error">没读出来：{error}</p>
+        : !data ? <p className="kin-quiet">正在听她介绍自己…</p>
+        : !traits.length ? <p className="kin-quiet">她还在慢慢认识自己</p>
+        : (
+          <ul className="kin-list kin-list-scroll" tabIndex={0}>
+            {traits.map((t) => (
+              <li key={t.id} className="kin-trait-row">
+                <div className="kin-trait-body">
+                  <span className="kin-tag">{TRAIT_CATEGORIES[t.category] ?? t.category}</span>
+                  <span>{t.text}</span>
+                  <span className="kin-dim"> · {t.status === 'established' ? '已成型' : t.status === 'candidate' ? '还在想' : t.status}</span>
+                </div>
+                <button type="button" className="kin-link kin-trait-revoke" disabled={busyId === t.id} onClick={() => revoke(t)}>
+                  {busyId === t.id ? '撤回中…' : '不是这样'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      {note ? <p className="kin-error">{note}</p> : null}
+    </section>
+  )
+}
+
+function DesktopNotifyCard() {
+  const supported = typeof Notification !== 'undefined'
+  const [perm, setPerm] = useState<NotificationPermission>(supported ? Notification.permission : 'denied')
+  const ask = async () => {
+    if (!supported) return
+    const next = await Notification.requestPermission()
+    setPerm(next)
+  }
+  return (
+    <section className="kin-card">
+      <h3 className="kin-card-title"><Bell size={15} /> 桌面轻通知</h3>
+      <div className="kin-switch-row">
+        <div>
+          <p>{perm === 'granted' ? '已开启通知' : perm === 'denied' ? '通知已被关闭' : '窗口在后台时提醒你'}</p>
+          <span className="kin-dim">
+            {!supported ? '当前环境不支持桌面通知'
+              : perm === 'granted' ? '你没看着桌面窗口时，她发来消息会轻轻弹出通知'
+              : perm === 'denied' ? '如需开启，请在浏览器或系统通知设置里允许本页面通知'
+              : '只有当你切走窗口、她主动找你或回复完成时才轻声提醒'}
+          </span>
+        </div>
+        {supported && perm !== 'granted' && perm !== 'denied' ? (
+          <button type="button" className="kin-btn" data-primary="" onClick={() => void ask()}>允许通知</button>
+        ) : null}
+      </div>
+    </section>
   )
 }
 

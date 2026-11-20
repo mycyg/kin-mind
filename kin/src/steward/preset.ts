@@ -6,7 +6,9 @@
  * subagent she starts inherits it.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { SessionSeq } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { ownerSpoke } from '../turn.js'
 import { crewWords, type Work } from './work.js'
@@ -14,12 +16,27 @@ import { crewWords, type Work } from './work.js'
 export const name = 'kin-steward'
 export const inject = ['kinSteward', 'tools', 'systemPrompt']
 
-const GUIDE = '帮手有两种。subagent 是对话里顺手的小帮手：查点东西、读几个文件、试一下，答案回到你这儿，你接着说。'
-  + '主人的正经活（在主人的文件夹里改文件、写代码、整理东西，要留下结果、主人想看着的）用 kin_delegate 交出去：'
-  + '它是 DSH 里主人能打开的一个会话，在那个文件夹里干活，要绝对路径，不确定是哪个文件夹就先问。做完结果会回到这段对话，用你自己的话告诉对方。'
-  + '活大、能拆成几块并行做的，交出去时带上 team：那个帮手当队长，自己叫队友分头做、最后汇总给你。'
-  + '问起手头的活用 kin_work；要补一句、或让停了的接着做，用 kin_work_tell；要叫停用 kin_work_stop。'
+const GUIDE = '在前台优先一轮直接接住话：不要自己在前台连续多次联网搜索、抓网页或反复起子代理把响应拖慢。'
+  + '遇到不需要指定主人文件夹的调研、多网页查询、核实比较、算东西或长内容整理，默认在 bubbles 里先回对方一句的同时调用 kin_background 丢给后台做事线异步完成（它比聊天线便宜得多），做好后结果会自动送回这段对话，你再补充告诉对方。'
+  + '明确要在主人本地文件夹里改文件、写代码、整理东西（要留下结果或主人想看着的），在 bubbles 里先说一句并用 kin_delegate 交出去（需要绝对路径，不确定就先问）。'
+  + 'subagent 仅限必须当场拿到一小段答案才能接下一句话的极轻量协助；用它也会阻塞本轮回复，能异步优先用 kin_background。'
+  + '问起手头的活用 kin_work；要补一句、或让停了的接着做，用 kin_work_tell；要叫停用 kin_work_stop；'
   + '帮手停下来等小光批准时，小光在这段对话里亲口说了让不让，就用 kin_work_answer 替他答复。'
+
+function spokeOnlyAsyncHandoff(agent: Agent): boolean {
+  const session = agent.session
+  for (let seq = Number(session.seq) - 1; seq >= 0; seq--) {
+    const event = session.eventAt(SessionSeq(seq))
+    if (!event) continue
+    if (event.type === 'step/start') break
+    if (event.type !== 'assistant/message') continue
+    const blocks = event.data.message.content
+    const hasText = blocks.some((block) => block.type === 'text' && block.text.trim().length > 0)
+    const calls = blocks.filter((block) => block.type === 'tool-call')
+    return hasText && calls.length > 0 && calls.every((call) => call.name === 'kin_background' || call.name === 'kin_delegate')
+  }
+  return false
+}
 
 const STATES: Record<Work['state'], string> = { running: '在做', done: '做完了', stopped: '停下了', failed: '没做成', interrupted: '断在半路' }
 
@@ -49,9 +66,29 @@ export function apply(ctx: Context) {
     output: text,
     async execute(args, exec) {
       const team = args.team === true
-      const work = await steward.delegate({ session: exec.agent!.session.id, label: args.title, task: args.task, folder: args.folder, team })
+      const agent = exec.agent!
+      const work = await steward.delegate({ session: agent.session.id, label: args.title, task: args.task, folder: args.folder, team })
+      if (spokeOnlyAsyncHandoff(agent)) exec.concludeTurn()
       return `交给帮手了（帮手 ${work.id}，在 ${work.folder}）。`
         + (work.team ? '它带队，会自己叫队友分头做。' : team ? '这个 DSH 里帮手队没起来，这件活由它一个人做。' : '')
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'kin_background',
+    description: '把不需要主人指定本地文件夹的耗时活（联网查资料、连看几个网页、比对信息、核实细节、起草长文、算东西或多步调研）转交后台帮手在便宜的做事线上异步完成。马上返回，不卡当前回复；做完结果会自动送回这段对话，让你给对方补充回复。调它的同一轮请直接在 bubbles 里先快速回对方一句。',
+    parameters: {
+      title: { type: 'string', required: true, description: '这件活的简短名字，几个字' },
+      task: { type: 'string', required: true, description: '交代给后台帮手的完整任务（包括背景、对方原话要点和想要什么结果；它看不到对话历史）' },
+      team: { type: 'boolean', description: '适合拆成多路并行查证或起草时填 true' },
+    },
+    output: text,
+    async execute(args, exec) {
+      const team = args.team === true
+      const agent = exec.agent!
+      const work = await steward.background({ session: agent.session.id, label: args.title, task: args.task, team })
+      if (spokeOnlyAsyncHandoff(agent)) exec.concludeTurn()
+      return `交给后台异步去查了（帮手 ${work.id}），做完会把结果送回这段对话。`
     },
   }))
 
