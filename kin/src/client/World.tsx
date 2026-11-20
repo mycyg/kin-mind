@@ -57,7 +57,7 @@ export function World({ home, place, go, openSettings, talk }: {
       {place === 'letters' ? <LettersView openSettings={openSettings} /> : null}
       {place === 'diary' ? <DiaryView openSettings={openSettings} /> : null}
       {place === 'wishes' ? <WishesView home={home} toDay={(at) => { setDay(dayKey(new Date(at))); go('calendar') }} talk={talk} /> : null}
-      {place === 'wander' ? <Wander /> : null}
+      {place === 'wander' ? <Wander talk={talk} /> : null}
       {place === 'memories' ? <Recall /> : null}
       {place === 'calendar' ? <CalendarView go={go} day={day} talk={talk} /> : null}
     </div>
@@ -278,7 +278,7 @@ function Creations({ talk }: { talk?: (text: string) => void }) {
   )
 }
 
-function Wander() {
+function Wander({ talk }: { talk?: (text: string) => void }) {
   const { data, error, reload } = useApi<Explore>('api/kin/explore', 30_000)
   if (error) return <Failed error={error} retry={reload} />
   if (!data) return <Quiet>正在翻她的探索笔记…</Quiet>
@@ -290,7 +290,7 @@ function Wander() {
   return (
     <>
       <Outing kind="exploration" />
-      {curious.length ? <section className="kin-card"><h3 className="kin-card-title">想弄明白的</h3><Wishes wishes={curious} /></section> : null}
+      {curious.length ? <section className="kin-card"><h3 className="kin-card-title">想弄明白的</h3><Wishes wishes={curious} talk={talk} /></section> : null}
       {data.explorations.length ? (
         <section className="kin-card">
           <h3 className="kin-card-title">探索过的</h3>
@@ -302,7 +302,18 @@ function Wander() {
       {findings.length ? (
         <section className="kin-card">
           <h3 className="kin-card-title">带回来的发现</h3>
-          <ul className="kin-list kin-list-scroll" tabIndex={0}>{findings.map((item, i) => <li key={item.id ?? i}>{item.result!.summary}</li>)}</ul>
+          <ul className="kin-list kin-list-scroll" tabIndex={0}>
+            {findings.map((item, i) => (
+              <li key={item.id ?? i} className="kin-list-item">
+                <span className="kin-list-body">{item.result!.summary}</span>
+                {talk ? (
+                  <button type="button" className="kin-say-btn" onClick={() => talk(`看到你出门带回来的发现「${clip(item.result!.summary!, 28)}」，想听你多说说`)}>
+                    <Bubble size={13} /> 和她聊聊
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
         </section>
       ) : null}
     </>

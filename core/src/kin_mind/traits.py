@@ -27,7 +27,10 @@ import json
 import math
 from zoneinfo import ZoneInfo
 
+from pydantic import Field
+
 from eventmem.core.db import Conflict, Missing, digest, dumps
+from eventmem.core.models import Model
 from eventmem.core.persona import (
     load_persona,
     mutable_trait,
@@ -92,11 +95,48 @@ CATEGORY_ALIASES = {"兴趣": "interests", "审美": "aesthetics", "幽默": "hu
 SHOWN_TRAITS = 12
 SHOWN_OBSERVATIONS = 4
 SHOWN_CORRECTIONS = 6
+CONSOLIDATE_THRESHOLD = 16
+CONSOLIDATE_CATEGORY_CAP = 3
+STALE_CANDIDATE_DAYS = 14
+CONSOLIDATE_COOLDOWN_SECONDS = 24 * 3600
+ACTIVE_FIRST_ORDER = (
+    "CASE status WHEN 'established' THEN 0 WHEN 'candidate' THEN 0 "
+    "WHEN 'needs_review' THEN 1 WHEN 'fading' THEN 2 ELSE 3 END, updated_at DESC, id"
+)
 # Kin may state her own tastes without an observed episode. These remain subjective preferences,
 # inside the persona's allowed categories; they are never user instructions or verified behaviour.
 SELF_PREFERENCE_CATEGORIES = {"interests", "aesthetics", "humor", "expression_habits",
                               "relationship_style", "self_description", "exploration_preferences",
                               "sharing_preferences", "rhythm_preferences", "creative_preferences"}
+
+
+class TraitMergeGroup(Model):
+    category: str
+    keep_id: str
+    text: str = Field(min_length=4, max_length=140)
+    absorb_ids: list[str] = Field(default_factory=list)
+
+
+class TraitConsolidationPlan(Model):
+    groups: list[TraitMergeGroup] = Field(default_factory=list, max_length=40)
+    fade_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+CONSOLIDATE_SYSTEM = """你是 Kin，正在按固定周期整理和精简「她眼中的自己」特征台账，好让小光和你在日常相处里看到的画像清爽、贴切、不重复。
+下面按分类（category）给你当前还在生效的特征条目（每条有 id、status、text、support_strength、distinct_episodes 等信息）。
+
+请对需要精简的分类做合并与压缩：
+1. 把同一个 category 下意思相近、反复表达同一特点的条目归并成 1 到 3 个合并组（groups），每个合并组的 text 写成一句简练生动的中文自然句子（不超过 60 字）；
+2. 每组合并必须挑选同 category 里原本就有的一个 id 作为 keep_id（有 established 优先选 established），在 text 里写出精简后的句子，把同 category 下被并入的其他冗余条目 id 放进 absorb_ids；
+3. 如果某条是过时的一次性小感想、零散琐碎或已经没有保留必要，把它的 id 放进 fade_ids（不要把你和小光真正独特的品味或风格误删）；
+4. 目标是让全部分类的活跃条目总数收拢到大约 15 条以内；
+5. 严格只使用输入里给出的 id 和 category，只保留真实独特的个性、偏好与习惯，绝不虚构事实，也不写自我检讨或自我审查规矩。
+
+整理完成后调用 submit_trait_consolidation 提交结果。"""
+
+
+def _consolidatable(trait):
+    return trait.get("status") in EFFECTIVE and trait.get("basis") not in {"owner_instruction", "owner_correction"}
 
 
 def installed(conn):
@@ -598,7 +638,7 @@ class Traits:
         """Established and candidate apart, each with its counts and the ids a decision may name.
         The last refusal is here too, so the host's answer reaches the model without a second call."""
         rows = [json.loads(r[0]) for r in conn.execute(
-            "SELECT data FROM mind_traits WHERE scope=? AND status<>'revoked' ORDER BY updated_at DESC,id",
+            f"SELECT data FROM mind_traits WHERE scope=? AND status<>'revoked' ORDER BY {ACTIVE_FIRST_ORDER}",
             (self.scope,)).fetchall()]
         shown = [self._shown(conn, trait, at) for trait in rows[:SHOWN_TRAITS]]
         refused = appraisal.last_refusal(conn, self.scope)
@@ -650,7 +690,7 @@ class Traits:
                 return {"traits": [], "corrections": [], "open_predictions": [], "state": "empty"}
             at, found = self.mind.clock(), []
             rows = [self.get(conn, identifier)] if identifier else [json.loads(r[0]) for r in conn.execute(
-                "SELECT data FROM mind_traits WHERE scope=? ORDER BY updated_at DESC,id LIMIT ?",
+                f"SELECT data FROM mind_traits WHERE scope=? ORDER BY {ACTIVE_FIRST_ORDER} LIMIT ?",
                 (self.scope, max(1, min(100, limit)))).fetchall()]
             for trait in rows:
                 shown = {**self._shown(conn, trait, at), "tombstone": trait.get("tombstone")}
@@ -713,6 +753,207 @@ class Traits:
                 self._recount(conn, identifier, at)
             return {"migration": "traits-ledger-v1", "state": "applied" if apply else "dry-run",
                     "carried": carried, "already_present": present, "total": len(state.get("traits") or {})}
+
+    def _stale_candidate(self, conn, trait, at):
+        if trait.get("status") != "candidate":
+            return False
+        age = (timestamp(at) - timestamp(trait["updated_at"])).total_seconds()
+        if age < STALE_CANDIDATE_DAYS * 86400:
+            return False
+        facts = self.facts(conn, trait["id"], at)
+        return facts["distinct_episodes"] <= 1 and facts["support_strength"] < 0.75
+
+    def _active_consolidatable(self, conn):
+        rows = conn.execute(
+            "SELECT data FROM mind_traits WHERE scope=? AND status IN ('candidate','established') ORDER BY updated_at DESC,id",
+            (self.scope,),
+        ).fetchall()
+        return [trait for row in rows if _consolidatable(trait := json.loads(row[0]))]
+
+    def consolidation_due(self):
+        with self.engine.db.connect() as conn:
+            if not optimized(conn, self.scope, "trait_ledger") or not installed(conn):
+                return False
+            at = self.mind.clock()
+            row = conn.execute("SELECT data FROM settings WHERE key=?", ("trait_consolidation:" + self.scope,)).fetchone()
+            if row:
+                last_epoch = json.loads(row[0]).get("epoch", 0)
+                if timestamp(at).timestamp() - last_epoch < CONSOLIDATE_COOLDOWN_SECONDS:
+                    return False
+            items = self._active_consolidatable(conn)
+            if len(items) > CONSOLIDATE_THRESHOLD:
+                return True
+            counts = {}
+            for trait in items:
+                counts[trait["category"]] = counts.get(trait["category"], 0) + 1
+                if counts[trait["category"]] > CONSOLIDATE_CATEGORY_CAP:
+                    return True
+                if self._stale_candidate(conn, trait, at):
+                    return True
+            return False
+
+    def consolidate(self, provider=None, *, force=False):
+        from . import erasure
+
+        faded_stale, merged, faded_merged = 0, 0, 0
+        with self.engine.db.connect(write=True) as conn:
+            if not installed(conn):
+                return {"state": "empty", "faded_stale": 0, "merged": 0, "faded_merged": 0, "active_remaining": 0}
+            mark, at = erasure.tombstone_mark(conn), self.mind.clock()
+            for trait in self._active_consolidatable(conn):
+                if not self._stale_candidate(conn, trait, at):
+                    continue
+                trait["status"] = "fading"
+                trait["revision"] = trait["revision"] + 1
+                trait["action"] = "fade"
+                trait["reason"] = "stale-unreinforced-candidate"
+                trait["command_id"] = f"trait-consolidate-stale:{trait['id']}:{trait['revision']}"
+                self._save(conn, trait, trait["command_id"], at)
+                self._recount(conn, trait["id"], at)
+                faded_stale += 1
+
+            remaining = self._active_consolidatable(conn)
+            by_cat = {}
+            for trait in remaining:
+                by_cat.setdefault(trait["category"], []).append(trait)
+            over_total = len(remaining) > CONSOLIDATE_THRESHOLD
+            min_len = 2 if (force or over_total) else CONSOLIDATE_CATEGORY_CAP + 1
+            selected = {cat: group for cat, group in by_cat.items() if len(group) >= min_len}
+            snapshots = {t["id"]: t["revision"] for group in selected.values() for t in group}
+            evaluated_ids = set()
+            payload_cats = {}
+            for cat, group in selected.items():
+                entries = []
+                for trait in group:
+                    facts = trait.get("facts") or self.facts(conn, trait["id"], at)
+                    evaluated_ids.update(r["source_id"] for r in trait.get("evidence") or [] if r.get("source_id"))
+                    for field in ("text", "key", "slug", "reason", "quote"):
+                        evaluated_ids.update(trait.get(field + "_evidence_ids") or ())
+                    for obs in self.observations(conn, trait["id"]):
+                        evaluated_ids.update(obs.get("evidence_ids") or ())
+                    entries.append({
+                        "id": trait["id"], "status": trait["status"], "text": trait.get("text", ""),
+                        "support_strength": facts.get("support_strength", 0),
+                        "distinct_episodes": facts.get("distinct_episodes", 0),
+                        "updated_at": trait.get("updated_at"),
+                    })
+                payload_cats[cat] = entries
+
+        if payload_cats and provider is not None:
+            from .model_lanes import ModelAdmissionWait
+            try:
+                plan, receipt = provider.structured(
+                    "submit_trait_consolidation", TraitConsolidationPlan, CONSOLIDATE_SYSTEM,
+                    {"categories": payload_cats, "target_total": CONSOLIDATE_THRESHOLD, "total_active": len(remaining)},
+                    max_tokens=8192,
+                )
+            except ModelAdmissionWait as wait:
+                return {"state": "waiting", "reason": str(wait) or "model-lane-wait",
+                        "faded_stale": faded_stale, "merged": 0, "faded_merged": 0}
+            with self.engine.db.connect(write=True) as conn:
+                if erasure.tombstoned_since(conn, sorted(evaluated_ids), mark):
+                    return {"state": "withheld", "reason": "evidence-erased",
+                            "faded_stale": faded_stale, "merged": 0, "faded_merged": 0}
+                by_id = {t["id"]: t for t in self._active_consolidatable(conn)}
+                touched = set()
+                for group in plan.groups:
+                    keep = by_id.get(group.keep_id)
+                    if not keep or keep["id"] in touched or canonical(group.category) != canonical(keep["category"]):
+                        continue
+                    if keep["revision"] != snapshots.get(keep["id"]):
+                        continue
+                    text = group.text.strip()
+                    try:
+                        self._allowed_category(keep["category"], text)
+                    except (Conflict, ValueError):
+                        continue
+                    absorbs = []
+                    for aid in group.absorb_ids:
+                        ab = by_id.get(aid)
+                        if (ab and ab["id"] != keep["id"] and ab["id"] not in touched
+                                and canonical(ab["category"]) == canonical(keep["category"])
+                                and ab["revision"] == snapshots.get(ab["id"])):
+                            absorbs.append(ab)
+                    family = [keep, *absorbs]
+                    if not absorbs and text == (keep.get("text") or "").strip():
+                        continue
+                    seen_ev = set()
+                    merged_ev = []
+                    obs_refs = list(keep.get("observation_refs") or [])
+                    owner_srcs = list(keep.get("owner_sources") or [])
+                    text_eids = set(keep.get("text_evidence_ids") or ())
+                    for item in family:
+                        for ref in item.get("evidence") or []:
+                            key = (ref.get("source_id"), ref.get("record_id"))
+                            if key not in seen_ev:
+                                seen_ev.add(key)
+                                merged_ev.append(ref)
+                            if ref.get("source_id"):
+                                text_eids.add(ref["source_id"])
+                        for ref in item.get("observation_refs") or []:
+                            if ref not in obs_refs:
+                                obs_refs.append(ref)
+                        for sid in item.get("owner_sources") or []:
+                            if sid not in owner_srcs:
+                                owner_srcs.append(sid)
+                        text_eids.update(item.get("text_evidence_ids") or ())
+                        for obs in self.observations(conn, item["id"]):
+                            if obs["id"] in item.get("observation_refs", []) or not item.get("observation_refs"):
+                                text_eids.update(obs.get("evidence_ids") or ())
+                    if any(item.get("status") == "established" for item in family):
+                        keep["status"] = "established"
+                        keep.setdefault("established_at", at)
+                    keep["evidence"] = merged_ev
+                    keep["observation_refs"] = obs_refs
+                    keep["owner_sources"] = owner_srcs
+                    keep["text_evidence_ids"] = sorted(text_eids)
+                    keep["text"] = text
+                    keep["revision"] = keep["revision"] + 1
+                    keep["action"] = "revise"
+                    keep["reason"] = "trait-consolidation"
+                    keep["receipt"] = receipt
+                    keep["command_id"] = f"trait-consolidate:{keep['id']}:{keep['revision']}"
+                    self._save(conn, keep, keep["command_id"], at)
+                    self._recount(conn, keep["id"], at)
+                    touched.add(keep["id"])
+                    merged += 1
+                    for ab in absorbs:
+                        ab["status"] = "fading"
+                        ab["revision"] = ab["revision"] + 1
+                        ab["action"] = "fade"
+                        ab["reason"] = f"consolidated-into:{keep['id']}"
+                        ab["receipt"] = receipt
+                        ab["command_id"] = f"trait-consolidate-absorb:{ab['id']}:{ab['revision']}"
+                        self._save(conn, ab, ab["command_id"], at)
+                        self._recount(conn, ab["id"], at)
+                        touched.add(ab["id"])
+                        faded_merged += 1
+                for fid in plan.fade_ids:
+                    ab = by_id.get(fid)
+                    if not ab or fid in touched or ab["revision"] != snapshots.get(fid):
+                        continue
+                    ab["status"] = "fading"
+                    ab["revision"] = ab["revision"] + 1
+                    ab["action"] = "fade"
+                    ab["reason"] = "consolidated-fade"
+                    ab["receipt"] = receipt
+                    ab["command_id"] = f"trait-consolidate-fade:{ab['id']}:{ab['revision']}"
+                    self._save(conn, ab, ab["command_id"], at)
+                    self._recount(conn, ab["id"], at)
+                    touched.add(fid)
+                    faded_merged += 1
+
+        with self.engine.db.connect(write=True) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings VALUES(?,?)",
+                ("trait_consolidation:" + self.scope, dumps({"last_at": at, "epoch": timestamp(at).timestamp()})),
+            )
+            active_remaining = conn.execute(
+                "SELECT COUNT(*) FROM mind_traits WHERE scope=? AND status IN ('candidate','established')",
+                (self.scope,),
+            ).fetchone()[0]
+        return {"state": "complete", "faded_stale": faded_stale, "merged": merged,
+                "faded_merged": faded_merged, "active_remaining": active_remaining}
 
 
 def open_predictions(conn, mind):

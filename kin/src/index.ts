@@ -410,7 +410,10 @@ export function apply(ctx: Context, config: Config) {
       }
     },
   })
-  route('/api/kin/traits', { GET: () => mind.call('traits', { limit: 30 }) })
+  route('/api/kin/traits', { GET: () => mind.call('traits', { limit: 60 }) })
+  route('/api/kin/traits/consolidate', {
+    POST: () => mind.run('traits-consolidate', { force: true }),
+  })
   route('/api/kin/traits/revoke', {
     POST: async (request) => {
       const { id, revision, text, reason } = await body<{ id: string; revision?: number; text?: string; reason?: string }>(request)

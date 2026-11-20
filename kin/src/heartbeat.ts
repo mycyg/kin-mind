@@ -190,6 +190,7 @@ export class Heartbeat {
   }
 
   private review() {
+    let integrated = false
     return this.lane('review', async () => {
       // Her conversation comes first between rounds too: one that began meanwhile is not kept waiting on the next.
       for (let round = 0; round < ROUNDS && !this.closed && !this.paused && !(round && this.replying()); round++) {
@@ -202,6 +203,7 @@ export class Heartbeat {
         this.note('review', answer)
         if (answer.state !== 'complete') break
         if (!answer.result?.already_integrated) {
+          integrated = true
           this.dailyDue = true
           this.preparationDue = true
         }
@@ -209,6 +211,15 @@ export class Heartbeat {
     }).then(() => {
       void this.prepare()
       void this.daily()
+      if (integrated) {
+        const contact = this.lanes.get('contact')
+        if (contact) {
+          void this.lane('contact', async () => {
+            const answer = await contact.round()
+            if (answer) this.note('contact', answer)
+          }, contact.whileReplying)
+        }
+      }
     })
   }
 

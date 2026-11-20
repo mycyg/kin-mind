@@ -561,3 +561,96 @@ def test_unknown_optional_topic_link_does_not_discard_subjective_stance(flexible
         intent = current(conn, mind, mind.clock(), persona=None)
     assert intent["stance"] == "想主动回应她"
     assert intent["continue_topics"] == [{"topic": "今晚约会怎么过", "concern_id": None}]
+
+
+def test_trait_consolidation_due_and_owner_instruction_protection(flexible):
+    mind, memory, source, clock = flexible
+    origin = source("owner-rule")
+    memory.configure({"records": True, "trait_ledger": True})
+    ledger = Traits(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        obs = ledger.observe(conn, [TraitObservation(
+            category="表达习惯", slug="owner-keep", key="主人说过的话",
+            evidence_class="owner_statement", polarity="support",
+            evidence_ids=[origin], note="说话自然一点",
+        )], "obs-owner", {}, None, "obs-owner")[0]
+    owner_trait = decide(mind, TraitDecision(
+        action="propose", basis="owner_instruction", category="表达习惯", slug="owner-keep",
+        key="主人说过的话", observation_refs=[obs["id"]], quote="owner-rule",
+        evidence_ids=[origin], text="说话自然一点，不用端着",
+    ), "owner-rule-prop")
+    for idx in range(4):
+        clock[0] += timedelta(minutes=5)
+        decide(mind, TraitDecision(
+            action="propose", basis="self_preference", category="expression_habits",
+            slug=f"pref-{idx}", key=f"表达{idx}", text=f"喜欢用轻松的短句聊天{idx}",
+        ), f"pref-{idx}")
+    assert ledger.consolidation_due() is True
+    from kin_mind.model_lanes import ModelAdmissionWait
+
+    class WaitingProvider:
+        def structured(self, *args, **kwargs):
+            raise ModelAdmissionWait("deepseek-foreground-priority")
+
+    waiting = ledger.consolidate(WaitingProvider(), force=False)
+    assert waiting["state"] == "waiting" and waiting["reason"] == "deepseek-foreground-priority"
+    assert ledger.consolidation_due() is True
+    seen_ids = []
+
+    class CaptureProvider:
+        def structured(self, name, schema, system, context, **kwargs):
+            for entries in context["categories"].values():
+                seen_ids.extend(e["id"] for e in entries)
+            return schema.model_validate({"groups": [], "fade_ids": []}), {"model": "fake"}
+
+    ledger.consolidate(CaptureProvider(), force=True)
+    assert owner_trait["id"] not in seen_ids
+
+
+def test_trait_consolidation_merges_and_preserves_erasure_lineage(flexible):
+    mind, _, source, _ = flexible
+    src_keep = source("src-keep")
+    src_absorb = source("src-absorb")
+    ledger = Traits(mind)
+    with mind.engine.db.connect(write=True) as conn:
+        t1 = ledger.decide(conn, [TraitDecision(
+            action="propose", basis="self_preference", category="expression_habits",
+            slug="s1", key="短句", text="说话简短轻松，像平时发微信那样",
+        )], "c1", {"private_note_evidence_ids": [src_keep]}, None, "e1")[0]
+        t2 = ledger.decide(conn, [TraitDecision(
+            action="propose", basis="self_preference", category="expression_habits",
+            slug="s2", key="短句二", text="不喜欢一次发很长的书面段落",
+        )], "c2", {"private_note_evidence_ids": [src_absorb]}, None, "e2")[0]
+
+    class FakeProvider:
+        def structured(self, name, schema, system, context, **kwargs):
+            return schema.model_validate({
+                "groups": [{
+                    "category": "expression_habits",
+                    "keep_id": t1["id"],
+                    "text": "说话简短轻松，爱用短句发消息",
+                    "absorb_ids": [t2["id"]],
+                }],
+                "fade_ids": [],
+            }), {"model": "fake-task"}
+
+    res = ledger.consolidate(FakeProvider(), force=True)
+    assert res["state"] == "complete" and res["merged"] == 1 and res["faded_merged"] == 1
+    assert res["active_remaining"] == 1
+    assert ledger.consolidation_due() is False
+
+    read_out = ledger.read(limit=10)["traits"]
+    assert read_out[0]["id"] == t1["id"] and read_out[0]["status"] == "candidate"
+    assert read_out[0]["text"] == "说话简短轻松，爱用短句发消息"
+    assert read_out[1]["id"] == t2["id"] and read_out[1]["status"] == "fading"
+
+    with mind.engine.db.connect() as conn:
+        proj = ledger.projection(conn, mind.clock())
+        assert [t["id"] for t in proj["candidate"]] == [t1["id"], t2["id"]]
+
+    # Deleting the absorbed trait's underlying source must still cascade-scrub the consolidated text.
+    mind.engine.delete(src_absorb)
+    with mind.engine.db.connect() as conn:
+        kept_after = ledger.get(conn, t1["id"])
+        assert "简短轻松" not in kept_after["text"]
+        assert kept_after["text"] == "[已删除]"

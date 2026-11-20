@@ -126,14 +126,20 @@ export function Settings() {
 }
 
 const TRAIT_CATEGORIES: Record<string, string> = {
-  temperament: '性格', habit: '习惯', preference: '偏好', style: '说话方式', value: '在意的事', boundary: '分寸',
+  temperament: '性格', habit: '习惯', habits: '习惯', preference: '偏好', style: '说话方式', value: '在意的事', values: '在意的事', boundary: '分寸',
+  relationship_style: '相处方式', expression_habits: '表达习惯', sharing_preferences: '分享倾向', self_description: '自我认识',
+  rhythm_preferences: '作息节奏', creative_preferences: '创作偏好', interests: '兴趣', humor: '幽默感', aesthetics: '审美', exploration_preferences: '探索偏好',
 }
 
 function SelfPortrait() {
   const { data, error, reload } = useApi<{ traits: TraitItem[] }>('api/kin/traits', 60_000)
   const [busyId, setBusyId] = useState<string>()
+  const [consolidating, setConsolidating] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [status, setStatus] = useState<string>()
   const [note, setNote] = useState<string>()
-  const traits = (data?.traits ?? []).filter((t) => t.status !== 'revoked')
+  const traits = (data?.traits ?? []).filter((t) => t.status === 'established' || t.status === 'candidate')
+  const visible = expanded ? traits : traits.slice(0, 8)
 
   const revoke = (item: TraitItem) => {
     setBusyId(item.id)
@@ -143,29 +149,63 @@ function SelfPortrait() {
       .finally(() => setBusyId(undefined))
   }
 
+  const consolidate = () => {
+    if (consolidating || traits.length < 2) return
+    setConsolidating(true)
+    setNote(undefined)
+    setStatus(undefined)
+    void api<{ state?: string; merged?: number; faded_merged?: number; faded_stale?: number; active_remaining?: number }>('api/kin/traits/consolidate', {})
+      .then((res) => {
+        if (res.state === 'waiting') {
+          setStatus('后台正在忙，稍后再试')
+          return
+        }
+        invalidateApi('api/kin/traits')
+        void reload()
+        const removed = (res.faded_merged ?? 0) + (res.faded_stale ?? 0)
+        setStatus(removed > 0 ? `已精简合并 ${removed} 条` : '已经挺精炼啦')
+      }, (err: Error) => setNote(err.message))
+      .finally(() => setConsolidating(false))
+  }
+
   return (
     <section className="kin-card">
-      <h3 className="kin-card-title">她眼中的自己</h3>
-      <p className="kin-hint">她平时慢慢攒下来的自我认识。要是哪条走偏了，你可以轻轻帮她撤掉。</p>
+      <div className="kin-card-bar">
+        <h3 className="kin-card-title">她眼中的自己 {traits.length ? <span className="kin-dim">· {traits.length}</span> : null}</h3>
+        <button type="button" className="kin-btn" disabled={consolidating || traits.length < 2} onClick={consolidate}>
+          {consolidating ? '整理中…' : '整理精简'}
+        </button>
+      </div>
+      <p className="kin-hint">她平时攒下的自我认识，攒多了会在后台定期自动合并精简；哪条走偏了也可以撤掉。</p>
       {error ? <p className="kin-error">没读出来：{error}</p>
         : !data ? <p className="kin-quiet">正在听她介绍自己…</p>
         : !traits.length ? <p className="kin-quiet">她还在慢慢认识自己</p>
         : (
-          <ul className="kin-list kin-list-scroll" tabIndex={0}>
-            {traits.map((t) => (
-              <li key={t.id} className="kin-trait-row">
-                <div className="kin-trait-body">
-                  <span className="kin-tag">{TRAIT_CATEGORIES[t.category] ?? t.category}</span>
-                  <span>{t.text}</span>
-                  <span className="kin-dim"> · {t.status === 'established' ? '已成型' : t.status === 'candidate' ? '还在想' : t.status}</span>
-                </div>
-                <button type="button" className="kin-link kin-trait-revoke" disabled={busyId === t.id} onClick={() => revoke(t)}>
-                  {busyId === t.id ? '撤回中…' : '不是这样'}
+          <>
+            <ul className="kin-list kin-list-scroll" tabIndex={0}>
+              {visible.map((t) => (
+                <li key={t.id} className="kin-trait-row">
+                  <div className="kin-trait-body">
+                    <span className="kin-tag">{TRAIT_CATEGORIES[t.category] ?? t.category}</span>
+                    <span>{t.text}</span>
+                    <span className="kin-dim"> · {t.status === 'established' ? '已成型' : '还在想'}</span>
+                  </div>
+                  <button type="button" className="kin-link kin-trait-revoke" disabled={busyId === t.id} onClick={() => revoke(t)}>
+                    {busyId === t.id ? '撤回中…' : '不是这样'}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            {traits.length > 8 ? (
+              <p className="kin-footnote">
+                <button type="button" className="kin-link" onClick={() => setExpanded(!expanded)}>
+                  {expanded ? '收起' : `展开全部（${traits.length} 条）`}
                 </button>
-              </li>
-            ))}
-          </ul>
+              </p>
+            ) : null}
+          </>
         )}
+      {status ? <p className="kin-hint">{status}</p> : null}
       {note ? <p className="kin-error">{note}</p> : null}
     </section>
   )

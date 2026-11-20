@@ -705,7 +705,7 @@ def _dispatch(config, action, request):
             "exploration_cadence": cadence.status(),
             "memory": {"settings": memory.settings(), "review": memory.semantic_context(event_limit=1)["next_review"]} if memory.settings()["records"] else {"state": "disabled"},
         }
-    if action in {"traits", "trait-revoke", "traits-migrate"}:
+    if action in {"traits", "trait-revoke", "traits-migrate", "traits-consolidate"}:
         from .traits import Traits
         ledger = Traits(mind)
         if action == "traits":
@@ -714,6 +714,9 @@ def _dispatch(config, action, request):
             # An owner correction that must not wait for an appraisal. The cited source decides
             # whether it is recorded as the owner's own correction or as the operator's.
             return ledger.revoke(request)
+        if action == "traits-consolidate":
+            with declared("user-work", "traits-consolidate"):
+                return ledger.consolidate(DeepSeek.from_engine(engine), force=bool(request.get("force", True)))
         # Idempotent, and a dry run writes nothing.
         return ledger.migrate(apply=bool(request.get("apply")))
     if action in {"play-configure", "interests-seed"}:
@@ -742,6 +745,12 @@ def _dispatch(config, action, request):
             from . import archive_memory
             if archive_memory.due(mind, waited=0 if not jobs.runnable("enrichment") else archive_memory.STARVED_SECONDS):
                 return archive_memory.run(mind, background_provider())
+        if not jobs.runnable("enrichment"):
+            from .traits import Traits
+            if Traits(mind).consolidation_due():
+                provider = DeepSeek.from_engine(engine)
+                provider.background = True
+                return Traits(mind).consolidate(provider, force=False)
         return jobs.run_one(background_provider(), lane="enrichment", job_id=request.get("job_id"))
     def review_pause():
         if config.get("review_paused"):
@@ -823,7 +832,8 @@ def _dispatch(config, action, request):
             # The memories of archived records are the background lane's work too (archive_memory).
             from .archive_memory import due as memories_due
             from .window_notes import due as notes_due
-            due["enrichment"] = memories_due(mind) > 0 or notes_due(mind) > 0
+            from .traits import Traits
+            due["enrichment"] = memories_due(mind) > 0 or notes_due(mind) > 0 or Traits(mind).consolidation_due()
         # The day's review has a gate of its own now: the host starts it only when there is something
         # to merge or evaluate, never to be told again that it is still waiting.
         return {"state": "due" if any(due.values()) else "idle", **due, "daily": DailyReview(mind).due()}

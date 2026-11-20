@@ -3,12 +3,12 @@
 KIN 的 DeepSeek Harness 插件：一个常驻的陪伴角色，和普通编码会话并存。
 
 - **KIN 预设**：在 DSH 的对话里选 “KIN” 就是在和她聊。人格来自 `<dataDir>/persona.md`；每轮回答前，她会先想起此刻的心情和相关记忆；聊过的话会写进她的心智。编码会话完全不受影响。
-- **KIN 页面**：侧栏点 “KIN”。左边是她自己的聊天框；右边用底部的玻璃 Dock 切换：此刻（她现在的心情、刚想到的、心事、心愿）、小世界（梦、信、日记、心愿、出门探索、回忆）、设置（改人设、排两条模型线〔聊天 / 做事，拖动排序、测一下〕、帮手的权限、内心开关、她认识的人与主动联系的规矩、微信 / 飞书账号与她的声音、她的状况）。窄屏时变成单栏。
-- **心智**：`../core` 里的 Python 心智，数据在 `<dataDir>/db`。短读写在一个常驻进程里；会调模型的活各起一个进程；另有一个常驻的记忆工作者。
-- **心跳**：她每分钟看一眼心里有没有要想的事，下次什么时候想由她自己定。你们聊着时她让你先，聊完再静下来想。评估、日记、梦、记忆整理都走做事线，用她的人设；页面“此刻”底下能看到她上次想事情是什么时候。
-- **大总管**：你让她做的事（处理文件、写代码、查资料），她用 `kin_delegate` 在你的文件夹里开一个 DSH 会话交给帮手（做事线），盯进度、能叫停，做完在你问她的那段对话里用她的话告诉你，也记进她的经历；顺手的小活交给 DSH 子代理。帮手的权限在设置里选：全权（默认）/ 问我 / 自动审核（要先在 DSH 的插件里打开 Auto review）。她自己也会出门探索、做点东西，帮手只在她自己的目录里动手。
-- **认识的人与主动联系**：设置里填每个人在微信 / 飞书上的账号、她能不能主动找；主动联系要守的规矩默认安静时段 22–8 点、每人每天最多 3 次、间隔 1 小时、等回了再找。“此刻”能看到她为什么没找谁、最近发了什么。渠道里发“停止任务 / 取消当前任务 / /停”能叫停她。微信群暂时认不出 @ 她，只能靠插话。
-- **渠道**：设置里连微信（扫码）、飞书（App ID / Secret 和地址），她的声音也在那里配；账号只存在 `<dataDir>/channels.json`（只有你能读）。
+- **KIN 页面**：侧栏点 “KIN”。左边是她自己的聊天框（支持 Markdown 富文本、波形语音条、可折叠工具步骤、悬停时间与免提双向语音陪伴），顶栏可看跨端私聊近况；右边用底部的玻璃 Dock 切换：此刻（互动式心情刻度与「和她说说」、她刚想到的、活跃与缓和心事、心愿、主动联系、心跳）、小世界（梦、可重读已拆时光信的信箱、日记〔可回她〕、心愿与计划〔含「她的手作匣」及文件内嵌预览〕、出门探索〔发现支持「和她聊聊」〕、回忆、日历）、四分栏设置（人格与自动/手动合并精简「她眼中的自己」、两条模型线〔聊天 / 做事，拖动排序、测一下、刷新目录〕与帮手权限、跨端通知 / 微信 / 飞书与 DeepSeek 云端或本地语音、看护自检与冻结）。窄屏时变成单栏。
+- **心智**：`../core` 里的 Python 心智，数据在 `<dataDir>/db`。核心请求分成双常驻管道：`fastPipe` 专跑前台记忆检索与页面轻量只读投影（`page` / `settings`），与后台调度互不阻塞；会调模型的活各起一个进程；另有一个常驻的记忆工作者。
+- **心跳**：她每分钟看一眼心里有没有要想的事，下次什么时候想由她自己定。你们聊着时她让你先，聊完再静下来想。评估、日记、梦、记忆整理及定期自我认知整理都走做事线，用她的人设；出门探索（Wander）结束后会立刻唤醒评估并在想分享时第一时间触发主动联系，不用再白等一分钟。
+- **大总管**：不需要动某个文件夹的联网查资料、汇总类多步任务，用 `kin_background` 转入隔离的 `kin/task` 后台，前台一句快回单步收尾，做完自动带回结果接话；要在你的文件夹里改写项目或文件，仍用 `kin_delegate` 开独立 DSH 工单会话，可用 `kin_work` 查进度、捎话或叫停；顺手小活交给子代理。帮手的权限在设置里选：全权（默认）/ 问我 / 自动审核（要先在 DSH 的插件里打开 Auto review）。
+- **认识的人与主动联系**：设置里填每个人在微信 / 飞书上的账号、她能不能主动找；微信/飞书 `3 秒`连发合一再回；主动联系的规矩可配安静时段、每人每天上限与间隔。“此刻”能看到她为什么没找谁、最近发了什么。渠道里发“停止任务 / 取消当前任务 / /停”能叫停她。微信群暂时认不出 @ 她，只能靠插话。
+- **渠道**：设置里连微信（扫码）、飞书（App ID / Secret 和地址），她的声音也在那里配（支持 **DeepSeek 云端极速 TTS / ASR** 与本地语音，含音色选择与试听）；账号只存在 `<dataDir>/channels.json`（只有你能读）。
 - **记得准**：她想起的每件事都写明是谁、对谁、在哪说的，带着说话那天的日期、星期和时间；“回忆”页能看到这些，记错了点“记错了”写一句，她以后想起都带着这句更正。她也能自己去看别的对话、往别处带话，说不说、说多少由她判断。
 - **她的状况**：设置里看她哪里不对、从什么时候起、怎么办（每 5 分钟看一眼、每 4 小时自检、每天 6:40 / 18:40 检查），也能冻结她的后台。
 
@@ -67,7 +67,7 @@ npm run dev    # 起一个隔离的开发版 DSH 网页（独立 DSH_HOME，数�
 
 开发实例只用 `../.dev/` 下的目录，不会读写你的 `~/.dsh`。macOS 上请用官方 Node 24 跑 `e2e` / `dev`，不要用桌面版自带的 Node：它的签名不允许加载 DSH 依赖里的原生模块。
 
-迁移旧库时，若主人编号不是 `person:person_a`，加 `--owner-id <旧编号>`，联系人和数据库里的身份引用会一起转换。语音转写使用 `channels.json` 的 `hearing: { python, model }`，调用 `core/scripts/transcribe.py`；优先保留平台已有的转写。
+迁移旧库时，若主人编号不是 `person:person_a`，加 `--owner-id <旧编号>`，联系人和数据库里的身份引用会一起转换。语音转写（ASR）与合成（TTS）优先使用配置的 **DeepSeek 云端接口**（`/v1/tools/asr`、`/v1/tools/tts`，经 `ffmpeg` 转码）以获得秒级响应，也保留本地 `core/scripts/transcribe.py` 与 MLX 语音脚本作离线回退。
 
 Python 的 `local-embedding` 与 `media`/`all` 附加包互斥，不使用 `--all-extras`。
 
@@ -75,9 +75,9 @@ Python 的 `local-embedding` 与 `media`/`all` 附加包互斥，不使用 `--al
 
 ### Conversation checkpoints
 
-The KIN presets use `dsh-kin/compaction`, a `BasicCompactionEngine` subclass. DSH still owns range selection, locks, token pricing, retained messages and append-only checkpoint commits. The subclass isolates the summarization task from the companion persona, presents earlier records as data without executable tools, and requires all eight non-empty checkpoint sections before allowing replacement. Invalid, empty, truncated or tool-producing output leaves the existing surface intact. Prior checkpoints and later corrections are summarized together; source identities remain attached so the existing deletion filter still applies. Structural validation does not prove semantic completeness of model-written summaries.
+The KIN presets use `dsh-kin/compaction`, a `BasicCompactionEngine` subclass. Active sessions keep the full `648k` input window (compacting at `90%` / `583.2k` to protect prompt cache hits), while sessions idle for 1 hour above `256k` tokens automatically run a background checkpoint compaction on `kin/task` (pruning old tool results first and retaining `20k` recent tokens). The subclass isolates the summarization task from the companion persona, presents earlier records as data without executable tools, and requires all eight non-empty checkpoint sections before allowing replacement. Invalid, empty, truncated or tool-producing output leaves the existing surface intact. Prior checkpoints and later corrections are summarized together; source identities remain attached so the existing deletion filter still applies. Structural validation does not prove semantic completeness of model-written summaries.
 
-`node dev/e2e-compaction.mjs` checks real compaction transactions with a synthetic model, cumulative context, unchanged retained messages, rejection and serialized session replay. `KIN_COMPACTION_BASELINE=1` runs the same assertions against the unmodified upstream engine and exposes the original acceptance bug. No contacts or real sessions are used.
+`node dev/e2e-compaction.mjs` checks real compaction transactions with a synthetic model, cumulative context, unchanged retained messages, rejection, 1-hour idle >256k background triggers and serialized session replay. `KIN_COMPACTION_BASELINE=1` runs the same assertions against the unmodified upstream engine and exposes the original acceptance bug. No contacts or real sessions are used.
 
 
 ### Long requests on relay routes
